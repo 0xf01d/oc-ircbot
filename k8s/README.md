@@ -44,7 +44,7 @@ them, regenerate it (from the repo root):
 
 ```bash
 python3 - <<'EOF'
-files = ["bot.py", "leak_guard.py",
+files = ["bot.py", "leak_guard.py", "util.py",
          "brain.py", "policy.py", "networks.py", "memory_log.py", "watchdog.py",
          "opencode.json",
          "tests/mock_irc_server.py", "tests/stub_opencode_serve.py",

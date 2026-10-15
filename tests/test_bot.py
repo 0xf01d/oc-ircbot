@@ -6,7 +6,7 @@ import bot
 def test_split_say_short_is_verbatim():
     with mock.patch.object(bot, "send_raw") as sr:
         bot.split_say("#c", "  keep   spacing  ")
-    sr.assert_called_once_with("PRIVMSG #c :  keep   spacing  ", None)
+    sr.assert_called_once_with("PRIVMSG #c :  keep   spacing  ")
 
 
 def test_split_say_wraps_long_lines():
@@ -20,7 +20,7 @@ def test_split_say_wraps_long_lines():
 def test_process_cmd_say():
     with mock.patch.object(bot, "send_raw") as sr:
         bot.process_cmd("SAY #c hi there")
-    sr.assert_called_once_with("PRIVMSG #c :hi there", None)
+    sr.assert_called_once_with("PRIVMSG #c :hi there")
 
 
 def test_process_cmd_act_and_notice():
@@ -29,12 +29,6 @@ def test_process_cmd_act_and_notice():
         bot.process_cmd("NOTICE nick hello")
     assert sr.call_args_list[0].args[0] == "PRIVMSG #c :\x01ACTION waves\x01"
     assert sr.call_args_list[1].args[0] == "NOTICE nick :hello"
-
-
-def test_process_cmd_origin_tag_rides_the_line():
-    with mock.patch.object(bot, "send_raw") as sr:
-        bot.process_cmd("SAY:impiccato #c hi")
-    assert sr.call_args.args[1] == "impiccato"
 
 
 def test_process_cmd_unknown_verb_emits_error():

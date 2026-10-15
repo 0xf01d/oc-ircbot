@@ -16,7 +16,7 @@ watchdog.py ── reads heartbeat / serve health / agent.status
 ```
 
 One `opencode serve` process for the whole stack; one bot per IRC network
-(systemd `oc-ircbot-bot@.service` template, or `nets.py` in containers); one
+(systemd `oc-ircbot-bot@.service` template, or one container each); one
 brain; one watchdog. The brain derives each network's file names from
 `IRC_NETWORKS` / `networks.json` (`networks.py`), so bot and brain never need
 to agree on anything except those paths.
@@ -43,9 +43,9 @@ aup_watchdog triggers, ported into the loop):
 
 | trigger | detection | action |
 |---|---|---|
-| **refusal** | `policy.refusal_hits` on the assistant text (AUP patterns, env-overridable) | `reset_session`, log to the activity log |
-| **turn cap** | `assistant_turn_count >= BRAIN_MAX_TURNS` (default 150) | `reset_session` — a fresh context, not a zombie |
-| **wedged turn** | `session.status` busy/retry longer than `BRAIN_TURN_TIMEOUT` (SSE `session.status` + `GET /session/status`) | `POST /session/{id}/abort`; a second wedge resets the session |
+| **refusal** | `policy.refusal_hits` on the assistant text (`policy.DEFAULT_REFUSAL_PATTERNS`) | `reset_session`, log to the activity log |
+| **turn cap** | `assistant_turn_count >= MAX_TURNS` (150, in `brain.py`) | `reset_session` — a fresh context, not a zombie |
+| **wedged turn** | `session.status` busy/retry longer than `TURN_TIMEOUT` (180 s, in `brain.py`) | `POST /session/{id}/abort`; a second wedge resets the session |
 
 Every new session is **rehydrated from disk**: a `rehydrate_prompt` injects
 `memory/MEMORY.md` + today's activity log and orders the agent to stay silent
@@ -58,7 +58,7 @@ are logged to the activity log when they arrive on SSE).
 
 1. `policy.build_prompt(batch, ring, …)` renders recent channel context, the
    new events (`[ADDRESSED]`-marked when the nick is addressed), the channel
-   register (`BRAIN_REGISTERS` / `registers.json`) and the verb contract.
+   register (`registers.json`) and the verb contract.
 2. `prompt_async` submits it (HTTP 204; accepted even while a turn streams —
    see `docs/monitor.md` for why this is the Monitor-equivalent).
 3. On SSE `session.idle`, the last assistant message is fetched and parsed by

@@ -1,41 +1,21 @@
 #!/usr/bin/env python3
 """leak_guard.py — reserved-content leak gate for bot.py.
 
-The original repo ships this module; the `.reference/` copy here does not
-include it, so this is an equivalent re-implementation of the same contract
-that bot.py relies on:
-
-    g = LeakGuard(host, reserved_file, store_file)
-    g.record(target, body)          # remember a line that entered the bridge
-    reason = g.check(target, text, dm_ok=False)   # None if the send is fine
-
-Model: a channel (or nick) is *reserved* when it appears in `bot.reserved`.
-Everything said in a reserved channel is private context: it may be read and
-reasoned about, but it must not be paraphrased back onto the open network.
-The gate therefore stores the recent reserved lines and, on the way out,
-refuses an outbound line to a NON-reserved target when it shares a verbatim
-run (>= MIN_RUN characters) with a line that was recorded in a reserved
-channel. A DM to a reserved target itself (dm_ok) is always allowed, and a
-line addressed *to* a reserved channel is never a leak.
-
-The original's exact heuristic is not published; this keeps the same shape
-(files, names, API, on/off via an empty file) and is deliberately boring:
-stdlib only, bounded memory, no framework.
+A channel (or nick) in `bot.reserved` is *reserved*: what is said there may
+be read and reasoned about, but never paraphrased back onto the open network.
+The gate records recent reserved lines and refuses an outbound line to a
+NON-reserved target when it shares a verbatim run (>= MIN_RUN chars) with a
+recorded reserved line. Sends to a reserved target, or a DM to one, are fine.
 """
 import fnmatch
 import os
 import threading
 import time
 
-# A shared run of this many characters between an outgoing line and a stored
-# reserved line is treated as a leak. Configurable; keep it high enough that
-# ordinary IRC chatter (greetings, single words) can never trip it.
-MIN_RUN = int(os.environ.get("BOT_RESERVED_MINRUN", "40"))
-# Bounded memory: keep at most this many reserved lines, each truncated.
-MAX_LINES = int(os.environ.get("BOT_RESERVED_MAX", "200"))
+MIN_RUN = 40       # shared-run length that counts as a leak
+MAX_LINES = 200    # bounded memory: reserved lines kept, each truncated
+MAX_AGE = 86400.0  # drop stored lines older than this (0 = never)
 LINE_CAP = 512
-# Drop stored lines older than this many seconds (0 = never expire).
-MAX_AGE = float(os.environ.get("BOT_RESERVED_TTL", "86400"))
 
 
 class LeakGuard:
@@ -53,9 +33,8 @@ class LeakGuard:
             with open(self.reserved_file) as f:
                 for line in f:
                     line = line.strip()
-                    # A comment is a bare '#', or '#' followed by whitespace.
-                    # A channel glob like '#brain-private' has no space, so it
-                    # is NOT mistaken for a comment (nicks never start with #).
+                    # '#' followed by whitespace is a comment; '#brain-p'
+                    # is a channel glob (nicks never start with #).
                     if not line or line == "#" or line.startswith("# "):
                         continue
                     self.globs.append(line.lower())
@@ -101,19 +80,15 @@ class LeakGuard:
             pass
 
     def check(self, target, text, dm_ok=False):
-        """Return a reason string when `text` must not go to `target`, else None.
-
-        A send to a reserved target, or a DM to a reserved nick, is fine.
-        """
+        """Reason string when `text` must not go to `target`, else None."""
         if not text:
             return None
         if self._is_reserved(target) or dm_ok:
             return None
-        needle = text
         with self.lock:
             self._expire_locked(time.monotonic())
             for _ts, src, body in self.lines:
-                if self._shared_run(needle, body):
+                if self._shared_run(text, body):
                     return f"reserved-content:{src}"
         return None
 
@@ -122,7 +97,6 @@ class LeakGuard:
         """True if a and b share a verbatim run of >= MIN_RUN characters."""
         if len(a) < MIN_RUN or len(b) < MIN_RUN:
             return False
-        # Bounded: a and b are capped at LINE_CAP, so the scan stays cheap.
         for i in range(len(a) - MIN_RUN + 1):
             if a[i:i + MIN_RUN] in b:
                 return True

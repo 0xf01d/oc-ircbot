@@ -101,8 +101,7 @@ WHOIS vjt
 QUIT :goodbye
 RAW PRIVMSG #x :direct
 """
-    got = [(v, t, b) for v, t, b, _ in policy.parse_answer(text)]
-    assert got == [
+    assert policy.parse_answer(text) == [
         ("SAY", "#test", "hello world"),
         ("ACT", "#test", "waves"),
         ("NOTICE", "alice", "psst"),
@@ -117,37 +116,28 @@ RAW PRIVMSG #x :direct
 def test_parse_answer_ignores_prose_and_injection():
     text = "\x1b[0m> build\x1b[0m\nrandom prose\nSAY  onlytarget\nSAY #c\n" \
            "SAY #ok fine\nQUIT\n"
-    got = [(v, t, b) for v, t, b, _ in policy.parse_answer(text)]
-    assert got == [("SAY", "#ok", "fine"), ("QUIT", "", "")]
+    assert policy.parse_answer(text) == [
+        ("SAY", "#ok", "fine"), ("QUIT", "", "")]
 
 
 def test_parse_answer_accepts_bare_quit():
-    assert policy.parse_answer("QUIT") == [("QUIT", "", "", "QUIT")]
+    assert policy.parse_answer("QUIT") == [("QUIT", "", "")]
 
 
 def test_parse_answer_strips_control_chars_from_bodies():
-    # A body must never smuggle a second FIFO command inside itself.
+    # A body must never smuggle a second FIFO command inside itself: every
+    # line the brain renders starts with a whitelist verb.
     got = policy.parse_answer("SAY #c one\r\nQUIT :forged\r\n")
     assert len(got) <= 2           # splitlines already separates
-    joined = " ".join(policy.fifo_lines(got))
-    assert "forged" in joined      # it's a SEPARATE line, loudly visible...
-    # ...and here is the point: every line starts with a whitelist verb.
-    assert all(l.split()[0] in policy.VERBS
-               for l in policy.fifo_lines(got))
+    assert all(v in policy.VERBS for v, _t, _b in got)
 
 
 def test_filter_answer_drops_own_echo():
     answer = policy.parse_answer(
         "SAY bot hi\nSAY #c bot: echo\nSAY #c fine\nACT bot waves\n"
         "JOIN #x")
-    got = policy.filter_answer(answer, "bot")
-    assert [(v, t, b) for v, t, b, _ in got] == [
+    assert policy.filter_answer(answer, "bot") == [
         ("SAY", "#c", "fine"), ("JOIN", "", "#x")]
-
-
-def test_fifo_lines_rendering():
-    answer = policy.parse_answer("SAY #c hi\nQUIT :bye")
-    assert policy.fifo_lines(answer) == ["SAY #c hi", "QUIT :bye"]
 
 
 # --- prompt construction --------------------------------------------------------

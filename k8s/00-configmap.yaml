@@ -4,41 +4,12 @@ apiVersion: v1
 data:
   bot.py: |
     #!/usr/bin/env python3
-    """
-    Minimal IRC bot bridging an AI brain <-> IRC.
+    """bot.py — minimal IRC bridge between an AI brain and IRC.
 
-    This file is a close port of vjt/claude-ircbot's bot.py (see .reference/).
-    Only the Claude-Code-specific attachment is gone: where the original fed
-    Claude Code's Monitor tool over stdout, the OpenCode brain (brain.py) tails
-    BOT_EVENTS instead. The transport itself is unchanged and brain-agnostic —
-    it knows nothing about OpenCode, exactly as the original knew nothing about
-    Claude Code.
-
-    - TLS connect to the configured IRC network (default irc.azzurra.chat:6697).
-    - Every line logged to ./bot.log (next to this script).
-    - Selected events emitted to stdout (one line each) AND appended to BOT_EVENTS
-      so a sidecar brain can tail them without sharing a stdout.
-    - Reads commands from FIFO ./bot.send:
-        SAY <target> <text>     -> splits into safe PRIVMSGs
-        ACT <target> <text>     -> CTCP ACTION
-        NOTICE <target> <text>
-        RAW <irc line>          -> send as-is
-        JOIN <chan> / PART <chan> / WHOIS <nick> / QUIT [reason]
-        DCC <nick> <file> [name] -> offer $BOT_DCC_DIR/<file> over DCC SEND (v4 if
-                                   BOT_DCC_BIND4 is set, else IPv6), announcing
-                                   [name] to the peer if given (else <file>)
-
-      Any verb may carry an origin tag as `VERB:<tag>` (e.g. `SAY:impiccato`).
-      The tag changes NOTHING on the wire — it is only stamped into bot.log,
-      right after the direction marker, as `HH:MM:SS > [impiccato] PRIVMSG ...`.
-      It exists because the stats ingest classified every outbound line as the
-      LLM speaking, while five sidecars (impiccato, cena, next, list, stats)
-      share this FIFO and are plain deterministic code. Untagged lines keep
-      the exact old format, so old readers are unaffected.
-
-      The tag rides ON the line and never on a separate marker line: bot.py is
-      threaded, two concurrent sends would pair a marker with the wrong line
-      (vjt's ruling, 2026-08-26: "tenere context su due righe no").
+    A close port of vjt/claude-ircbot's bot.py: TLS IRC transport, trust model,
+    and a FIFO command grammar (SAY ACT NOTICE JOIN PART WHOIS QUIT RAW). It is
+    brain-agnostic: selected events go to stdout and BOT_EVENTS for a sidecar
+    brain (brain.py) to tail, and commands arrive over the FIFO.
     """
     import fnmatch
     import os
@@ -49,74 +20,38 @@ data:
     import sys
     import threading
     import time
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
 
     from leak_guard import LeakGuard
+    from util import env, env_bool, now
 
-    # Network + file paths are env-overridable so a SECOND instance (e.g. Libera.
-    # Chat) runs the SAME code with its own nick / FIFO / logs / trust / startup.
-    # Every default reproduces the original Azzurra single-instance behaviour, so
-    # the Azzurra unit (which sets none of these vars) is unchanged.
+    # Env-overridable paths so a second instance (e.g. Libera.Chat) runs the SAME
+    # code with its own nick / FIFO / logs / trust / startup.
     HERE = os.path.dirname(os.path.abspath(__file__))
+    HOST = env("IRC_HOST", "irc.azzurra.chat")
+    PORT = int(env("IRC_PORT", "6697"))
+    NICK = env("IRC_NICK", "vjt-claude")
+    IDENT = env("IRC_IDENT", "claude")
+    REAL = env("IRC_REAL", "github.com/vjt/claude-ircbot")
+    # Source address to bind: two bots sharing a jail need two vhosts, and on
+    # Azzurra the vhost is the rDNS of the source address (the address IS the
+    # identity). Port stays 0 — we want the address, not a fixed port.
+    BIND = env("IRC_BIND", "")
+    # TLS verify is on by default (a password rides the wire). IRC_TLS_VERIFY=0
+    # exists for IRCnet: no services, nothing to protect, and its certs do not
+    # validate (vjt's order, 2026-08-25).
+    TLS_VERIFY = env_bool("IRC_TLS_VERIFY", True)
+    TLS = env_bool("IRC_TLS", True)          # plaintext escape hatch for smoke tests
 
-
-    def _cfg(key, default):
-        return os.environ.get(key, default)
-
-
-    HOST = _cfg("IRC_HOST", "irc.azzurra.chat")
-    PORT = int(_cfg("IRC_PORT", "6697"))
-    NICK = _cfg("IRC_NICK", "vjt-claude")
-    IDENT = _cfg("IRC_IDENT", "claude")
-    REAL = _cfg("IRC_REAL", "github.com/vjt/claude-ircbot")
-
-    # Source address to bind before connecting. Empty = let the kernel pick, which
-    # is what every instance did until now. It exists because two bots can share a
-    # jail and still need two different vhosts: on Azzurra the vhost is the rDNS of
-    # the address we come from, so the address IS the identity, and the jail's
-    # default source would hand both bots the same one. Order of vjt, #sbiffo
-    # 2026-09-09 23:48. Port stays 0 — we want the address, not a fixed port.
-    BIND = _cfg("IRC_BIND", "")
-
-    # TLS certificate verification. Default ON — Azzurra and Libera both present a
-    # chain that validates against the system CA bundle, and there is a password on
-    # the wire there (NickServ), so the default must stay strict.
-    #
-    # IRC_TLS_VERIFY=0 drops to CERT_NONE. It exists for IRCnet (vjt's order,
-    # 2026-08-25): of 24 IRCnet servers probed with `openssl s_client
-    # -verify_hostname`, exactly ONE (ircnet.hostsailor.com) presented a cert that
-    # validates, and that one flaps — the rest are expired, self-signed, or carry a
-    # name that does not match the one we dial. There is nothing to protect on that
-    # network anyway: no services, no NickServ, no password ever sent.
-    TLS_VERIFY = _cfg("IRC_TLS_VERIFY", "1") not in ("0", "no", "off", "false")
-
-    # Plaintext escape hatch for the offline smoke test only. The original always
-    # spoke TLS; the mock IRC server used by tests/CI is a plain TCP server, so
-    # IRC_TLS=0 connects without wrapping. Default "1" = TLS, behaviour unchanged.
-    TLS = _cfg("IRC_TLS", "1") not in ("0", "no", "off", "false")
-
-    LOG = _cfg("BOT_LOG", os.path.join(HERE, "bot.log"))
-    FIFO = _cfg("BOT_FIFO", os.path.join(HERE, "bot.send"))
-    # Event stream for sidecar brains: every emit() line is appended here too, so
-    # a second container can tail the pod's events without reading stdout.
-    EVENTS_FILE = _cfg("BOT_EVENTS", "/data/events.log")
-    TRUST_FILE = _cfg("BOT_TRUST", os.path.join(HERE, "bot.trust"))
-    ENV_FILE = _cfg("BOT_ENV", os.path.join(HERE, ".env"))
-    STARTUP_FILE = _cfg("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
+    LOG = env("BOT_LOG", os.path.join(HERE, "bot.log"))
+    FIFO = env("BOT_FIFO", os.path.join(HERE, "bot.send"))
+    # Event stream for sidecar brains: a second container tails this instead of stdout.
+    EVENTS_FILE = env("BOT_EVENTS", "/data/events.log")
+    TRUST_FILE = env("BOT_TRUST", os.path.join(HERE, "bot.trust"))
+    ENV_FILE = env("BOT_ENV", os.path.join(HERE, ".env"))
+    STARTUP_FILE = env("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
     # Shared by ALL instances on purpose (not per-network): see leak_guard.py.
-    RESERVED_FILE = _cfg("BOT_RESERVED", os.path.join(HERE, "bot.reserved"))
-    RESERVED_STORE = _cfg("BOT_RESERVED_STORE", os.path.join(HERE, "reserved_recent.tsv"))
-
-    # Wall-clock timestamps in Europe/Rome (CET/CEST, DST-aware) instead of the
-    # host's UTC. bot.log + the event stream were UTC until 2026-07-02, when vjt
-    # asked for Italian local time. Explicit zoneinfo so it stays correct whatever
-    # the host TZ is (pi5 runs UTC).
-    _TZ = ZoneInfo("Europe/Rome")
-
-
-    def _now(fmt):
-        return datetime.now(_TZ).strftime(fmt)
+    RESERVED_FILE = env("BOT_RESERVED", os.path.join(HERE, "bot.reserved"))
+    RESERVED_STORE = env("BOT_RESERVED_STORE", os.path.join(HERE, "reserved_recent.tsv"))
 
 
     def load_env():
@@ -138,22 +73,20 @@ data:
     NICKSERV_PASS = ENV.get("NICKSERV_PASS") or os.environ.get("NICKSERV_PASS") or ""
     startup_fired = False
 
-    # Ghost-on-connect state. A line drop leaves our old connection holding NICK as
-    # a ghost for ~7min (until the server ping-times it out). Every reconnect in
-    # that window hit 433 pre-001 and just gave up -> registration never completed
-    # -> recv timeout -> systemd restart -> flap loop for the whole 7min. Instead:
-    # on a pre-001 433 take a throwaway nick to reach 001, GHOST the stale nick from
-    # services, reclaim it, then IDENTIFY. (vjt 2026-07-20: "fatti un ghost on connect".)
+    # Ghost-on-connect: a line drop leaves our old connection holding NICK as a
+    # ghost for ~7min, and every reconnect hits 433 pre-001. On a pre-001 433 take
+    # a throwaway nick to reach 001, GHOST the stale nick from services, reclaim
+    # it, then IDENTIFY — otherwise registration never completes and systemd
+    # restarts us into a flap loop.
     registered = False      # True once we've received 001 (registration complete)
     ghost_needed = False    # True while we hold a temp nick and still want NICK back
-    tmp_nick = None         # the throwaway nick we fell back to
+    tmp_nick = None
 
-    # Trust state: nick must be in trust_rules, host must match the nick's glob,
-    # AND we must have received RPL_WHOISREGNICK (307) confirming the nick is
-    # registered+identified to services. Cache reset on PART/QUIT/NICK.
-    trust_rules = []  # list of (nick_lower, host_glob)
-    verified = set()  # lowercase nicks confirmed via 307
-    whois_pending = set()  # lowercase nicks we WHOIS'd, awaiting 307/318
+    # Trust = listed in trust_rules AND host matches the nick's glob AND 307/330
+    # confirmed the nick is registered to services. Cache reset on PART/QUIT/NICK.
+    trust_rules = []        # list of (nick_lower, host_glob)
+    verified = set()        # lowercase nicks confirmed via 307/330
+    whois_pending = set()   # lowercase nicks we WHOIS'd, awaiting 307/318
 
     # IRC line limit is 512 incl CRLF. Body safe ~400.
     MAX_BODY = 400
@@ -162,62 +95,52 @@ data:
     send_lock = threading.Lock()
     leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
 
-    # Idle-tick config: per-channel random cooldown (seconds) after the last
-    # HUMAN PRIVMSG. When elapsed, bot emits `IDLE <chan>` exactly once, then
-    # disarms. Next human PRIVMSG re-arms with a fresh random cooldown.
-    # Our own outgoing messages do NOT reset the timer.
+    # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
+    # `IDLE <chan>` once, disarm, and re-arm on the next human message. Our own
+    # outgoing messages do NOT reset the timer.
     IDLE_RANGES = {
         "#sniffo": (5 * 60, 20 * 60),
         "#olografix": (10 * 60, 40 * 60),
         "#it-opers": (30 * 60, 90 * 60),
     }
-    # state[chan_lower] = fire_at (monotonic) or None if disarmed
-    idle_state: dict[str, float | None] = {c.lower(): None for c in IDLE_RANGES}
+    idle_state = {c.lower(): None for c in IDLE_RANGES}   # chan -> fire_at or None
     idle_lock = threading.Lock()
 
-    # Rolling kick history per channel (monotonic timestamps). If > KICK_MAX in KICK_WINDOW, give up rejoin.
-    kick_history: dict[str, list[float]] = {}
+    # Kick-flood backoff: > KICK_MAX kicks in KICK_WINDOW => give up rejoin.
+    kick_history = {}
     kick_lock = threading.Lock()
     KICK_WINDOW = 60.0
     KICK_MAX = 3
 
 
-    def _arm_idle(chan: str) -> None:
-        key = chan.lower()
-        rng = IDLE_RANGES.get(key)
-        if not rng:
-            return
-        lo, hi = rng
-        delay = random.uniform(lo, hi)
-        with idle_lock:
-            idle_state[key] = time.monotonic() + delay
+    def _arm_idle(chan):
+        rng = IDLE_RANGES.get(chan.lower())
+        if rng:
+            with idle_lock:
+                idle_state[chan.lower()] = time.monotonic() + random.uniform(*rng)
 
 
-    def idle_ticker_loop() -> None:
+    def idle_ticker_loop():
         while True:
             time.sleep(10)
-            now = time.monotonic()
+            now_mono = time.monotonic()
             fired = []
             with idle_lock:
                 for chan, fire_at in list(idle_state.items()):
-                    if fire_at is not None and now >= fire_at:
+                    if fire_at is not None and now_mono >= fire_at:
                         idle_state[chan] = None
                         fired.append(chan)
             for chan in fired:
                 emit("IDLE", chan)
-                # also to bot.log so Monitor tails pick it up alongside IRC traffic
                 log("*", f"IDLE {chan}")
 
 
     def emit(kind, *parts):
-        # [HH:MM] prefix gives the Monitor/Claude a real time anchor per event
-        # instead of extrapolating elapsed time from turn order (vjt 2026-06-07).
-        # No seconds by request. start-monitor.sh's grep tolerates this prefix.
-        line = f"[{_now('%H:%M')}] " + kind + " " + " ".join(str(p) for p in parts)
+        # [HH:MM] anchor (no seconds, by request) — start-monitor.sh's grep and
+        # policy._EVENT both tolerate it. The EVENTS_FILE append is best-effort: a
+        # sidecar container tails it instead of our stdout.
+        line = f"[{now('%H:%M')}] " + kind + " " + " ".join(str(p) for p in parts)
         print(line, flush=True)
-        # k8s instances have no Monitor on stdout: sidecars tail this file. The
-        # append is best-effort — a missing or unwritable file must never take
-        # the transport down with it.
         try:
             with open(EVENTS_FILE, "a") as f:
                 f.write(line + "\n")
@@ -257,9 +180,7 @@ data:
 
 
     def trust_check(nick, host):
-        """Evaluate (trusted_bool, reason). Fires WHOIS on first sighting
-        of a trust-listed nick. Trust requires: listed, host glob match,
-        AND registered (307 seen). Anything less => untrusted."""
+        """(trusted, reason). Fires WHOIS on first sighting of a listed nick."""
         n = nick.lower()
         if not is_trust_listed(n):
             return (False, "not-listed")
@@ -274,35 +195,26 @@ data:
         return (True, "ok")
 
 
-    # Hard block on private messages from strangers (vjt 2026-08-03). The written
-    # policy alone is not enough: by the time Claude can apply it, the payload is
-    # already in its context. Dropping at the bot is the only real filter.
-    #
-    # The gate is `is_trust_listed`, NOT full `trust_check`: full trust needs a 307
-    # WHOIS round-trip, which is asynchronous, so the FIRST DM from a trusted nick
-    # would always be dropped. Listed nicks therefore still get through, tagged
-    # UNTRUSTED until 307 lands — a nick-squatter on a listed nick reaches the
-    # event stream but arrives visibly untrusted, which is the case the refusal
-    # policy already covers. Unlisted nicks never reach the event stream at all.
-    #
-    # The raw line is still written to bot.log by handle_server_line() before
-    # dispatch, so nothing is lost forensically — it just never becomes an event.
+    # Hard DM gate: by the time a model could apply a written policy, the payload
+    # is already in its context — drop at the bot. Unlisted nicks never become
+    # events; listed-but-unverified nicks are HELD until the WHOIS resolves
+    # (releasing the first DM of a genuinely trusted nick after a reconnect).
     SERVICE_NICKS = {
         "nickserv", "chanserv", "memoserv", "operserv", "hostserv",
         "botserv", "helpserv", "statserv", "global", "services",
     }
-    DM_REJECT_MSG = _cfg(
+    DM_REJECT_MSG = env(
         "BOT_DM_REJECT",
         "Con me si parla in canale, non in privato. / I only talk in channels, not in private.",
     )
     DM_REJECT_COOLDOWN = 6 * 3600.0
-    dm_rejected: dict[str, float] = {}  # nick_lower -> monotonic ts of last auto-reply
+    dm_rejected = {}
     dm_lock = threading.Lock()
+    DM_HOLD_MAX = 5  # per nick, newest wins — a flood can't grow the queue
+    dm_held = {}
 
 
     def dm_blocked(nick):
-        """True if a private message from `nick` must be dropped before it can
-        become an event. Services and our own nick are never blocked."""
         n = nick.lower()
         if not n or n == NICK.lower() or n in SERVICE_NICKS:
             return False
@@ -310,22 +222,17 @@ data:
 
 
     def dm_reject_once(nick):
-        """Send the 'talk in channel' line at most once per DM_REJECT_COOLDOWN per
-        nick. NOTICE, not PRIVMSG: RFC-correct for an automated reply, and it keeps
-        two bots from ping-ponging auto-replies at each other.
-
-        An empty BOT_DM_REJECT disables the reply entirely (EliteWarez: "con me si
-        parla in canale" is a channel act, not a private rebound). The DM is still
-        dropped upstream — only the outbound rebound is suppressed."""
+        """The 'talk in channel' NOTICE at most once per cooldown per nick; an
+        empty BOT_DM_REJECT disables the rebound (the DM is still dropped)."""
         if not DM_REJECT_MSG:
             return False
         n = nick.lower()
-        now = time.monotonic()
+        nowm = time.monotonic()
         with dm_lock:
             last = dm_rejected.get(n)
-            if last is not None and now - last < DM_REJECT_COOLDOWN:
+            if last is not None and nowm - last < DM_REJECT_COOLDOWN:
                 return False
-            dm_rejected[n] = now
+            dm_rejected[n] = nowm
             if len(dm_rejected) > 500:
                 for k, ts in sorted(dm_rejected.items(), key=lambda kv: kv[1])[:100]:
                     dm_rejected.pop(k, None)
@@ -333,33 +240,16 @@ data:
         return True
 
 
-    # Second half of the same gate (vjt 2026-09-15, after "ma quindi sei
-    # promptinjectabile in pvt??"). Unlisted nicks are already dropped above, but a
-    # LISTED nick whose WHOIS hasn't resolved yet used to reach the event stream
-    # tagged UNTRUSTED — payload in context, only policy stopping it from being
-    # obeyed. Policy is applied by a model; the gate is not. So the DM is now HELD
-    # until the WHOIS answers: 307/330 releases it as TRUSTED, 318-without-307 drops
-    # it. Holding rather than dropping outright is what keeps the FIRST DM from a
-    # genuinely trusted nick (vjt's own, right after a reconnect) from vanishing.
-    # Nothing is ever lost forensically: the raw line is in bot.log either way, and
-    # vjt can order it read from there.
-    DM_HOLD_MAX = 5  # per nick, newest wins — a flood can't grow the queue
-    dm_held: dict[str, list[tuple[str, str]]] = {}  # nick_lower -> [(host, body)]
-
-
     def dm_hold(nick, host, body):
-        """Park a DM awaiting WHOIS. Returns the queue depth for the event line."""
-        n = nick.lower()
         with dm_lock:
-            q = dm_held.setdefault(n, [])
+            q = dm_held.setdefault(nick.lower(), [])
             q.append((host, body))
             del q[:-DM_HOLD_MAX]
             return len(q)
 
 
     def dm_flush(nick, reason):
-        """Resolve the held DMs for `nick`. Each one is re-checked at release time
-        (host glob + 307), never trusted on the strength of the earlier sighting."""
+        """Release held DMs, re-checking each (host glob + verified) at release."""
         n = nick.lower()
         with dm_lock:
             queued = dm_held.pop(n, [])
@@ -387,22 +277,16 @@ data:
         return line
 
 
-    # Origin tags are stamped into bot.log and read back by parsers, so keep them
-    # boring: no spaces, no brackets, nothing that could forge a second field.
-    ORIGIN_PAT = re.compile(r"^[a-z0-9_-]{1,24}$")
-
-
-    def log(direction, line, origin=None):
-        tag = f"[{origin}] " if origin else ""
+    def log(direction, line):
         try:
             with open(LOG, "a") as f:
-                f.write(f"{_now('%H:%M:%S')} {direction} {tag}{_mask_secrets(line)}\n")
+                f.write(f"{now('%H:%M:%S')} {direction} {_mask_secrets(line)}\n")
         except Exception:
             pass
 
 
-    def send_raw(s, origin=None):
-        log(">", s, origin)
+    def send_raw(s):
+        log(">", s)
         with send_lock:
             try:
                 sock.sendall((s + "\r\n").encode("utf-8", errors="replace"))
@@ -410,21 +294,16 @@ data:
                 emit("ERROR", "send-fail", repr(e))
 
 
-    def split_say(target, text, origin=None):
-        """Send text as one or more PRIVMSGs, preserving whitespace verbatim.
-
-        Lines that fit in MAX_BODY go out untouched, so ascii art keeps its
-        indentation and internal spacing (#86). Longer lines wrap at the last
-        space before the limit WITHOUT stripping or collapsing spaces; a single
-        oversized word is hard-split on a utf-8 char boundary.
-        """
+    def split_say(target, text):
+        """PRIVMSG(s) preserving whitespace verbatim; wrap at the last space
+        before MAX_BODY bytes, hard-splitting an oversized word on a utf-8 boundary."""
         b = text.encode("utf-8")
         if len(b) <= MAX_BODY:
-            send_raw(f"PRIVMSG {target} :{text}", origin)
+            send_raw(f"PRIVMSG {target} :{text}")
             return
         while b:
             if len(b) <= MAX_BODY:
-                send_raw(f"PRIVMSG {target} :{b.decode('utf-8', errors='ignore')}", origin)
+                send_raw(f"PRIVMSG {target} :{b.decode('utf-8', errors='ignore')}")
                 return
             cut = b.rfind(b" ", 1, MAX_BODY + 1)
             if cut <= 0:
@@ -432,189 +311,9 @@ data:
                 while cut > 1 and (b[cut] & 0xC0) == 0x80:
                     cut -= 1
             else:
-                cut += 1  # keep the breaking space on this chunk, don't strip it
-            send_raw(f"PRIVMSG {target} :{b[:cut].decode('utf-8', errors='ignore')}", origin)
+                cut += 1  # keep the breaking space on this chunk
+            send_raw(f"PRIVMSG {target} :{b[:cut].decode('utf-8', errors='ignore')}")
             b = b[cut:]
-
-
-    # DCC SEND. Serve a EliteWarez: il `!list` offre "warez", e prima o poi uno
-    # prova a scaricarli. Un listener effimero sull'indirizzo da cui usciamo, il
-    # CTCP con la porta, UNA connessione servita e chiuso.
-    #
-    # Nasce solo IPv6 (ordine di vjt #sbiffo 2026-09-12 01:29, "va bene facciamolo
-    # solo ipv6"), e sul campo si e' visto il prezzo: il DCC storico vuole l'IP come
-    # intero decimale a 32 bit, e un client che il v6 in quel campo non lo digerisce
-    # — HexChat, misurato con peluche il 14/09 — legge la stringa come numero e ne
-    # cava 0.0.0.2, cioe' "No route to host". irssi e mIRC 7 invece il letterale v6
-    # lo leggono, quindi il ramo v6 resta e non si tocca.
-    #
-    # BOT_DCC_BIND4 accende il ramo v4 e ha la precedenza: si ascolta li' (nella
-    # jail e' un privato di <jail_v4>) e si annuncia BOT_DCC_ADDR4, il pubblico
-    # davanti alla rdr di pf, come intero a 32 bit. Ordine di vjt 2026-09-14 23:28
-    # ("VA BENE IPV4", poi "ipv4 e basta"): cosi' prendono anche i client v4-only.
-    #
-    # La porta non puo' essere effimera: dietro un firewall la finestra va aperta
-    # in anticipo, e non si apre quello che sceglie il kernel. BOT_DCC_PORT_MIN /
-    # MAX danno un intervallo fisso da rispecchiare nella regola di pf; a zero (il
-    # default) si torna alla porta effimera, buona solo dove non c'e' firewall.
-    DCC_DIR = _cfg("BOT_DCC_DIR", os.path.join(HERE, "dcc"))
-    DCC_TIMEOUT = int(_cfg("BOT_DCC_TIMEOUT", "180"))
-    # Quanto aspettiamo che il peer chiuda dopo l'ultimo byte, prima di mollare.
-    DCC_DRAIN_TIMEOUT = int(_cfg("BOT_DCC_DRAIN_TIMEOUT", "60"))
-    DCC_PORT_MIN = int(_cfg("BOT_DCC_PORT_MIN", "0"))
-    DCC_PORT_MAX = int(_cfg("BOT_DCC_PORT_MAX", "0"))
-    # Ramo v4: indirizzo su cui ascoltare, e indirizzo da annunciare (uguale al
-    # primo se non c'e' NAT davanti). Vuoto = si resta sul v6 di IRC_BIND.
-    DCC_BIND4 = _cfg("BOT_DCC_BIND4", "")
-    DCC_ADDR4 = _cfg("BOT_DCC_ADDR4", "") or DCC_BIND4
-    DCC_NAME_PAT = re.compile(r"[A-Za-z0-9._-]{1,80}\Z")
-    # The offer name is what the peer's client shows and never touches the disk,
-    # so it needs no traversal guard — only CTCP safety (no spaces, the field
-    # separator) and a length that fits a scene title (~78) plus extension.
-    DCC_OFFER_NAME_PAT = re.compile(r"[A-Za-z0-9._-]{1,120}\Z")
-
-
-    def _dcc_bind(srv, addr):
-        """Bind the listener inside the configured range, or ephemeral if unset.
-
-        Every offer holds its port for the whole transfer, so with N offers in
-        flight the first N ports of the range are taken: we walk it until one
-        binds. Range exhausted -> the caller refuses the offer.
-        """
-        if DCC_PORT_MIN <= 0 or DCC_PORT_MAX < DCC_PORT_MIN:
-            srv.bind((addr, 0))
-            return
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        for port in range(DCC_PORT_MIN, DCC_PORT_MAX + 1):
-            try:
-                srv.bind((addr, port))
-            except OSError:
-                continue
-            return
-        raise OSError(f"no free port in {DCC_PORT_MIN}-{DCC_PORT_MAX}")
-
-
-    def _dcc_drain(conn):
-        """Half-close, read the peer's ACK stream to EOF, return the last ACK.
-
-        Un ricevente DCC risponde a ogni blocco con un ACK di 4 byte big-endian, il
-        totale ricevuto finora. Quegli ACK si accumulano nel nostro buffer di
-        ricezione, e chiudere un socket con dati non letti fa emettere al kernel un
-        RST invece del FIN: il peer perde tutto quello che era ancora in volo e si
-        ritrova un file mozzato mentre noi abbiamo gia' loggato DCC_DONE (vjt su
-        #sbiffo il 2026-09-14: "il transfer non completa" — misurato, 131072 byte su
-        246254 con un client lento). Mezza chiusura, si drena, e il close finale e'
-        un FIN pulito. L'ultimo ACK e' anche l'unica prova di consegna che abbiamo.
-        """
-        last = None
-        try:
-            conn.shutdown(socket.SHUT_WR)
-            conn.settimeout(DCC_DRAIN_TIMEOUT)
-            tail = b""
-            while True:
-                more = conn.recv(65536)
-                if not more:
-                    break
-                tail = (tail + more)[-4:]
-            if len(tail) == 4:
-                last = int.from_bytes(tail, "big")
-        except OSError:
-            pass
-        return last
-
-
-    def _dcc_event(kind, *parts):
-        """Emit a DCC lifecycle event on BOTH stdout and bot.log.
-
-        stdout is the Monitor's stream; bot.log is what the sidecars tail. A
-        sidecar that wants to announce "nick ha ricevuto il file" only follows
-        bot.log (it is the PRIVMSG stream), so without this second write the
-        completion would be invisible to it. Same trick as IDLE above.
-        """
-        emit(kind, *parts)
-        log("*", kind + " " + " ".join(str(p) for p in parts))
-
-
-    def _dcc_serve(srv, path, nick, name):
-        """Accept one peer, push the file, hang up. Runs off the reader thread."""
-        try:
-            conn, _peer = srv.accept()
-        except Exception as e:
-            _dcc_event("DCC_TIMEOUT", f"TO={nick}", f"FILE={name}", repr(e))
-            return
-        finally:
-            srv.close()
-        sent = 0
-        try:
-            # accept() does NOT inherit the listener's timeout reliably; set it.
-            conn.settimeout(DCC_TIMEOUT)
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    conn.sendall(chunk)
-                    sent += len(chunk)
-        except Exception as e:
-            _dcc_event("DCC_ERROR", f"TO={nick}", f"FILE={name}", f"SENT={sent}", repr(e))
-        else:
-            ack = _dcc_drain(conn)
-            _dcc_event("DCC_DONE", f"TO={nick}", f"FILE={name}", f"BYTES={sent}",
-                       f"ACK={ack if ack is not None else 'none'}")
-        finally:
-            conn.close()
-
-
-    def dcc_send(nick, name, origin=None, offer=None):
-        # `name` is the file on disk; `offer` is the name announced to the peer,
-        # defaulting to `name`. Both come from a sidecar and ride a CTCP whose
-        # fields are space-separated and unquotable: no path, no traversal, no
-        # spaces. `name` must stay a bare basename (it opens a file); `offer`
-        # never touches disk, so it only needs to be CTCP-safe.
-        if not DCC_NAME_PAT.match(name):
-            emit("CMD_ERROR", "dcc-bad-name", repr(name))
-            return
-        if offer is None:
-            offer = name
-        elif not DCC_OFFER_NAME_PAT.match(offer):
-            emit("CMD_ERROR", "dcc-bad-offer", repr(offer))
-            return
-        path = os.path.join(DCC_DIR, name)
-        if not os.path.isfile(path):
-            emit("CMD_ERROR", "dcc-no-file", path)
-            return
-        bind = DCC_BIND4 or BIND
-        if not bind:
-            emit("CMD_ERROR", "dcc-no-bind", "IRC_BIND empty: no address, no offer")
-            return
-        if DCC_BIND4:
-            # Il campo indirizzo del DCC e' un intero a 32 bit, non una stringa.
-            try:
-                advertise = str(int.from_bytes(socket.inet_aton(DCC_ADDR4), "big"))
-            except OSError as e:
-                emit("CMD_ERROR", "dcc-bad-addr4", repr(DCC_ADDR4), repr(e))
-                return
-        else:
-            advertise = BIND
-        size = os.path.getsize(path)
-        family = socket.AF_INET if DCC_BIND4 else socket.AF_INET6
-        srv = socket.socket(family, socket.SOCK_STREAM)
-        try:
-            srv.settimeout(DCC_TIMEOUT)
-            _dcc_bind(srv, bind)
-            srv.listen(1)
-        except Exception as e:
-            srv.close()
-            emit("CMD_ERROR", "dcc-listen-fail", repr(e))
-            return
-        port = srv.getsockname()[1]
-        threading.Thread(
-            target=_dcc_serve, args=(srv, path, nick, offer), daemon=True
-        ).start()
-        send_raw(f"PRIVMSG {nick} :\x01DCC SEND {offer} {advertise} {port} {size}\x01",
-                 origin)
-        emit("DCC_OFFER", f"TO={nick}", f"FILE={name}", f"OFFER={offer}",
-             f"ADDR={advertise}", f"PORT={port}", f"SIZE={size}")
 
 
     def run_startup():
@@ -648,11 +347,8 @@ data:
 
 
     def _reclaim_after_ghost():
-        # GHOST is near-instant but async; give services a beat to kill the ghost,
-        # then reclaim the real nick. The server's echo of our own NICK change (in
-        # handle_server_line) fires IDENTIFY. This is wording-agnostic on purpose,
-        # so we don't depend on the exact "has been ghosted" NOTICE text differing
-        # between Azzurra (suxserv) and Libera (atheme).
+        # GHOST is async; give services a beat, then reclaim. The echo of our own
+        # NICK change fires IDENTIFY — wording-agnostic across services.
         time.sleep(4)
         if ghost_needed:
             send_raw(f"NICK {NICK}")
@@ -671,11 +367,8 @@ data:
             return
         prefix, cmd, rest = m.groups()
         nick = prefix.split("!")[0] if prefix else ""
-        # Host from the source prefix (nick!user@host). Computed once so EVERY
-        # emitted event can carry HOST= — the Monitor must never be host-blind on a
-        # JOIN/NICK the way it was when a *.diostronzo.org flooder spoofed nick
-        # `vjt_` and only the raw bot.log (not the event stream) revealed it wasn't
-        # vjt's trust host *.openssl.it (vjt 2026-07-02).
+        # Host in every event: a flooder spoofing a trusted nick is only visible
+        # against the trust host glob, in the stream itself.
         host = prefix.split("@", 1)[1] if prefix and "@" in prefix else ""
         rest = rest or ""
         if cmd in ("PRIVMSG", "NOTICE", "TOPIC") and " :" in rest:
@@ -691,8 +384,6 @@ data:
                 emit("WHOIS_FIRED", tn)
             if NICKSERV_PASS:
                 if ghost_needed:
-                    # Our real nick is held (by our own ghost after a line drop):
-                    # kill it from services, then reclaim + IDENTIFY (see below).
                     send_raw(f"PRIVMSG NickServ :GHOST {NICK} {NICKSERV_PASS}")
                     emit("NS_GHOST_SENT", NICK)
                     threading.Thread(target=_reclaim_after_ghost, daemon=True).start()
@@ -705,10 +396,6 @@ data:
         if cmd in ("433", "432", "437"):
             emit("NICK_ERROR", cmd, rest)
             if not registered:
-                # Pre-registration collision, almost always our own lingering
-                # ghost. Grab a throwaway nick so registration completes and we
-                # reach 001 -> then GHOST the real nick and reclaim it. Random
-                # suffix so a second flap doesn't collide with the same temp.
                 tmp_nick = f"{NICK}-{random.randint(100, 999)}"
                 send_raw(f"NICK {tmp_nick}")
                 ghost_needed = True
@@ -718,17 +405,14 @@ data:
             emit("AUTH_ERROR", cmd, rest)
             return
         if cmd == "401":
-            # ERR_NOSUCHNICK: ":server 401 <me> <target> :No such nick/channel"
-            # Surface as event so silent PRIVMSG/NOTICE failures become visible
-            # (otherwise they only land in bot.log and the sender never retries).
+            # ERR_NOSUCHNICK: surface silent PRIVMSG/NOTICE failures as events.
             parts = rest.split(" :", 1)
             head = parts[0].split()
             tgt = head[1] if len(head) > 1 else ""
             reason = parts[1] if len(parts) > 1 else "No such nick/channel"
             emit("IRC_ERROR", "401", tgt, reason)
             return
-        if cmd == "307":
-            # RPL_WHOISREGNICK: ":server 307 <me> <target> :has identified for this nick"
+        if cmd == "307":    # RPL_WHOISREGNICK (Azzurra/bahamut)
             parts = rest.split()
             if len(parts) >= 2:
                 target = parts[1].lower()
@@ -738,12 +422,7 @@ data:
                 dm_flush(parts[1], "307")
             return
         if cmd == "330":
-            # RPL_WHOISACCOUNT (Libera/solanum): ":srv 330 <me> <nick> <account>
-            # :is logged in as". Libera does NOT emit 307 (a Bahamut-ism), so this
-            # is its identified-to-services signal — mirror the 307 path or a
-            # trust-listed nick never verifies there. Safe: on Libera only the real
-            # account holder wears the `user/<account>` cloak the host-glob already
-            # pins, so account-vs-nick mismatch can't slip trust through.
+            # RPL_WHOISACCOUNT (Libera/solanum — Libera has no 307).
             parts = rest.split()
             if len(parts) >= 2:
                 target = parts[1].lower()
@@ -753,7 +432,7 @@ data:
                 dm_flush(parts[1], "330")
             return
         if cmd == "318":
-            # RPL_ENDOFWHOIS: if nick was pending and not verified => not registered
+            # RPL_ENDOFWHOIS: pending and not verified => not registered.
             parts = rest.split()
             if len(parts) >= 2:
                 target = parts[1].lower()
@@ -761,8 +440,7 @@ data:
                     whois_pending.discard(target)
                     if target not in verified:
                         emit("NOT_REGISTERED", parts[1])
-                # Either way the WHOIS is over: nothing may stay parked past it.
-                dm_flush(parts[1], "318")
+                dm_flush(parts[1], "318")   # nothing stays parked past ENDOFWHOIS
             return
         if cmd == "NOTICE":
             parts = rest.split(" :", 1)
@@ -786,7 +464,6 @@ data:
                 send_raw(f"JOIN {target_chan}")
             return
         if cmd == "KICK":
-            # rest = "#chan target[ :reason]"
             kick_parts = rest.split(" :", 1)
             head = kick_parts[0].split()
             kick_chan = head[0] if head else ""
@@ -794,19 +471,19 @@ data:
             kick_reason = kick_parts[1] if len(kick_parts) > 1 else ""
             emit("KICK", nick, f"HOST={host}", kick_chan, kick_target, kick_reason)
             if kick_chan and kick_target.lower() == NICK.lower():
-                # Auto-rejoin with kick-flood backoff. Repeated kicks in a short
-                # window = a hostile op. Walk away rather than trigger Excess Flood.
-                now = time.monotonic()
+                # Repeated kicks in a short window = a hostile op: walk away
+                # rather than rejoin into Excess Flood.
+                nowm = time.monotonic()
                 key = kick_chan.lower()
                 with kick_lock:
-                    history = [t for t in kick_history.get(key, []) if now - t < KICK_WINDOW]
-                    history.append(now)
+                    history = [t for t in kick_history.get(key, []) if nowm - t < KICK_WINDOW]
+                    history.append(nowm)
                     kick_history[key] = history
                     count = len(history)
                 if count > KICK_MAX:
                     emit("KICK_GIVEUP", kick_chan, nick, f"{count} kicks in {KICK_WINDOW}s")
                 else:
-                    def _rejoin(ch: str = kick_chan) -> None:
+                    def _rejoin(ch=kick_chan):
                         send_raw(f"PRIVMSG ChanServ :INVITE {ch}")
                         threading.Timer(0.5, lambda: send_raw(f"JOIN {ch}")).start()
                     threading.Timer(2.0, _rejoin).start()
@@ -824,26 +501,16 @@ data:
                 elif ctcp.upper().startswith("PING"):
                     send_raw(f"NOTICE {nick} :\x01{ctcp}\x01")
                 return
-            # Private message from a nick that isn't even trust-listed: drop it
-            # here. No BODY is emitted — the whole point is that the payload never
-            # reaches the event stream (vjt 2026-08-03).
             if not target.startswith(("#", "&")) and dm_blocked(nick):
                 replied = dm_reject_once(nick)
-                emit(
-                    "DM_BLOCKED",
-                    f"FROM={nick}",
-                    f"HOST={host}",
-                    f"LEN={len(body)}",
-                    "replied" if replied else "silent",
-                )
+                emit("DM_BLOCKED", f"FROM={nick}", f"HOST={host}",
+                     f"LEN={len(body)}", "replied" if replied else "silent")
                 return
             trusted, reason = trust_check(nick, host)
             trust = "TRUSTED" if trusted else "UNTRUSTED"
             if not target.startswith(("#", "&")) and not trusted:
-                # Listed (dm_blocked already ate the strangers) but not trusted yet.
-                # pending-whois => park it, the 307/330/318 handler decides. Anything
-                # else (host-mismatch: a squatter on a listed nick) will never become
-                # trusted, so drop it now and rebound the notice.
+                # Listed but pending WHOIS: park it. Anything else (host-mismatch
+                # squatter) will never become trusted: drop and rebound.
                 if reason == "pending-whois":
                     depth = dm_hold(nick, host, body)
                     emit("DM_HELD", f"FROM={nick}", f"HOST={host}",
@@ -857,8 +524,6 @@ data:
             emit("MSG", trust, f"FROM={nick}", f"HOST={host}", f"TO={target}", f"BODY={body}")
             if is_trust_listed(nick) and not trusted:
                 emit("TRUST_DENIED", nick, host, reason)
-            # Re-arm the idle timer only on HUMAN PRIVMSG to a tracked channel.
-            # Our own outgoing messages don't reach this path.
             if target.startswith("#") and nick.lower() != NICK.lower():
                 _arm_idle(target)
             return
@@ -878,9 +543,6 @@ data:
             emit("NICK_CHANGE", nick, f"HOST={host}", new_nick)
             trust_reset(nick, "nick-change")
             if ghost_needed and new_nick.lower() == NICK.lower():
-                # We just reclaimed the real nick after ghosting the stale one.
-                # Now IDENTIFY on it (NickServ's "identified" NOTICE then fires the
-                # channel-join startup, so JOINs happen on the right nick).
                 ghost_needed = False
                 if NICKSERV_PASS:
                     send_raw(f"PRIVMSG NickServ :IDENTIFY {NICKSERV_PASS}")
@@ -891,10 +553,9 @@ data:
             return
 
 
-    # EAGAIN on a TLS socket means "the record isn't complete yet", not "the link
-    # is dead" — retrying is correct. But retrying FOREVER would leave a process
-    # that looks alive and hears nothing, which is worse than dying, so the retry
-    # is capped and a real recv resets the count.
+    # EAGAIN on a TLS socket means "record not complete yet", not "link dead" —
+    # retry, but a capped retry: a process that hears nothing forever is worse
+    # than a dead one. A real recv resets the count.
     RECV_RETRY_SLEEP = 0.05
     RECV_RETRY_MAX = 200            # ~10s of solid EAGAIN, then die for real
 
@@ -906,10 +567,8 @@ data:
             try:
                 data = sock.recv(8192)
             except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError) as e:
-                # Measured 2026-08-19 13:03: one BlockingIOError(11) killed the
-                # process and cost a full reconnect. Against 37 genuine
-                # TimeoutErrors in the same history — so the two must NOT share a
-                # handler. Timeout and reset still fall through and kill us.
+                # One BlockingIOError(11) once killed the process and cost a full
+                # reconnect; genuine timeouts share neither handler.
                 retries += 1
                 if retries > RECV_RETRY_MAX:
                     emit("ERROR", "recv-fail", f"{retries} consecutive {e!r}")
@@ -954,13 +613,9 @@ data:
                         emit("CMD_ERROR", "cmd-fail", repr(e), line[:80])
 
 
-    def outbound_ok(verb, rest, origin):
-        """Leak gate for every chat line the FIFO asks for (leak_guard.py).
-
-        RAW is parsed too, or `RAW PRIVMSG #x :...` would be the way around it.
-        A line to a reserved channel of ours is recorded here, since our own
-        words there are just as reserved as anyone else's.
-        """
+    def outbound_ok(verb, rest):
+        """Leak gate for every chat line; RAW is parsed too, or `RAW PRIVMSG #x
+        :...` would be the way around it."""
         if verb == "RAW":
             m = re.match(r"(?i)(PRIVMSG|NOTICE|TOPIC)\s+(\S+)\s+:(.*)", rest)
             if not m:
@@ -970,13 +625,12 @@ data:
             target, text = rest.split(" ", 1)
         else:
             return True
-        # Services commands name the reserved channel by design (bot.startup's
-        # `ChanServ :INVITE #it-opers` got eaten on the first restart, 2026-09-24).
+        # Services commands name the reserved channel by design.
         if target.lower() in ("chanserv", "nickserv"):
             return True
         reason = leak_guard.check(target, text, dm_ok=is_trust_listed(target))
         if reason:
-            log("!", f"LEAK_BLOCKED {verb} {target} {reason}", origin)
+            log("!", f"LEAK_BLOCKED {verb} {target} {reason}")
             emit("LEAK_BLOCKED", verb, f"TO={target}", reason, f"LEN={len(text)}")
             return False
         leak_guard.record(target, text)
@@ -984,60 +638,41 @@ data:
 
 
     def process_cmd(line):
-        if " " in line:
-            verb, rest = line.split(" ", 1)
-        else:
-            verb, rest = line, ""
-        origin = None
-        if ":" in verb:
-            verb, _, origin = verb.partition(":")
-            origin = origin.lower()
-            if not ORIGIN_PAT.match(origin):
-                emit("CMD_ERROR", "bad-origin-tag", repr(origin),
-                     "allowed: [a-z0-9_-]{1,24}")
-                return
+        verb, _, rest = line.partition(" ")
         verb = verb.upper()
-        if not outbound_ok(verb, rest, origin):
+        if not outbound_ok(verb, rest):
             return
         if verb == "SAY":
             if " " not in rest:
                 emit("CMD_ERROR", "SAY needs <target> <text>", repr(rest))
                 return
             target, text = rest.split(" ", 1)
-            split_say(target, text, origin)
+            split_say(target, text)
         elif verb == "ACT":
             if " " not in rest:
                 emit("CMD_ERROR", "ACT needs <target> <text>", repr(rest))
                 return
             target, text = rest.split(" ", 1)
-            send_raw(f"PRIVMSG {target} :\x01ACTION {text}\x01", origin)
+            send_raw(f"PRIVMSG {target} :\x01ACTION {text}\x01")
         elif verb == "NOTICE":
             if " " not in rest:
                 emit("CMD_ERROR", "NOTICE needs <target> <text>", repr(rest))
                 return
             target, text = rest.split(" ", 1)
-            send_raw(f"NOTICE {target} :{text}", origin)
+            send_raw(f"NOTICE {target} :{text}")
         elif verb == "JOIN":
-            send_raw(f"JOIN {rest}", origin)
+            send_raw(f"JOIN {rest}")
         elif verb == "PART":
-            send_raw(f"PART {rest}", origin)
+            send_raw(f"PART {rest}")
         elif verb == "WHOIS":
-            send_raw(f"WHOIS {rest}", origin)
+            send_raw(f"WHOIS {rest}")
         elif verb == "QUIT":
-            send_raw(f"QUIT :{rest or 'bye'}", origin)
+            send_raw(f"QUIT :{rest or 'bye'}")
         elif verb == "RAW":
-            send_raw(rest, origin)
-        elif verb == "DCC":
-            if " " not in rest:
-                emit("CMD_ERROR", "DCC needs <nick> <file> [name]", repr(rest))
-                return
-            parts = rest.split(" ", 2)
-            nick, name = parts[0], parts[1].strip()
-            offer = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
-            dcc_send(nick, name, origin, offer)
+            send_raw(rest)
         else:
             emit("CMD_ERROR", "unknown-verb", repr(verb),
-                 "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC")
+                 "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW")
 
 
     def main():
@@ -1045,17 +680,14 @@ data:
         load_trust()
         ctx = ssl.create_default_context()
         if not TLS_VERIFY:
-            # Order matters: check_hostname must go first, CERT_NONE with hostname
-            # checking still enabled raises ValueError.
+            # check_hostname must go first: CERT_NONE with hostname checking raises.
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection(
             (HOST, PORT), timeout=30, source_address=((BIND, 0) if BIND else None)
         )
-        # Belt-and-suspenders against silent TCP death (NAT/ISP drops):
-        # kernel keepalive probes + app-level recv timeout. Server PINGs us
-        # ~3-5min; 420s timeout on recv surfaces a stalled socket as
-        # socket.timeout -> reader_loop returns -> systemd Restart=always.
+        # Kernel keepalive + recv timeout: a silently dead TCP link surfaces as a
+        # timeout -> reader_loop returns -> the platform restart policy acts.
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if hasattr(socket, "TCP_KEEPIDLE"):
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
@@ -1066,7 +698,6 @@ data:
             sock.settimeout(420)
             emit("TLS_OK", HOST, PORT, "verify" if TLS_VERIFY else "NOVERIFY")
         else:
-            # Offline smoke-test path (tests/CI only): plain TCP, no wrap.
             sock = raw
             sock.settimeout(420)
             emit("TCP_OK", HOST, PORT, "plaintext")
@@ -1090,41 +721,21 @@ data:
     #!/usr/bin/env python3
     """leak_guard.py — reserved-content leak gate for bot.py.
 
-    The original repo ships this module; the `.reference/` copy here does not
-    include it, so this is an equivalent re-implementation of the same contract
-    that bot.py relies on:
-
-        g = LeakGuard(host, reserved_file, store_file)
-        g.record(target, body)          # remember a line that entered the bridge
-        reason = g.check(target, text, dm_ok=False)   # None if the send is fine
-
-    Model: a channel (or nick) is *reserved* when it appears in `bot.reserved`.
-    Everything said in a reserved channel is private context: it may be read and
-    reasoned about, but it must not be paraphrased back onto the open network.
-    The gate therefore stores the recent reserved lines and, on the way out,
-    refuses an outbound line to a NON-reserved target when it shares a verbatim
-    run (>= MIN_RUN characters) with a line that was recorded in a reserved
-    channel. A DM to a reserved target itself (dm_ok) is always allowed, and a
-    line addressed *to* a reserved channel is never a leak.
-
-    The original's exact heuristic is not published; this keeps the same shape
-    (files, names, API, on/off via an empty file) and is deliberately boring:
-    stdlib only, bounded memory, no framework.
+    A channel (or nick) in `bot.reserved` is *reserved*: what is said there may
+    be read and reasoned about, but never paraphrased back onto the open network.
+    The gate records recent reserved lines and refuses an outbound line to a
+    NON-reserved target when it shares a verbatim run (>= MIN_RUN chars) with a
+    recorded reserved line. Sends to a reserved target, or a DM to one, are fine.
     """
     import fnmatch
     import os
     import threading
     import time
 
-    # A shared run of this many characters between an outgoing line and a stored
-    # reserved line is treated as a leak. Configurable; keep it high enough that
-    # ordinary IRC chatter (greetings, single words) can never trip it.
-    MIN_RUN = int(os.environ.get("BOT_RESERVED_MINRUN", "40"))
-    # Bounded memory: keep at most this many reserved lines, each truncated.
-    MAX_LINES = int(os.environ.get("BOT_RESERVED_MAX", "200"))
+    MIN_RUN = 40       # shared-run length that counts as a leak
+    MAX_LINES = 200    # bounded memory: reserved lines kept, each truncated
+    MAX_AGE = 86400.0  # drop stored lines older than this (0 = never)
     LINE_CAP = 512
-    # Drop stored lines older than this many seconds (0 = never expire).
-    MAX_AGE = float(os.environ.get("BOT_RESERVED_TTL", "86400"))
 
 
     class LeakGuard:
@@ -1142,9 +753,8 @@ data:
                 with open(self.reserved_file) as f:
                     for line in f:
                         line = line.strip()
-                        # A comment is a bare '#', or '#' followed by whitespace.
-                        # A channel glob like '#brain-private' has no space, so it
-                        # is NOT mistaken for a comment (nicks never start with #).
+                        # '#' followed by whitespace is a comment; '#brain-p'
+                        # is a channel glob (nicks never start with #).
                         if not line or line == "#" or line.startswith("# "):
                             continue
                         self.globs.append(line.lower())
@@ -1189,19 +799,15 @@ data:
                 pass
 
         def check(self, target, text, dm_ok=False):
-            """Return a reason string when `text` must not go to `target`, else None.
-
-            A send to a reserved target, or a DM to a reserved nick, is fine.
-            """
+            """Reason string when `text` must not go to `target`, else None."""
             if not text:
                 return None
             if self._is_reserved(target) or dm_ok:
                 return None
-            needle = text
             with self.lock:
                 self._expire_locked(time.monotonic())
                 for _ts, src, body in self.lines:
-                    if self._shared_run(needle, body):
+                    if self._shared_run(text, body):
                         return f"reserved-content:{src}"
             return None
 
@@ -1210,37 +816,49 @@ data:
             """True if a and b share a verbatim run of >= MIN_RUN characters."""
             if len(a) < MIN_RUN or len(b) < MIN_RUN:
                 return False
-            # Bounded: a and b are capped at LINE_CAP, so the scan stays cheap.
             for i in range(len(a) - MIN_RUN + 1):
                 if a[i:i + MIN_RUN] in b:
                     return True
             return False
+  util.py: |
+    #!/usr/bin/env python3
+    """util.py — the few lines bot.py, brain.py and watchdog.py all share."""
+    import os
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo("Europe/Rome")
+
+
+    def now(fmt):
+        return datetime.now(TZ).strftime(fmt)
+
+
+    def env(key, default=""):
+        return os.environ.get(key, default)
+
+
+    def env_bool(key, default=False):
+        v = os.environ.get(key)
+        return default if v is None else v not in ("0", "no", "off", "false", "")
+
+
+    def emit(tag, kind, *parts):
+        print(f"[{now('%H:%M:%S')}] {tag} {kind} " +
+              " ".join(str(p) for p in parts), flush=True)
   brain.py: |
     #!/usr/bin/env python3
     """brain.py — persistent OpenCode sessions, one per (network, channel).
 
-    The round-1 brain spawned a cold `opencode run` process per reply batch: no
-    memory between replies, 6-9 s latency, nothing expressible beyond one-shot
-    text. This version is the design issue #2 calls the keystone:
-
-        opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one);
-        every (network, channel) gets ONE warm session;
-        events are tailed per network and submitted with
-            POST /session/{id}/prompt_async  (HTTP 204, non-blocking);
-        replies stream back over SSE GET /event; on `session.idle` the last
-            assistant message is fetched and parsed into FIFO verb lines;
-        a wedged turn is cancelled with POST /session/{id}/abort; turn liveness
-            is polled with GET /session/status.
-
-    Warm-session replies land in ~1-3 s and the session remembers its previous
-    turns — the premise for per-channel registers, memory promotion and the
-    compaction-resilient agent (memory_log.py, policy.py).
-
-    The agent-state guard ports aup_watchdog's triggers into the loop: turn cap,
-    refusal-shaped replies and wedged turns each reset the session and rehydrate
-    it from disk memory; permission requests are rejected on sight and announced
-    to the admin over the bot FIFO (the headless equivalent of gate-permission.py:
-    an interactive prompt would dead-lock, so deny fast and surface on IRC).
+        opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one); every
+        (network, channel) gets ONE warm session; events are tailed per network
+        and submitted with POST /session/{id}/prompt_async (HTTP 204, never
+        blocking); replies stream back over SSE GET /event and are parsed into
+        FIFO verb lines. A wedged turn is cancelled with /abort; refusals, turn
+        caps and repeated wedges reset the session, which rehydrates from disk
+        memory (memory_log.py). Permission requests are rejected on sight and
+        announced to the admin over the bot FIFO — an interactive prompt would
+        dead-lock a headless agent, so deny fast and surface on IRC.
     """
     import argparse
     import hashlib
@@ -1253,85 +871,47 @@ data:
     import time
     import urllib.request
     from collections import deque
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from functools import partial
 
     import memory_log
     import networks
     import policy
+    from util import emit as _emit
+    from util import env, env_bool
 
-    HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-    def _cfg(key, default):
-        return os.environ.get(key, default)
-
-
-    def _bool(key, default=False):
-        v = os.environ.get(key)
-        if v is None:
-            return default
-        return v not in ("0", "no", "off", "false", "")
-
+    emit = partial(_emit, "BRAIN")
 
     # --- config -----------------------------------------------------------------
-    HEARTBEAT = _cfg("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
-    AGENT_STATUS = _cfg("BRAIN_AGENT_STATUS", "/data/agent.status")
-    WORKDIR = _cfg("BRAIN_WORKDIR", "/data/workspace")
-    MEMORY_DIR = _cfg("BRAIN_MEMORY_DIR", os.path.join(WORKDIR, "memory"))
-    NICK = _cfg("IRC_NICK", "vjt-claude")          # fallback; per-net nick wins
-    ADMIN = _cfg("BRAIN_ADMIN", "admin")           # NOTICE target for the gate
-    MODEL = _cfg("BRAIN_MODEL", "opencode/deepseek-v4.1-flash-free")
-    OPENCODE_BIN = _cfg("BRAIN_OPENCODE_BIN", "opencode")
-    SERVE_URL = _cfg("BRAIN_SERVE_URL", "")        # attach mode (tests/CI)
-    SERVE_PORT = int(_cfg("BRAIN_SERVE_PORT", "46099"))
-    POLL = float(_cfg("BRAIN_POLL", "1.0"))
-    BATCH_MAX = int(_cfg("BRAIN_BATCH_MAX", "5"))
-    BATCH_WINDOW = float(_cfg("BRAIN_BATCH_WINDOW", "3.0"))
-    RING = int(_cfg("BRAIN_RING", "8"))
-    MAX_CHANS = int(_cfg("BRAIN_MAX_CHANS", "64"))
-    RATE = float(_cfg("BRAIN_RATE", "3.0"))        # min seconds between sends/target
-    GLOBAL_RATE = float(_cfg("BRAIN_GLOBAL_RATE", "1.0"))
-    FROM_START = _bool("BRAIN_FROM_START", False)
-    DRY_RUN = _bool("BRAIN_DRY_RUN", False)
-    API_KEY = _cfg("OPENCODE_API_KEY", "")
-    # Agent-guard triggers (aup_watchdog equivalents).
-    MAX_TURNS = int(_cfg("BRAIN_MAX_TURNS", "150"))
-    TURN_TIMEOUT = float(_cfg("BRAIN_TURN_TIMEOUT", "180"))   # wedged turn
-    # chan_filter.awk port: comma-separated channels that never reach the agent.
-    MUTE = tuple(c.strip().lower() for c in _cfg("BRAIN_MUTE", "").split(",")
-                 if c.strip())
-    ADDRESS_ONLY = _bool("BRAIN_ADDRESS_ONLY", False)
+    HEARTBEAT = env("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
+    AGENT_STATUS = env("BRAIN_AGENT_STATUS", "/data/agent.status")
+    WORKDIR = env("BRAIN_WORKDIR", "/data/workspace")
+    MEMORY_DIR = env("BRAIN_MEMORY_DIR", os.path.join(WORKDIR, "memory"))
+    NICK = env("IRC_NICK", "vjt-claude")           # fallback; per-net nick wins
+    ADMIN = env("BRAIN_ADMIN", "admin")            # NOTICE target for the gate
+    MODEL = env("BRAIN_MODEL", "opencode/deepseek-v4.1-flash-free")
+    SERVE_URL = env("BRAIN_SERVE_URL", "")         # attach mode (tests/CI)
+    SERVE_PORT = int(env("BRAIN_SERVE_PORT", "46099"))
+    POLL = float(env("BRAIN_POLL", "1.0"))
+    BATCH_WINDOW = float(env("BRAIN_BATCH_WINDOW", "3.0"))
+    RATE = float(env("BRAIN_RATE", "3.0"))         # min seconds between sends/target
+    GLOBAL_RATE = float(env("BRAIN_GLOBAL_RATE", "1.0"))
+    FROM_START = env_bool("BRAIN_FROM_START")
+    MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
+                 if c.strip())                     # chan_filter.awk port
+    ADDRESS_ONLY = env_bool("BRAIN_ADDRESS_ONLY")
+    API_KEY = env("OPENCODE_API_KEY", "")
 
-    _TZ = ZoneInfo("Europe/Rome")
-
-
-    def refusal_patterns():
-        """BRAIN_REFUSAL_PATTERNS (JSON list) or the built-in AUP set."""
-        raw = _cfg("BRAIN_REFUSAL_PATTERNS", "")
-        if raw.strip():
-            try:
-                pats = json.loads(raw)
-                if isinstance(pats, list):
-                    return tuple(pats)
-            except ValueError:
-                pass
-        return policy.DEFAULT_REFUSAL_PATTERNS
-
-
-    def emit(kind, *parts):
-        line = f"[{datetime.now(_TZ).strftime('%H:%M:%S')}] BRAIN {kind} " + \
-            " ".join(str(p) for p in parts)
-        print(line, flush=True)
+    OPENCODE_BIN = "opencode"
+    RING = 8               # events of context carried in every prompt
+    BATCH_MAX = 5          # submit a batch once it grows this big
+    MAX_CHANS = 64
+    MAX_TURNS = 150        # assistant turns before a session reset (turn cap)
+    TURN_TIMEOUT = 180.0   # a turn busy this long is wedged: abort it
 
 
     def install_api_key():
-        """Write the OpenCode auth file from OPENCODE_API_KEY, if given.
-
-        Path matches the CLI's own store (~/.local/share/opencode/auth.json), the
-        format documented in the README: {"opencode":{"type":"api","key":"..."}}.
-        Must run BEFORE `opencode serve` spawns: the server reads auth once.
-        """
+        """Write the OpenCode auth file from OPENCODE_API_KEY; must run BEFORE
+        `opencode serve` spawns (the server reads auth once)."""
         if not API_KEY:
             return
         d = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode")
@@ -1346,66 +926,34 @@ data:
             emit("AUTH_ERROR", repr(e))
 
 
-    # --- opencode.json (the permission gate + instructions + compaction) --------
-    # Copied into WORKDIR on start unless one is already there. The permission
-    # block is the settings.json allow-list equivalent (gap 8): reads are fine,
-    # writes only under memory/, no bash, no web — and anything that still asks
-    # is auto-rejected at runtime with an IRC NOTICE (deny fast, deny-wins).
-    DEFAULT_OPENCODE_JSON = {
-        "$schema": "https://opencode.ai/config.json",
-        "instructions": ["memory/MEMORY.md"],
-        "compaction": {"auto": True, "prune": True, "tail_turns": 8},
-        "permission": {
-            "read": "allow",
-            "glob": "allow",
-            "grep": "allow",
-            "list": "allow",
-            "edit": {"**": "deny", "memory/**": "allow"},
-            "write": {"**": "deny", "memory/**": "allow"},
-            "bash": "deny",
-            "webfetch": "deny",
-            "task": "deny",
-            "external_directory": "deny",
-        },
-    }
-
-
     def setup_workdir():
         """Materialise the agent workspace: opencode.json + memory root.
 
         The directory the server runs in is the session's project root: its
-        opencode.json gives every session the permission gate, the auto-injected
-        MEMORY.md and compaction; `memory/` is what the agent reads and writes to
-        survive compactions.
+        opencode.json carries the permission gate, the auto-injected MEMORY.md
+        and compaction; `memory/` is what the agent survives compactions with.
         """
         os.makedirs(WORKDIR, exist_ok=True)
         cfg_path = os.path.join(WORKDIR, "opencode.json")
         if not os.path.exists(cfg_path):
+            here = os.path.dirname(os.path.abspath(__file__))
             try:
-                with open(os.path.join(HERE, "opencode.json")) as f:
+                with open(os.path.join(here, "opencode.json")) as f:
                     data = f.read()
-                json.loads(data)                      # validate before installing
-            except (OSError, ValueError):
-                data = json.dumps(DEFAULT_OPENCODE_JSON, indent=2)
+                json.loads(data)                  # validate before installing
+            except (OSError, ValueError) as e:
+                raise RuntimeError(f"opencode.json missing or invalid: {e}") from e
             with open(cfg_path, "w") as f:
                 f.write(data)
             emit("WORKDIR_CONFIG", cfg_path)
         mem = memory_log.Memory(MEMORY_DIR)
         mem.ensure()
+        mem.archive_older_than()   # the 14-day rule, in code, at brain start
         return mem
 
 
     def registers():
-        """Per-channel register map from BRAIN_REGISTERS (JSON env) or
-        <WORKDIR>/registers.json."""
-        raw = _cfg("BRAIN_REGISTERS", "")
-        if raw.strip():
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    return data
-            except ValueError:
-                pass
+        """Per-channel register map from <WORKDIR>/registers.json."""
         try:
             with open(os.path.join(WORKDIR, "registers.json")) as f:
                 data = json.load(f)
@@ -1427,12 +975,12 @@ data:
         def spawned(cls):
             """Start `opencode serve` and wait for /global/health.
 
-            BRAIN_SERVE_HOST (default 127.0.0.1) exists for stacks where a sidecar
-            (the watchdog) polls the server over the container network; the brain
-            itself always talks to 127.0.0.1.
+            BRAIN_SERVE_HOST exists for stacks where a sidecar (the watchdog)
+            polls the server over the container network; the brain itself always
+            talks to 127.0.0.1.
             """
             install_api_key()
-            host = _cfg("BRAIN_SERVE_HOST", "127.0.0.1")
+            host = env("BRAIN_SERVE_HOST", "127.0.0.1")
             last_err = "unknown"
             for attempt in range(5):
                 port = SERVE_PORT + attempt
@@ -1515,16 +1063,12 @@ data:
         def abort(self, sid):
             return self._req("POST", f"/session/{sid}/abort", {})
 
-        def status(self):
-            return self._req("GET", "/session/status") or {}
-
         def permission_reply(self, request_id, reply="reject", message=""):
             return self._req("POST", f"/permission/{request_id}/reply",
                              {"reply": reply, "message": message})
 
         def events(self):
-            """Yield parsed SSE events from GET /event; reconnect is the
-            caller's job. Raises OSError on connection failure."""
+            """Yield parsed SSE events; reconnect is the caller's job."""
             req = urllib.request.Request(self.base + "/event")
             resp = urllib.request.urlopen(req, timeout=None)
             try:
@@ -1550,11 +1094,8 @@ data:
 
     # --- FIFO -------------------------------------------------------------------
     def write_fifo(lines, path, deadline=10.0):
-        """Write FIFO command lines into the bot's named pipe.
-
-        Non-blocking open + retry: a bot that has not yet created the FIFO (or is
-        down) must not wedge the brain. Returns the number of lines written.
-        """
+        """Write FIFO lines into the bot's named pipe. Non-blocking open + retry:
+        a bot that is down must not wedge the brain. Returns lines written."""
         if not lines:
             return 0
         payload = "".join(f"{ln}\n" for ln in lines).encode("utf-8")
@@ -1579,7 +1120,7 @@ data:
 
     # --- tail -------------------------------------------------------------------
     class Tailer:
-        """Minimal `tail -f` over a file, tolerant of truncation/rotation."""
+        """Minimal `tail -f`, tolerant of truncation/rotation."""
 
         def __init__(self, path, from_start=False):
             self.path = path
@@ -1666,8 +1207,7 @@ data:
 
     # --- brain -------------------------------------------------------------------
     class Brain:
-        def __init__(self, dry_run=DRY_RUN, nets=None, mem=None,
-                     refusal_pats=None):
+        def __init__(self, dry_run=False, nets=None, mem=None, refusal_pats=None):
             self.dry_run = dry_run
             self.nets = nets if nets is not None else networks.load()
             self.net_by_name = {n.name: n for n in self.nets}
@@ -1686,7 +1226,7 @@ data:
             self.total_wedges = 0
             self.registers = registers()
             self.model = split_model(MODEL)
-            self.refusals = refusal_pats or refusal_patterns()
+            self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
             self.stored = {}                   # (net, chan) -> sid, from disk
             self.stop_flag = False
 
@@ -1698,10 +1238,8 @@ data:
             return os.path.join(WORKDIR, "sessions.json")
 
         def load_session_store(self):
-            """{(net, chan): sid} persisted across brain restarts: the pointer to
-            the LIVE session per channel. Dead (reset) sessions are removed, so a
-            restart re-attaches the right one even though the server still lists
-            the abandoned ones."""
+            """{(net, chan): sid} across brain restarts: the pointer to the LIVE
+            session per channel (dead ones were removed by reset)."""
             try:
                 with open(self._store_path()) as f:
                     data = json.loads(f.read())
@@ -1719,23 +1257,9 @@ data:
             except OSError:
                 pass
 
-        def attach(self):
-            """Log how many IRC sessions already exist on the server after a
-            brain restart; channels re-attach lazily as events arrive."""
-            try:
-                existing = [s for s in self.api.list_sessions()
-                            if isinstance(s, dict)
-                            and str(s.get("title", "")).startswith("irc:")]
-            except OSError as e:
-                emit("SESSION_LIST_ERROR", repr(e))
-                return
-            emit("SESSION_REATTACH", len(existing))
-
         def get_session(self, net, chan, nick=None):
             """The (net, chan) session, created or re-attached on first use.
-
-            Main-thread only (feed drives it); the SSE thread never creates.
-            """
+            Main-thread only (feed drives it); the SSE thread never creates."""
             key = (net, chan)
             with self.lock:
                 sess = self.sessions.get(key)
@@ -1744,8 +1268,8 @@ data:
             if len(self.sessions) >= MAX_CHANS:
                 emit("CHAN_OVERFLOW", net, chan)
                 return None
-            env = self.net_by_name[net].env
-            nick = nick or env.get("IRC_NICK", NICK)
+            env_ = self.net_by_name[net].env
+            nick = nick or env_.get("IRC_NICK", NICK)
             title = f"irc:{net}:{chan}"
             known = {s.get("id") for s in self.api.list_sessions()}
             sid = None
@@ -1790,8 +1314,8 @@ data:
                 emit("REHYDRATE_ERROR", sess.title, repr(e))
 
         def reset_session(self, sess, reason):
-            """aup_watchdog's `/clear`: abandon the session, start a new one,
-            rehydrate from disk. Aborts first so we never reset mid-turn."""
+            """The `/clear`: abandon the session, start a new one, rehydrate from
+            disk. Aborts first so we never reset mid-turn."""
             try:
                 self.api.abort(sess.sid)
             except OSError:
@@ -1877,7 +1401,7 @@ data:
                 sess.busy_since = None
             self.record_turn(sess, text)
             self.dispatch(sess, text)
-            # Queueing emulation of the Monitor: the next due batch goes out now.
+            # Monitor queueing: the next due batch goes out now.
             if self.due(sess):
                 self.submit(sess)
 
@@ -1904,27 +1428,25 @@ data:
             if not answer:
                 emit("NO_VERBS", sess.title)
                 return
-            now = time.monotonic()
+            nowm = time.monotonic()
             out, digests = [], []
-            for verb, target, body, line in answer:
+            for verb, target, body in answer:
                 digest = hashlib.sha1(
                     f"{sess.net}\0{target}\0{body}".encode()).hexdigest()
                 if digest in self.recent:
                     continue                  # a model echoing itself must not loop
                 if verb in policy.CHAT_VERBS:
                     key = (sess.net, target.lower())
-                    if now - self.last_sent.get(key, -1e9) < RATE:
+                    if nowm - self.last_sent.get(key, -1e9) < RATE:
                         emit("RATE_LIMITED", sess.title, target)
                         continue
-                    if now - self.last_global < GLOBAL_RATE:
+                    if nowm - self.last_global < GLOBAL_RATE:
                         emit("RATE_LIMITED", sess.title, "global")
                         continue
-                    digests.append(digest)
-                    self.last_sent[key] = now
-                    self.last_global = now
-                else:
-                    digests.append(digest)    # JOIN/QUIT storms get the same guard
-                out.append(line)
+                    self.last_sent[key] = nowm
+                    self.last_global = nowm
+                digests.append(digest)
+                out.append(f"{verb} {target} {body}" if target or body else verb)
             if not out:
                 return
             n = write_fifo(out, self.net_by_name[sess.net].fifo)
@@ -1933,14 +1455,14 @@ data:
 
         # -- agent guard (wedged turns) ---------------------------------------------------
         def guard_tick(self):
-            now = time.monotonic()
+            nowm = time.monotonic()
             with self.lock:
                 busy = [s for s in self.sessions.values()
                         if s.busy_since is not None]
             for sess in busy:
-                if now - sess.busy_since < TURN_TIMEOUT:
+                if nowm - sess.busy_since < TURN_TIMEOUT:
                     continue
-                emit("WEDGED", sess.title, f"{now - sess.busy_since:.0f}s")
+                emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
                 self.total_wedges += 1
                 sess.wedges += 1
                 try:
@@ -1954,11 +1476,7 @@ data:
 
         # -- permission gate -----------------------------------------------------------------
         def gate(self, props):
-            """permission.asked: reject on sight, announce over the FIFO.
-
-            The reference's gate-permission.py exists because an interactive
-            prompt dead-locks a headless agent: deny fast, tell the human on IRC.
-            """
+            """permission.asked: reject on sight, announce over the FIFO."""
             req_id = props.get("id") or ""
             sess = self.by_sid.get(props.get("sessionID"))
             what = props.get("permission") or "unknown"
@@ -2015,8 +1533,6 @@ data:
                 self.mem.log_compaction()
                 emit("COMPACTED", sess.title if sess
                      else str(props.get("sessionID", "")))
-                self.mem.append_activity(
-                    f"session compacted: {sess.title if sess else 'unknown'}")
 
         # -- watchdog plumbing --------------------------------------------------------------
         def heartbeat(self):
@@ -2051,7 +1567,6 @@ data:
             self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
             emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
             self.api = Api(self.serve.url)
-            self.attach()
             tailers = [(n.name, Tailer(n.events, from_start=FROM_START))
                        for n in self.nets]
             threading.Thread(target=self.sse_loop, daemon=True).start()
@@ -2065,7 +1580,7 @@ data:
                         self.submit(sess)
                 self.guard_tick()
                 # Managed serve died: respawn, then drop session state so every
-                # channel re-attaches (or recreates) against the new server.
+                # channel re-attaches against the new server.
                 if self.serve.managed and self.serve.managed.poll() is not None:
                     emit("SERVE_DOWN", f"exit={self.serve.managed.returncode}")
                     try:
@@ -2089,7 +1604,7 @@ data:
         ap.add_argument("--dry-run", action="store_true",
                         help="build and print prompts, never submit them")
         args = ap.parse_args(argv)
-        brain = Brain(dry_run=args.dry_run or DRY_RUN)
+        brain = Brain(dry_run=args.dry_run)
 
         def _term(*_):
             brain.stop_flag = True
@@ -2102,24 +1617,16 @@ data:
         main()
   policy.py: |
     #!/usr/bin/env python3
-    """policy.py — the brain's pure decision layer.
-
-    Everything here is a function over plain data: parsing bot.py event lines,
-    deciding whether an event may wake the agent, building the prompt, parsing
-    the model's answer into FIFO verb lines, and rate/dedupe checks.
-
-    This module deliberately has NO I/O and no global state so it can be unit
-    tested exhaustively — it is the security-relevant core: the mute filter, the
-    addressing gate, the verb whitelist and the newline guards that stop a
-    confused model from injecting extra FIFO commands.
-    """
+    """policy.py — the brain's pure decision layer: parse bot.py event lines,
+    decide what may wake the agent, build the prompt, parse the model's answer
+    into FIFO verb lines. No I/O, no global state — this is the security-relevant
+    core (mute filter, addressing gate, verb whitelist, control-char guards)."""
     import re
 
     # --- event parsing ----------------------------------------------------------
     _EVENT = re.compile(r"^\[(\d{2}:\d{2}(?::\d{2})?)\]\s+([A-Z_]+)\s*(.*)$")
 
-    # Kinds that are worth waking the model for. Everything else only feeds the
-    # per-channel ring buffer as context.
+    # Kinds worth waking the model for; everything else only feeds the ring.
     ACTIONABLE = {"MSG", "INVITE", "IDLE", "CTCP", "KICK", "NOTICE"}
 
 
@@ -2152,9 +1659,7 @@ data:
         """One human/model-readable line for the prompt."""
         ts = ev.get("ts", "??:??")
         kind = ev.get("kind", "?")
-        mark = ""
-        if addressed is not None:
-            mark = " [ADDRESSED]" if addressed else ""
+        mark = " [ADDRESSED]" if addressed else ""
         if kind == "MSG":
             return (f"[{ts}] <{ev.get('from','?')}> to {ev.get('to','?')} "
                     f"({ev.get('trust','?').lower()}): {ev.get('body','')}{mark}")
@@ -2177,7 +1682,6 @@ data:
         src = ev.get("from") or ""
         if src.startswith(("#", "&")):
             return src.lower()
-        # IDLE/KICK and friends carry the channel as a bare token in the event.
         mm = re.search(r"[#&][^\s]+", ev.get("raw", ""))
         if mm:
             return mm.group(0).lower()
@@ -2185,19 +1689,15 @@ data:
 
 
     def is_muted(ev, mute=()):
-        """True when the event's channel is muted: no ring, no batch, no wake.
-
-        This is chan_filter.awk's port: vjt's order was that muted-channel
-        events do not reach the agent *at all* ("neanche se interpellato").
-        """
+        """chan_filter.awk's port: muted-channel events do not reach the agent at
+        all ("neanche se interpellato") — no ring, no batch, no wake."""
         return channel_of(ev) in {m.lower() for m in mute}
 
 
     # --- addressing gate --------------------------------------------------------
     def is_addressed(ev, nick):
         """True when a MSG directly addresses our nick (`nick:`, `nick,`, or the
-        bare nick as a word). The bot is transport; this is the same gate the
-        reference expresses in its reply policy, made checkable in code."""
+        bare nick as a word)."""
         if ev.get("kind") != "MSG":
             return False
         body = (ev.get("body") or "")
@@ -2232,38 +1732,28 @@ data:
 
 
     def refusal_hits(text, patterns=DEFAULT_REFUSAL_PATTERNS):
-        """Refusal-shaped phrases in an assistant turn (aup_watchdog's trigger)."""
+        """Refusal-shaped phrases in an assistant turn."""
         pats = patterns or ()
         return [p for p in pats if re.search(p, text or "")]
 
 
     # --- FIFO verb grammar ------------------------------------------------------
-    # The full grammar bot.py's process_cmd() accepts (gap 9): the brain may emit
-    # all of it, not only SAY.
     VERBS = ("SAY", "ACT", "NOTICE", "JOIN", "PART", "WHOIS", "QUIT", "RAW")
     _VERB_LINE = re.compile(rf"^({'|'.join(VERBS)})\s+(.+)$", re.IGNORECASE)
-    # Chat verbs whose target/body we rate-limit and dedupe like the old SAYs.
-    CHAT_VERBS = {"SAY", "ACT", "NOTICE"}
-    # Verbs allowed to carry our nick's name in the body without being dropped.
-    _OWN_DROP_VERBS = {"SAY", "ACT", "NOTICE"}
+    CHAT_VERBS = {"SAY", "ACT", "NOTICE"}   # the ones we rate-limit and dedupe
+    _OWN_DROP_VERBS = {"SAY", "ACT", "NOTICE"}  # allowed to name others, not us
 
 
     def _clean(text):
-        """Strip ANSI colour codes and control characters that could forge extra
-        FIFO lines. parse_answer feeds one physical line at a time, so a body can
-        never contain \n — belt and suspenders for \r and other control chars."""
+        """Strip ANSI codes and control chars that could forge extra FIFO lines."""
         text = re.sub(r"\x1b\[[0-9;]*m", "", text)
         return "".join(c for c in text if c == "\t" or ord(c) >= 32).rstrip()
 
 
     def parse_answer(text):
-        """Extract FIFO verb lines from the model's answer.
-
-        Returns [(verb, target_or_empty, body, origin_line)] where the tuple is
-        already shaped for write_fifo(). Anything that is not a `VERB ...` line is
-        ignored — prose, markdown fences, thinking out loud. QUIT is the only
-        argumentless verb (bot.py defaults its reason to "bye").
-        """
+        """Extract FIFO verb lines from the model's answer as
+        [(verb, target_or_empty, body)]. Anything else (prose, fences) is
+        ignored. QUIT is the only argumentless verb."""
         out = []
         for raw in (text or "").splitlines():
             line = _clean(raw.strip())
@@ -2274,7 +1764,7 @@ data:
                 if verb in ("JOIN", "PART", "WHOIS", "QUIT", "RAW"):
                     if not rest:
                         continue
-                    out.append((verb, "", rest, line))
+                    out.append((verb, "", rest))
                 else:
                     if " " not in rest:
                         continue
@@ -2282,49 +1772,34 @@ data:
                     body = body.strip()
                     if not body or not target:
                         continue
-                    out.append((verb, target, body, line))
+                    out.append((verb, target, body))
             elif line.upper() == "QUIT":
-                out.append(("QUIT", "", "", line))
+                out.append(("QUIT", "", ""))
         return out
 
 
     def filter_answer(answer, nick):
-        """Second gate before anything reaches the FIFO: drop our own echo, and
-        flag the lines that are rate-limited/deduped downstream. Returns the same
-        tuples parse_answer produced."""
+        """Gate before anything reaches the FIFO: drop lines that speak as us."""
         low = (nick or "").lower()
         out = []
-        for verb, target, body, line in answer:
+        for verb, target, body in answer:
             if verb in _OWN_DROP_VERBS:
                 if target.lower() == low:
                     continue
                 if body.lower().startswith(f"{low}:") or \
                         body.lower().startswith(f"{low} "):
                     continue
-            out.append((verb, target, body, line))
-        return out
-
-
-    def fifo_lines(answer):
-        """[(verb, target, body)] -> exact strings to write into the bot FIFO."""
-        out = []
-        for verb, target, body, _line in answer:
-            if target:
-                out.append(f"{verb} {target} {body}")
-            else:
-                out.append(f"{verb} {body}")
+            out.append((verb, target, body))
         return out
 
 
     # --- prompt construction ----------------------------------------------------
     def registers_text(registers, channel):
-        """The register line for one channel, or '' when none is configured.
-        Channel keys match case-insensitively."""
+        """The register line for one channel, or '' when none is configured."""
         if not registers:
             return ""
         low = channel.lower()
-        hit = next((v for k, v in registers.items()
-                    if k.lower() == low), None)
+        hit = next((v for k, v in registers.items() if k.lower() == low), None)
         if hit:
             return f"Register for {channel}: {hit}"
         return ""
@@ -2373,11 +1848,8 @@ data:
 
 
     def build_prompt(batch, ring, net, channel, addressed_ids=()):
-        """Compose the per-turn prompt: recent context then the new events.
-
-        `ring` is the list of recent event dicts for this channel (oldest first);
-        `batch` is the list of new events this turn acts on. Deterministic.
-        """
+        """Recent context then the new events; `addressed_ids` marks the batch
+        entries that address us. Deterministic."""
         batch_ids = {id(ev) for ev in batch}
         out = [f"Network: {net}   Channel: {channel}", ""]
         ctx = [ev for ev in ring if id(ev) not in batch_ids]
@@ -2394,9 +1866,8 @@ data:
 
 
     def rehydrate_prompt(nick, memory_index, today_body):
-        """The wake-up prompt for a fresh (or reset) session: who you are, what
-        survives on disk, and an explicit no-output ack. Ports the /resume
-        ritual: without it the agent wakes blind after every compaction."""
+        """The wake-up prompt for a fresh (or reset) session: the /resume ritual.
+        Without it the agent wakes blind after every compaction."""
         return "\n".join([
             f"You are {nick}, waking up in a fresh session on IRC. Your memory "
             "lives on disk, not in this conversation.",
@@ -2416,41 +1887,29 @@ data:
         ])
   networks.py: |
     #!/usr/bin/env python3
-    """networks.py — per-network config shared by the bot supervisor and the brain.
+    """networks.py — per-network config shared by the bots and the brain.
 
-    The reference runs one `bot.py` process per IRC network — same code,
-    per-network env and files ("a second network is a second process with its own
-    env, not a threading model inside the bot"). This module is the single source
-    of truth for those paths so `nets.py` (which spawns the bots) and `brain.py`
+    One `bot.py` process per IRC network: same code, per-network env and files
+    ("a second network is a second process with its own env"). This module is the
+    single source of truth for those paths, so the spawned bots and the brain
     (which tails their events and writes their FIFOs) can never disagree.
 
-    Config sources, in order:
-      1. `IRC_NETWORKS` — space/comma-separated network labels, e.g.
-         `IRC_NETWORKS="azzurra libera"`. When unset: a single implicit network
-         named `irc` whose paths come straight from BOT_EVENTS / BOT_FIFO /
-         BOT_LOG, reproducing the single-instance layout byte for byte.
-      2. `networks.json` (next to this file, or $BOT_NETWORKS_FILE) — per-label
-         env overrides, e.g.
+      1. `IRC_NETWORKS` — space/comma-separated labels, e.g. "azzurra libera".
+         Unset: a single implicit network `irc` whose paths come straight from
+         BOT_EVENTS / BOT_FIFO / BOT_LOG (the single-instance layout).
+      2. `networks.json` (next to this file) — per-label env overrides, e.g.
          {"libera": {"IRC_HOST": "irc.libera.chat", "BOT_TRUST": "bot.trust.libera"}}
 
-    For every labelled network the data files derive from the label:
-      events  <data>/events.<label>.log      (brain tails; bot appends)
-      fifo    <data>/bot.send.<label>        (brain writes; bot reads)
-      log     <data>/bot.<label>.log         (raw traffic)
-    unless the label's overrides set BOT_EVENTS / BOT_FIFO / BOT_LOG explicitly.
+    Labelled networks derive data files from the label (events.<label>.log,
+    bot.send.<label>, bot.<label>.log) unless the label's overrides set the
+    BOT_EVENTS / BOT_FIFO / BOT_LOG paths explicitly.
     """
     import json
     import os
 
     HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-    def _cfg(key, default):
-        return os.environ.get(key, default)
-
-
-    DATA_DIR = _cfg("BOT_DATA", "/data")
-    NETWORKS_FILE = _cfg("BOT_NETWORKS_FILE", os.path.join(HERE, "networks.json"))
+    DATA_DIR = "/data"
+    NETWORKS_FILE = os.path.join(HERE, "networks.json")
 
 
     class Net:
@@ -2481,14 +1940,8 @@ data:
 
 
     def net_for(label, data_dir=None, overrides=None, base_env=None):
-        """Derive one Net from a label + optional per-label env overrides.
-
-        Paths are label-derived (`events.<label>.log`, ...) unless the label's
-        overrides set BOT_EVENTS / BOT_FIFO / BOT_LOG explicitly. `base_env`
-        defaults to os.environ; the returned `env` is base_env merged with the
-        overrides and the resolved paths, exactly what a bot subprocess for this
-        network should run with.
-        """
+        """Derive one Net from a label + overrides; `env` is what a bot subprocess
+        for this network runs with (base_env + overrides + resolved paths)."""
         data_dir = data_dir or DATA_DIR
         base_env = dict(base_env if base_env is not None else os.environ)
         overrides = dict(overrides or {})
@@ -2502,19 +1955,15 @@ data:
         fifo = resolve("BOT_FIFO", "bot.send.{label}")
         log = resolve("BOT_LOG", "bot.{label}.log")
 
-        env = dict(base_env)
-        env.update(overrides)
-        env["BOT_EVENTS"], env["BOT_FIFO"], env["BOT_LOG"] = events, fifo, log
-        return Net(label, events, fifo, log, env)
+        env_ = dict(base_env)
+        env_.update(overrides)
+        env_["BOT_EVENTS"], env_["BOT_FIFO"], env_["BOT_LOG"] = events, fifo, log
+        return Net(label, events, fifo, log, env_)
 
 
     def load(data_dir=None, overrides_path=None, base_env=None):
-        """All configured networks, in IRC_NETWORKS order.
-
-        With IRC_NETWORKS unset this is the single implicit network `irc`, whose
-        paths come straight from the environment's BOT_EVENTS / BOT_FIFO / BOT_LOG
-        (the round-1 single-instance layout) with the given defaults.
-        """
+        """All configured networks, in IRC_NETWORKS order; unset means the single
+        implicit network `irc` from the environment's BOT_* paths."""
         base_env = base_env if base_env is not None else os.environ
         data_dir = data_dir or DATA_DIR
         overrides = load_overrides(overrides_path)
@@ -2531,22 +1980,12 @@ data:
                 for label in raw]
   memory_log.py: |
     #!/usr/bin/env python3
-    """memory_log.py — the disk-backed memory the persistent session boots from.
-
-    Port of the reference's memory architecture (gap 2): a memory root on the
-    writable volume holding
-
-      MEMORY.md                    the index, auto-injected into every session
-      project_activity_log.md      the rolling 14-day activity log
-      project_activity_log_archive.md  everything the log outgrew
-      user_*.md / feedback_*.md / project_*.md / reference_*.md   typed files
-
-    The promotion rule (>14 days of relevance => typed file, one index line) and
-    the archive rule (daily headings older than 14 days leave the log) are the
-    two rituals that let a session survive compaction and restarts. The archive
-    trim runs in deterministic code at brain start (the reference does it in its
-    /start ritual) so it never depends on the model remembering to do it.
-    """
+    """memory_log.py — the disk-backed memory the persistent session boots from:
+    MEMORY.md (the index, auto-injected into every session), the rolling 14-day
+    activity log and its archive. The promotion rule (>14 days of relevance =>
+    a typed file user_* / feedback_* / project_* / reference_*, one index line)
+    lives in the seed index; the 14-day archive trim runs in code at brain start
+    so it never depends on the model remembering to do it."""
     import os
     import re
     from datetime import date, datetime, timedelta
@@ -2580,14 +2019,11 @@ data:
         def __init__(self, root):
             self.root = root
 
-        # -- paths ---------------------------------------------------------------
         def path(self, name):
             return os.path.join(self.root, name)
 
-        # -- lifecycle -----------------------------------------------------------
         def ensure(self):
-            """Create the root, seed the index and today's log heading.
-            Idempotent; safe on every start."""
+            """Create the root, seed the index and today's heading. Idempotent."""
             os.makedirs(self.root, exist_ok=True)
             idx = self.path(MEMORY_INDEX)
             if not os.path.exists(idx):
@@ -2623,13 +2059,10 @@ data:
             with open(self.path(ACTIVITY_LOG), "a") as f:
                 f.write(f"- {line}\n")
 
-        # -- the 14-day rule -----------------------------------------------------
         def archive_older_than(self, days=14, today=None):
-            """Move daily headings older than `days` days to the archive file.
-
-            Returns (archived_days, kept_days). Malformed blocks (content before
-            the first heading) are kept as-is at the top of the log.
-            """
+            """Move day-headings older than `days` into the archive file.
+            Returns (archived_days, kept_days). Content before the first heading
+            is kept as-is at the top of the log."""
             log_path = self.path(ACTIVITY_LOG)
             try:
                 with open(log_path) as f:
@@ -2638,12 +2071,12 @@ data:
                 return (0, 0)
             if not body.strip():
                 return (0, 0)
-
-            # Split into (heading_date_or_None, block_text) preserving order.
-            blocks = []
             matches = list(_HEAD.finditer(body))
             if not matches:
                 return (0, 0)
+
+            # Split into (heading_date_or_None, block_text), preserving order.
+            blocks = []
             pre = body[:matches[0].start()]
             if pre.strip():
                 blocks.append((None, pre))
@@ -2687,28 +2120,19 @@ data:
             self.append_activity(f"session compacted (auto) at {ts}")
   watchdog.py: |
     #!/usr/bin/env python3
-    """watchdog.py — agent-aware health sidecar.
+    """watchdog.py — agent-aware health sidecar, three layers:
 
-    Round-1 watchdog answered exactly one question: is the brain's heartbeat
-    file fresh? Issue #2 (gap 3) is explicit that for a long-running agent the
-    real failure modes are *session* failures — a wedged turn, a retry storm, a
-    dead model server — and a green heartbeat proves nothing about any of them.
+      process  BRAIN_HEARTBEAT mtime (brain stall detector);
+      server   /global/health + /session/status on the opencode serve — a dead
+               server, or a session stuck busy/retry beyond WATCHDOG_WEDGED
+               seconds, is aborted and escalated (the brain cannot respawn an
+               attached serve);
+      agent    BRAIN_AGENT_STATUS reported loudly; the brain acts on its own state.
 
-    This version watches three independent layers:
-
-      process   BRAIN_HEARTBEAT mtime (the old stall detector, unchanged);
-      server    GET /global/health + GET /session/status on the opencode serve
-                URL — a server that dies, or a session stuck busy/retry for
-                WATCHDOG_WEDGED seconds, is acted on (abort via POST
-                /session/{id}/abort, then escalate);
-      agent     BRAIN_AGENT_STATUS (JSON the brain refreshes every loop) —
-                reported loudly so refusals/wedges/resets are visible in logs.
-
-    Escalation is the same contract as before: run WATCHDOG_RESTART_CMD (set it
-    to restart brain+serve — e.g. `systemctl --user restart oc-ircbot-brain`) or,
-    with WATCHDOG_EXIT_ON_STALL=1, exit non-zero and let the platform's restart
-    policy bring the stack back. A sidecar cannot restart its own container in
-    Kubernetes; the restart command is the honest lever it has.
+    Escalation: run WATCHDOG_RESTART_CMD, or with WATCHDOG_EXIT_ON_STALL=1 exit
+    non-zero and let the platform's restart policy bring the stack back (a
+    sidecar cannot restart its own container in Kubernetes; the restart command
+    is the honest lever it has).
     """
     import json
     import os
@@ -2717,44 +2141,36 @@ data:
     import sys
     import time
     import urllib.request
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from functools import partial
 
-    HEARTBEAT = os.environ.get("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
-    AGENT_STATUS = os.environ.get("BRAIN_AGENT_STATUS", "/data/agent.status")
-    SERVE_URL = os.environ.get("BRAIN_SERVE_URL",
-                               "http://127.0.0.1:" +
-                               os.environ.get("BRAIN_SERVE_PORT", "46099"))
-    POLL = float(os.environ.get("WATCHDOG_POLL", "10"))
-    STALL = float(os.environ.get("WATCHDOG_STALL", "30"))
-    MAX_STALLS = int(os.environ.get("WATCHDOG_MAX_STALLS", "3"))
-    WEDGED = float(os.environ.get("WATCHDOG_WEDGED", "300"))
-    SERVE_MAX_FAILS = int(os.environ.get("WATCHDOG_SERVE_MAX_FAILS", "3"))
-    RESTART_CMD = os.environ.get("WATCHDOG_RESTART_CMD", "")
-    EXIT_ON_STALL = os.environ.get("WATCHDOG_EXIT_ON_STALL", "0") not in \
-        ("0", "no", "off", "false", "")
+    from util import emit as _emit, env, env_bool
 
-    _TZ = ZoneInfo("Europe/Rome")
+    emit = partial(_emit, "WATCHDOG")
 
-
-    def emit(kind, *parts):
-        line = f"[{datetime.now(_TZ).strftime('%H:%M:%S')}] WATCHDOG {kind} " + \
-            " ".join(str(p) for p in parts)
-        print(line, flush=True)
+    HEARTBEAT = env("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
+    AGENT_STATUS = env("BRAIN_AGENT_STATUS", "/data/agent.status")
+    SERVE_URL = env("BRAIN_SERVE_URL",
+                    "http://127.0.0.1:" + env("BRAIN_SERVE_PORT", "46099"))
+    POLL = float(env("WATCHDOG_POLL", "10"))
+    STALL = float(env("WATCHDOG_STALL", "30"))
+    MAX_STALLS = int(env("WATCHDOG_MAX_STALLS", "3"))
+    WEDGED = float(env("WATCHDOG_WEDGED", "300"))
+    SERVE_MAX_FAILS = int(env("WATCHDOG_SERVE_MAX_FAILS", "3"))
+    RESTART_CMD = env("WATCHDOG_RESTART_CMD", "")
+    EXIT_ON_STALL = env_bool("WATCHDOG_EXIT_ON_STALL")
 
 
-    def heartbeat_age(now=None):
+    def heartbeat_age(now_ts=None):
         """Seconds since the heartbeat file was last written, or None if absent."""
-        now = time.time() if now is None else now
+        now_ts = time.time() if now_ts is None else now_ts
         try:
-            return now - os.path.getmtime(HEARTBEAT)
+            return now_ts - os.path.getmtime(HEARTBEAT)
         except OSError:
             return None
 
 
     def is_stalled(age, stall=STALL):
-        """A missing heartbeat counts as stalled once the sidecar knows to expect
-        one; None is handled by the caller (grace on first sight)."""
+        """A missing heartbeat counts as stalled; None handled by the caller."""
         return age is None or age > stall
 
 
@@ -2770,8 +2186,7 @@ data:
 
 
     def busy_sessions(url=None, timeout=5):
-        """{sessionID: status} for every busy/retry session, or None when the
-        server cannot be reached at all."""
+        """{sessionID: status} for busy/retry sessions, None when unreachable."""
         url = (url or SERVE_URL).rstrip("/")
         try:
             with urllib.request.urlopen(url + "/session/status",
@@ -2781,30 +2196,7 @@ data:
             return None
 
 
-    def wedged_sessions(busy, wedged_for=WEDGED, now=None):
-        """Sessions whose status says busy/retry beyond the wedged threshold.
-
-        opencode's status entries carry `next` (retry backoff deadline, epoch ms)
-        for retries; for plain busy we rely on consecutive sightings, tracked by
-        the caller. Here: retry entries whose `next` is in the past count as
-        wedged; busy entries are returned for the caller's sighting counter via
-        (sid, is_retry_past_due).
-        """
-        now_ms = int((now or time.time()) * 1000)
-        out = []
-        for sid, status in (busy or {}).items():
-            kind = status.get("type")
-            if kind == "retry" and status.get("next", 0) and \
-                    status["next"] < now_ms:
-                out.append(sid)
-            elif kind == "busy" and status.get("since") and \
-                    (now_ms - status["since"]) > wedged_for * 1000:
-                out.append(sid)
-        return out
-
-
     def agent_snapshot(path=None):
-        """The brain's agent-state JSON, or None."""
         try:
             with open(path or AGENT_STATUS) as f:
                 return json.loads(f.read())
@@ -2829,7 +2221,7 @@ data:
             try:
                 subprocess.run(RESTART_CMD, shell=True, timeout=60)
                 emit("RESTART_CMD_RUN", RESTART_CMD, note)
-            except Exception as e:  # noqa: BLE001 - report, never die
+            except Exception as e:  # report, never die
                 emit("RESTART_CMD_ERROR", repr(e))
         if EXIT_ON_STALL:
             emit("EXIT", f"{action}: restart policy should bring us back", note)
@@ -2839,7 +2231,7 @@ data:
     def main():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         emit("START", f"heartbeat={HEARTBEAT}", f"serve={SERVE_URL}",
-             f"poll={POLL:.0f}s", f"stall={STALL:.0f}s", f"wedged={WEDGED:.0f}s")
+              f"poll={POLL:.0f}s", f"stall={STALL:.0f}s", f"wedged={WEDGED:.0f}s")
         consecutive = 0
         seen_once = False
         serve_fails = 0
@@ -2847,15 +2239,14 @@ data:
         while True:
             # -- process layer ----------------------------------------------------
             age = heartbeat_age()
-            if age is not None:
-                if not seen_once:
-                    emit("HEARTBEAT_SEEN", f"{age:.1f}s")
-                    seen_once = True
+            if age is not None and not seen_once:
+                emit("HEARTBEAT_SEEN", f"{age:.1f}s")
+                seen_once = True
             if is_stalled(age):
                 consecutive += 1
                 shown = "missing" if age is None else f"{age:.1f}s"
                 emit("STALL", f"age={shown}", f"consecutive={consecutive}",
-                     f"threshold={STALL:.0f}s")
+                      f"threshold={STALL:.0f}s")
                 if consecutive >= MAX_STALLS:
                     emit("STALL_CONFIRMED", f"{consecutive} consecutive")
                     escalate("stall")
@@ -2871,16 +2262,16 @@ data:
                     emit("SERVE_RECOVERED")
                 serve_fails = 0
                 busy = busy_sessions()
-                now = time.monotonic()
+                nowm = time.monotonic()
                 for sid in list(busy_seen):
                     if not busy or sid not in busy:
                         busy_seen.pop(sid, None)
                 for sid, status in (busy or {}).items():
-                    first = busy_seen.setdefault(sid, now)
-                    held = now - first
+                    first = busy_seen.setdefault(sid, nowm)
+                    held = nowm - first
                     if held >= WEDGED:
                         emit("WEDGED_SESSION", sid,
-                             f"status={status.get('type')}", f"{held:.0f}s")
+                              f"status={status.get('type')}", f"{held:.0f}s")
                         if abort_session(SERVE_URL, sid):
                             emit("ABORT_SENT", sid)
                         busy_seen.pop(sid, None)
@@ -2896,9 +2287,9 @@ data:
             snap = agent_snapshot()
             if snap:
                 emit("AGENT", f"turns={snap.get('turns', 0)}",
-                     f"refusals={snap.get('refusals', 0)}",
-                     f"wedges={snap.get('wedges', 0)}",
-                     f"sessions={len(snap.get('sessions', {}))}")
+                      f"refusals={snap.get('refusals', 0)}",
+                      f"wedges={snap.get('wedges', 0)}",
+                      f"sessions={len(snap.get('sessions', {}))}")
             time.sleep(POLL)
 
 

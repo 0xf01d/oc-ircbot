@@ -36,21 +36,14 @@ def test_serve_healthy_against_stub():
         serve.stop()
 
 
-def test_busy_sessions_and_wedged_detection():
+def test_busy_sessions_lists_busy():
     serve = StubServe().start()
     try:
         assert watchdog.busy_sessions(serve.url) == {}
         sid = serve.state.new_sid()
         serve.state.sessions[sid] = {"id": sid, "title": "t",
                                      "messages": [], "busy": True}
-        busy = watchdog.busy_sessions(serve.url)
-        assert busy == {sid: {"type": "busy"}}
-        # A plain "busy" status has no `since` — the watchdog's own sighting
-        # window decides; retry entries with a past-due `next` are wedged.
-        assert watchdog.wedged_sessions(busy) == []
-        retry = {sid: {"type": "retry",
-                       "next": int((time.time() - 60) * 1000)}}
-        assert watchdog.wedged_sessions(retry) == [sid]
+        assert watchdog.busy_sessions(serve.url) == {sid: {"type": "busy"}}
     finally:
         serve.stop()
 

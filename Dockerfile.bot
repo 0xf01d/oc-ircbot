@@ -2,7 +2,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY bot.py leak_guard.py bot.say ./
+COPY bot.py leak_guard.py util.py bot.say ./
 COPY bot.trust bot.trust.ircnet bot.reserved bot.startup ./
 
 # Shared data volume: bot.log, bot.send FIFO, events.log, heartbeat.

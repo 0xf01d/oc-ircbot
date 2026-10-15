@@ -7,7 +7,7 @@ stack runs in **Docker**, on **Kubernetes**, or as plain **systemd** user
 units.
 
 The bridge is a near-verbatim port of the original: same events, same FIFO
-grammar, same trust model, same DCC. Round 1 swapped Claude Code's Monitor
+grammar, same trust model. Round 1 swapped Claude Code's Monitor
 for a per-reply `opencode run`; round 2 replaced that with the real thing:
 persistent sessions, streaming replies, an agent guard, disk-backed memory
 and a permission gate. The bridge itself never changed.
@@ -37,7 +37,7 @@ its workspace, or attaches to a running one via `BRAIN_SERVE_URL`):
 - **Streaming replies.** An SSE thread on `GET /event` wakes on
   `session.idle`, fetches the last assistant message, parses FIFO verbs and
   writes them to the right network's FIFO.
-- **Cancellation.** A turn stuck beyond `BRAIN_TURN_TIMEOUT` is cancelled
+- **Cancellation.** A turn stuck beyond `TURN_TIMEOUT` (180 s) is cancelled
   with `POST /session/{id}/abort`; liveness is polled via
   `GET /session/status`.
 
@@ -47,7 +47,7 @@ turn on a fresh server took 2.44 s including the provider handshake. The
 round-1 per-reply `opencode run` measured 6–9 s, cold, every time.
 
 **The agent guard** (vjt's `aup_watchdog` triggers, ported into the loop):
-a refusal-shaped reply, a session over `BRAIN_MAX_TURNS` (150) assistant
+a refusal-shaped reply, a session over 150 assistant
 turns, or a wedged turn each reset the session. Every new session is
 **rehydrated from disk** — `memory/MEMORY.md` plus today's activity log are
 injected with an explicit "do not send anything to IRC right now" order — so
@@ -64,9 +64,9 @@ agent.
 **Multi-network.** `bot.py` is env-parameterised, so one process per IRC
 network shares one brain: `IRC_NETWORKS=azzurra,libera` (plus
 `networks.json` per-label overrides) makes the brain tail
-`events.<net>.log` and write `bot.send.<net>` per network. Hosts run the
-`oc-ircbot-bot@.service` template unit; containers run `nets.py`, a small
-supervisor that spawns one bot per network and cleans up with a real `QUIT`.
+`events.<net>.log` and write `bot.send.<net>` per network. Run one bot
+instance per network — a `oc-ircbot-bot@.service` template unit on a host,
+one container each in Docker/Kubernetes.
 
 **The Monitor-equivalent.** `opencode serve` has no mid-turn notification
 API, but `prompt_async` is accepted while a turn streams (verified: the
@@ -83,12 +83,8 @@ platform's restart policy.
 
 The original ran a small zoo of sidecars next to the bridge, and the pattern
 they all follow is supported here on purpose: **a sidecar tails `bot.log`
-(and/or `events.log`) and writes `VERB <args>` lines into the FIFO, with an
-origin tag** — `SAY:stats #chan text` — which changes nothing on the wire but
-stamps `bot.log` so deterministic sidecars are distinguishable from the LLM's
-lines. Five sidecars can share one FIFO because of that tag.
-
-The brain may spawn such helpers **inside its own container** (they only need
+(and/or `events.log`) and writes `VERB <args>` lines into the FIFO**. The
+brain may spawn such helpers **inside its own container** (they only need
 the shared volume): the shipped example is `watchdog.py`. The counters and
 game bots of the original (`roll_counter.py`, `firma_counter.py`, stats,
 `impiccato`, …) are deliberately not ported — they are programs that happen
@@ -113,7 +109,7 @@ inside a message. Silence is the default (`policy.build_system`): the prompt
 is an opportunity, not an obligation. The system prompt also carries the
 identity-discipline rule (never claim to be a human; refuse spoofed-identity
 games) and, optionally, per-channel registers
-(`BRAIN_REGISTERS='{"#chan":"register text"}'` or `registers.json`).
+(`registers.json`).
 
 Send a command by hand exactly as the original documented:
 
@@ -143,11 +139,11 @@ The `OPENCODE_API_KEY` is written by the brain into
 (`/data/workspace`): `opencode.json` (the permission gate) is installed there
 at startup, and `memory/` is the agent's persistent memory.
 
-Several networks at once: either set `IRC_NETWORKS` + `networks.json` and run
-`nets.py` as the bot container's command, or (host install) enable
-`oc-ircbot-bot@azzurra`, `oc-ircbot-bot@libera`, … from the template unit —
-each with its own `.env.<net>` and its own trust file. Trust does not travel
-between networks.
+Several networks at once: set `IRC_NETWORKS` + `networks.json`, and run one
+bot instance per network — `oc-ircbot-bot@azzurra`, `oc-ircbot-bot@libera`,
+… from the template unit (host), or one container each — every one with its
+own `.env.<net>` and its own trust file. Trust does not travel between
+networks.
 
 ### systemd (Docker-less host)
 
@@ -206,7 +202,6 @@ Brain variables:
 | `BRAIN_MODEL` | `opencode/deepseek-v4.1-flash-free` | model for new sessions |
 | `BRAIN_SERVE_URL` | *(empty)* | attach to a running serve (else spawn one) |
 | `BRAIN_SERVE_PORT` / `BRAIN_SERVE_HOST` | `46099` / `127.0.0.1` | spawn port; host `0.0.0.0` lets a sidecar poll it |
-| `BRAIN_OPENCODE_BIN` | `opencode` | server binary |
 | `BRAIN_WORKDIR` | `/data/workspace` | serve cwd: `opencode.json`, sessions.json, memory |
 | `BRAIN_MEMORY_DIR` | `$WORKDIR/memory` | agent memory (index + activity log) |
 | `BRAIN_AGENT_STATUS` | `/data/agent.status` | JSON snapshot for the watchdog |
@@ -214,23 +209,20 @@ Brain variables:
 | `BRAIN_ADMIN` | `admin` | NOTICE target for permission-gate announcements |
 | `BRAIN_MUTE` | *(empty)* | CSV of muted channels (chan_filter.awk port) |
 | `BRAIN_ADDRESS_ONLY` | `0` | wake only when addressed |
-| `BRAIN_REGISTERS` / `registers.json` | *(empty)* | per-channel register text |
-| `BRAIN_REFUSAL_PATTERNS` | built-in AUP set | JSON list of refusal regexes |
-| `BRAIN_MAX_TURNS` | `150` | assistant turns before a session reset |
-| `BRAIN_TURN_TIMEOUT` | `180` | seconds before a busy turn is aborted |
-| `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` / `BRAIN_BATCH_MAX` | `1.0` / `3.0` / `5` | batching |
-| `BRAIN_RING` / `BRAIN_MAX_CHANS` | `8` / `64` | bounded per-channel context |
+| `registers.json` | *(none)* | per-channel register text, in `BRAIN_WORKDIR` |
+| `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` | `1.0` / `3.0` | batching |
 | `BRAIN_RATE` / `BRAIN_GLOBAL_RATE` | `3.0` / `1.0` | send rate limits (s) |
 | `BRAIN_FROM_START` | `0` | read event logs from the top on start |
-| `BRAIN_DRY_RUN` / `brain.py --dry-run` | `0` | print the prompt instead of submitting |
+| `brain.py --dry-run` | — | print the prompt instead of submitting |
+
+Session-guard constants live in `brain.py` (`MAX_TURNS` 150, `TURN_TIMEOUT`
+180 s, ring 8, batch max 5, 64 channels); the refusal patterns are
+`policy.DEFAULT_REFUSAL_PATTERNS`.
 
 Watchdog variables: `WATCHDOG_POLL` (`10`), `WATCHDOG_STALL` (`30`),
 `WATCHDOG_MAX_STALLS` (`3`), `WATCHDOG_WEDGED` (`300`),
 `WATCHDOG_SERVE_MAX_FAILS` (`3`), `WATCHDOG_RESTART_CMD`,
 `WATCHDOG_EXIT_ON_STALL`, `BRAIN_SERVE_URL`.
-
-Nets supervisor (containers): `NETS_RESTART_SEC` (`30`),
-`NETS_RESTART_MAX` (`1800`), `NETS_QUIT_GRACE` (`10`).
 
 ## Kubernetes
 
@@ -276,7 +268,7 @@ Run the units locally with `python -m pytest tests -q`.
   re-implemented headlessly: `opencode.json` + auto-reject + admin NOTICE.
 - **chan_filter.awk** returns as `BRAIN_MUTE`.
 - **Multi-network** is first-class: per-network bot processes, FIFOs and
-  brain sessions (`networks.py`, `nets.py`, `bot.trust.libera`,
+  brain sessions (`networks.py`, `bot.trust.libera`,
   `oc-ircbot-bot@.service`).
 - **Packaging.** Dockerfiles + compose + `k8s/` alongside the original's
   systemd approach (both shipped; the bot units grow a template and a clean

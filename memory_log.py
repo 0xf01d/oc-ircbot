@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""memory_log.py — the disk-backed memory the persistent session boots from.
-
-Port of the reference's memory architecture (gap 2): a memory root on the
-writable volume holding
-
-  MEMORY.md                    the index, auto-injected into every session
-  project_activity_log.md      the rolling 14-day activity log
-  project_activity_log_archive.md  everything the log outgrew
-  user_*.md / feedback_*.md / project_*.md / reference_*.md   typed files
-
-The promotion rule (>14 days of relevance => typed file, one index line) and
-the archive rule (daily headings older than 14 days leave the log) are the
-two rituals that let a session survive compaction and restarts. The archive
-trim runs in deterministic code at brain start (the reference does it in its
-/start ritual) so it never depends on the model remembering to do it.
-"""
+"""memory_log.py — the disk-backed memory the persistent session boots from:
+MEMORY.md (the index, auto-injected into every session), the rolling 14-day
+activity log and its archive. The promotion rule (>14 days of relevance =>
+a typed file user_* / feedback_* / project_* / reference_*, one index line)
+lives in the seed index; the 14-day archive trim runs in code at brain start
+so it never depends on the model remembering to do it."""
 import os
 import re
 from datetime import date, datetime, timedelta
@@ -48,14 +38,11 @@ class Memory:
     def __init__(self, root):
         self.root = root
 
-    # -- paths ---------------------------------------------------------------
     def path(self, name):
         return os.path.join(self.root, name)
 
-    # -- lifecycle -----------------------------------------------------------
     def ensure(self):
-        """Create the root, seed the index and today's log heading.
-        Idempotent; safe on every start."""
+        """Create the root, seed the index and today's heading. Idempotent."""
         os.makedirs(self.root, exist_ok=True)
         idx = self.path(MEMORY_INDEX)
         if not os.path.exists(idx):
@@ -91,13 +78,10 @@ class Memory:
         with open(self.path(ACTIVITY_LOG), "a") as f:
             f.write(f"- {line}\n")
 
-    # -- the 14-day rule -----------------------------------------------------
     def archive_older_than(self, days=14, today=None):
-        """Move daily headings older than `days` days to the archive file.
-
-        Returns (archived_days, kept_days). Malformed blocks (content before
-        the first heading) are kept as-is at the top of the log.
-        """
+        """Move day-headings older than `days` into the archive file.
+        Returns (archived_days, kept_days). Content before the first heading
+        is kept as-is at the top of the log."""
         log_path = self.path(ACTIVITY_LOG)
         try:
             with open(log_path) as f:
@@ -106,12 +90,12 @@ class Memory:
             return (0, 0)
         if not body.strip():
             return (0, 0)
-
-        # Split into (heading_date_or_None, block_text) preserving order.
-        blocks = []
         matches = list(_HEAD.finditer(body))
         if not matches:
             return (0, 0)
+
+        # Split into (heading_date_or_None, block_text), preserving order.
+        blocks = []
         pre = body[:matches[0].start()]
         if pre.strip():
             blocks.append((None, pre))

@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 """brain.py — persistent OpenCode sessions, one per (network, channel).
 
-The round-1 brain spawned a cold `opencode run` process per reply batch: no
-memory between replies, 6-9 s latency, nothing expressible beyond one-shot
-text. This version is the design issue #2 calls the keystone:
-
-    opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one);
-    every (network, channel) gets ONE warm session;
-    events are tailed per network and submitted with
-        POST /session/{id}/prompt_async  (HTTP 204, non-blocking);
-    replies stream back over SSE GET /event; on `session.idle` the last
-        assistant message is fetched and parsed into FIFO verb lines;
-    a wedged turn is cancelled with POST /session/{id}/abort; turn liveness
-        is polled with GET /session/status.
-
-Warm-session replies land in ~1-3 s and the session remembers its previous
-turns — the premise for per-channel registers, memory promotion and the
-compaction-resilient agent (memory_log.py, policy.py).
-
-The agent-state guard ports aup_watchdog's triggers into the loop: turn cap,
-refusal-shaped replies and wedged turns each reset the session and rehydrate
-it from disk memory; permission requests are rejected on sight and announced
-to the admin over the bot FIFO (the headless equivalent of gate-permission.py:
-an interactive prompt would dead-lock, so deny fast and surface on IRC).
+    opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one); every
+    (network, channel) gets ONE warm session; events are tailed per network
+    and submitted with POST /session/{id}/prompt_async (HTTP 204, never
+    blocking); replies stream back over SSE GET /event and are parsed into
+    FIFO verb lines. A wedged turn is cancelled with /abort; refusals, turn
+    caps and repeated wedges reset the session, which rehydrates from disk
+    memory (memory_log.py). Permission requests are rejected on sight and
+    announced to the admin over the bot FIFO — an interactive prompt would
+    dead-lock a headless agent, so deny fast and surface on IRC.
 """
 import argparse
 import hashlib
@@ -35,85 +22,47 @@ import threading
 import time
 import urllib.request
 from collections import deque
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from functools import partial
 
 import memory_log
 import networks
 import policy
+from util import emit as _emit
+from util import env, env_bool
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _cfg(key, default):
-    return os.environ.get(key, default)
-
-
-def _bool(key, default=False):
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    return v not in ("0", "no", "off", "false", "")
-
+emit = partial(_emit, "BRAIN")
 
 # --- config -----------------------------------------------------------------
-HEARTBEAT = _cfg("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
-AGENT_STATUS = _cfg("BRAIN_AGENT_STATUS", "/data/agent.status")
-WORKDIR = _cfg("BRAIN_WORKDIR", "/data/workspace")
-MEMORY_DIR = _cfg("BRAIN_MEMORY_DIR", os.path.join(WORKDIR, "memory"))
-NICK = _cfg("IRC_NICK", "vjt-claude")          # fallback; per-net nick wins
-ADMIN = _cfg("BRAIN_ADMIN", "admin")           # NOTICE target for the gate
-MODEL = _cfg("BRAIN_MODEL", "opencode/deepseek-v4.1-flash-free")
-OPENCODE_BIN = _cfg("BRAIN_OPENCODE_BIN", "opencode")
-SERVE_URL = _cfg("BRAIN_SERVE_URL", "")        # attach mode (tests/CI)
-SERVE_PORT = int(_cfg("BRAIN_SERVE_PORT", "46099"))
-POLL = float(_cfg("BRAIN_POLL", "1.0"))
-BATCH_MAX = int(_cfg("BRAIN_BATCH_MAX", "5"))
-BATCH_WINDOW = float(_cfg("BRAIN_BATCH_WINDOW", "3.0"))
-RING = int(_cfg("BRAIN_RING", "8"))
-MAX_CHANS = int(_cfg("BRAIN_MAX_CHANS", "64"))
-RATE = float(_cfg("BRAIN_RATE", "3.0"))        # min seconds between sends/target
-GLOBAL_RATE = float(_cfg("BRAIN_GLOBAL_RATE", "1.0"))
-FROM_START = _bool("BRAIN_FROM_START", False)
-DRY_RUN = _bool("BRAIN_DRY_RUN", False)
-API_KEY = _cfg("OPENCODE_API_KEY", "")
-# Agent-guard triggers (aup_watchdog equivalents).
-MAX_TURNS = int(_cfg("BRAIN_MAX_TURNS", "150"))
-TURN_TIMEOUT = float(_cfg("BRAIN_TURN_TIMEOUT", "180"))   # wedged turn
-# chan_filter.awk port: comma-separated channels that never reach the agent.
-MUTE = tuple(c.strip().lower() for c in _cfg("BRAIN_MUTE", "").split(",")
-             if c.strip())
-ADDRESS_ONLY = _bool("BRAIN_ADDRESS_ONLY", False)
+HEARTBEAT = env("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
+AGENT_STATUS = env("BRAIN_AGENT_STATUS", "/data/agent.status")
+WORKDIR = env("BRAIN_WORKDIR", "/data/workspace")
+MEMORY_DIR = env("BRAIN_MEMORY_DIR", os.path.join(WORKDIR, "memory"))
+NICK = env("IRC_NICK", "vjt-claude")           # fallback; per-net nick wins
+ADMIN = env("BRAIN_ADMIN", "admin")            # NOTICE target for the gate
+MODEL = env("BRAIN_MODEL", "opencode/deepseek-v4.1-flash-free")
+SERVE_URL = env("BRAIN_SERVE_URL", "")         # attach mode (tests/CI)
+SERVE_PORT = int(env("BRAIN_SERVE_PORT", "46099"))
+POLL = float(env("BRAIN_POLL", "1.0"))
+BATCH_WINDOW = float(env("BRAIN_BATCH_WINDOW", "3.0"))
+RATE = float(env("BRAIN_RATE", "3.0"))         # min seconds between sends/target
+GLOBAL_RATE = float(env("BRAIN_GLOBAL_RATE", "1.0"))
+FROM_START = env_bool("BRAIN_FROM_START")
+MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
+             if c.strip())                     # chan_filter.awk port
+ADDRESS_ONLY = env_bool("BRAIN_ADDRESS_ONLY")
+API_KEY = env("OPENCODE_API_KEY", "")
 
-_TZ = ZoneInfo("Europe/Rome")
-
-
-def refusal_patterns():
-    """BRAIN_REFUSAL_PATTERNS (JSON list) or the built-in AUP set."""
-    raw = _cfg("BRAIN_REFUSAL_PATTERNS", "")
-    if raw.strip():
-        try:
-            pats = json.loads(raw)
-            if isinstance(pats, list):
-                return tuple(pats)
-        except ValueError:
-            pass
-    return policy.DEFAULT_REFUSAL_PATTERNS
-
-
-def emit(kind, *parts):
-    line = f"[{datetime.now(_TZ).strftime('%H:%M:%S')}] BRAIN {kind} " + \
-        " ".join(str(p) for p in parts)
-    print(line, flush=True)
+OPENCODE_BIN = "opencode"
+RING = 8               # events of context carried in every prompt
+BATCH_MAX = 5          # submit a batch once it grows this big
+MAX_CHANS = 64
+MAX_TURNS = 150        # assistant turns before a session reset (turn cap)
+TURN_TIMEOUT = 180.0   # a turn busy this long is wedged: abort it
 
 
 def install_api_key():
-    """Write the OpenCode auth file from OPENCODE_API_KEY, if given.
-
-    Path matches the CLI's own store (~/.local/share/opencode/auth.json), the
-    format documented in the README: {"opencode":{"type":"api","key":"..."}}.
-    Must run BEFORE `opencode serve` spawns: the server reads auth once.
-    """
+    """Write the OpenCode auth file from OPENCODE_API_KEY; must run BEFORE
+    `opencode serve` spawns (the server reads auth once)."""
     if not API_KEY:
         return
     d = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode")
@@ -128,66 +77,34 @@ def install_api_key():
         emit("AUTH_ERROR", repr(e))
 
 
-# --- opencode.json (the permission gate + instructions + compaction) --------
-# Copied into WORKDIR on start unless one is already there. The permission
-# block is the settings.json allow-list equivalent (gap 8): reads are fine,
-# writes only under memory/, no bash, no web — and anything that still asks
-# is auto-rejected at runtime with an IRC NOTICE (deny fast, deny-wins).
-DEFAULT_OPENCODE_JSON = {
-    "$schema": "https://opencode.ai/config.json",
-    "instructions": ["memory/MEMORY.md"],
-    "compaction": {"auto": True, "prune": True, "tail_turns": 8},
-    "permission": {
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "list": "allow",
-        "edit": {"**": "deny", "memory/**": "allow"},
-        "write": {"**": "deny", "memory/**": "allow"},
-        "bash": "deny",
-        "webfetch": "deny",
-        "task": "deny",
-        "external_directory": "deny",
-    },
-}
-
-
 def setup_workdir():
     """Materialise the agent workspace: opencode.json + memory root.
 
     The directory the server runs in is the session's project root: its
-    opencode.json gives every session the permission gate, the auto-injected
-    MEMORY.md and compaction; `memory/` is what the agent reads and writes to
-    survive compactions.
+    opencode.json carries the permission gate, the auto-injected MEMORY.md
+    and compaction; `memory/` is what the agent survives compactions with.
     """
     os.makedirs(WORKDIR, exist_ok=True)
     cfg_path = os.path.join(WORKDIR, "opencode.json")
     if not os.path.exists(cfg_path):
+        here = os.path.dirname(os.path.abspath(__file__))
         try:
-            with open(os.path.join(HERE, "opencode.json")) as f:
+            with open(os.path.join(here, "opencode.json")) as f:
                 data = f.read()
-            json.loads(data)                      # validate before installing
-        except (OSError, ValueError):
-            data = json.dumps(DEFAULT_OPENCODE_JSON, indent=2)
+            json.loads(data)                  # validate before installing
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"opencode.json missing or invalid: {e}") from e
         with open(cfg_path, "w") as f:
             f.write(data)
         emit("WORKDIR_CONFIG", cfg_path)
     mem = memory_log.Memory(MEMORY_DIR)
     mem.ensure()
+    mem.archive_older_than()   # the 14-day rule, in code, at brain start
     return mem
 
 
 def registers():
-    """Per-channel register map from BRAIN_REGISTERS (JSON env) or
-    <WORKDIR>/registers.json."""
-    raw = _cfg("BRAIN_REGISTERS", "")
-    if raw.strip():
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
-        except ValueError:
-            pass
+    """Per-channel register map from <WORKDIR>/registers.json."""
     try:
         with open(os.path.join(WORKDIR, "registers.json")) as f:
             data = json.load(f)
@@ -209,12 +126,12 @@ class Serve:
     def spawned(cls):
         """Start `opencode serve` and wait for /global/health.
 
-        BRAIN_SERVE_HOST (default 127.0.0.1) exists for stacks where a sidecar
-        (the watchdog) polls the server over the container network; the brain
-        itself always talks to 127.0.0.1.
+        BRAIN_SERVE_HOST exists for stacks where a sidecar (the watchdog)
+        polls the server over the container network; the brain itself always
+        talks to 127.0.0.1.
         """
         install_api_key()
-        host = _cfg("BRAIN_SERVE_HOST", "127.0.0.1")
+        host = env("BRAIN_SERVE_HOST", "127.0.0.1")
         last_err = "unknown"
         for attempt in range(5):
             port = SERVE_PORT + attempt
@@ -297,16 +214,12 @@ class Api:
     def abort(self, sid):
         return self._req("POST", f"/session/{sid}/abort", {})
 
-    def status(self):
-        return self._req("GET", "/session/status") or {}
-
     def permission_reply(self, request_id, reply="reject", message=""):
         return self._req("POST", f"/permission/{request_id}/reply",
                          {"reply": reply, "message": message})
 
     def events(self):
-        """Yield parsed SSE events from GET /event; reconnect is the
-        caller's job. Raises OSError on connection failure."""
+        """Yield parsed SSE events; reconnect is the caller's job."""
         req = urllib.request.Request(self.base + "/event")
         resp = urllib.request.urlopen(req, timeout=None)
         try:
@@ -332,11 +245,8 @@ def split_model(model):
 
 # --- FIFO -------------------------------------------------------------------
 def write_fifo(lines, path, deadline=10.0):
-    """Write FIFO command lines into the bot's named pipe.
-
-    Non-blocking open + retry: a bot that has not yet created the FIFO (or is
-    down) must not wedge the brain. Returns the number of lines written.
-    """
+    """Write FIFO lines into the bot's named pipe. Non-blocking open + retry:
+    a bot that is down must not wedge the brain. Returns lines written."""
     if not lines:
         return 0
     payload = "".join(f"{ln}\n" for ln in lines).encode("utf-8")
@@ -361,7 +271,7 @@ def write_fifo(lines, path, deadline=10.0):
 
 # --- tail -------------------------------------------------------------------
 class Tailer:
-    """Minimal `tail -f` over a file, tolerant of truncation/rotation."""
+    """Minimal `tail -f`, tolerant of truncation/rotation."""
 
     def __init__(self, path, from_start=False):
         self.path = path
@@ -448,8 +358,7 @@ def assistant_turn_count(messages):
 
 # --- brain -------------------------------------------------------------------
 class Brain:
-    def __init__(self, dry_run=DRY_RUN, nets=None, mem=None,
-                 refusal_pats=None):
+    def __init__(self, dry_run=False, nets=None, mem=None, refusal_pats=None):
         self.dry_run = dry_run
         self.nets = nets if nets is not None else networks.load()
         self.net_by_name = {n.name: n for n in self.nets}
@@ -468,7 +377,7 @@ class Brain:
         self.total_wedges = 0
         self.registers = registers()
         self.model = split_model(MODEL)
-        self.refusals = refusal_pats or refusal_patterns()
+        self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored = {}                   # (net, chan) -> sid, from disk
         self.stop_flag = False
 
@@ -480,10 +389,8 @@ class Brain:
         return os.path.join(WORKDIR, "sessions.json")
 
     def load_session_store(self):
-        """{(net, chan): sid} persisted across brain restarts: the pointer to
-        the LIVE session per channel. Dead (reset) sessions are removed, so a
-        restart re-attaches the right one even though the server still lists
-        the abandoned ones."""
+        """{(net, chan): sid} across brain restarts: the pointer to the LIVE
+        session per channel (dead ones were removed by reset)."""
         try:
             with open(self._store_path()) as f:
                 data = json.loads(f.read())
@@ -501,23 +408,9 @@ class Brain:
         except OSError:
             pass
 
-    def attach(self):
-        """Log how many IRC sessions already exist on the server after a
-        brain restart; channels re-attach lazily as events arrive."""
-        try:
-            existing = [s for s in self.api.list_sessions()
-                        if isinstance(s, dict)
-                        and str(s.get("title", "")).startswith("irc:")]
-        except OSError as e:
-            emit("SESSION_LIST_ERROR", repr(e))
-            return
-        emit("SESSION_REATTACH", len(existing))
-
     def get_session(self, net, chan, nick=None):
         """The (net, chan) session, created or re-attached on first use.
-
-        Main-thread only (feed drives it); the SSE thread never creates.
-        """
+        Main-thread only (feed drives it); the SSE thread never creates."""
         key = (net, chan)
         with self.lock:
             sess = self.sessions.get(key)
@@ -526,8 +419,8 @@ class Brain:
         if len(self.sessions) >= MAX_CHANS:
             emit("CHAN_OVERFLOW", net, chan)
             return None
-        env = self.net_by_name[net].env
-        nick = nick or env.get("IRC_NICK", NICK)
+        env_ = self.net_by_name[net].env
+        nick = nick or env_.get("IRC_NICK", NICK)
         title = f"irc:{net}:{chan}"
         known = {s.get("id") for s in self.api.list_sessions()}
         sid = None
@@ -572,8 +465,8 @@ class Brain:
             emit("REHYDRATE_ERROR", sess.title, repr(e))
 
     def reset_session(self, sess, reason):
-        """aup_watchdog's `/clear`: abandon the session, start a new one,
-        rehydrate from disk. Aborts first so we never reset mid-turn."""
+        """The `/clear`: abandon the session, start a new one, rehydrate from
+        disk. Aborts first so we never reset mid-turn."""
         try:
             self.api.abort(sess.sid)
         except OSError:
@@ -659,7 +552,7 @@ class Brain:
             sess.busy_since = None
         self.record_turn(sess, text)
         self.dispatch(sess, text)
-        # Queueing emulation of the Monitor: the next due batch goes out now.
+        # Monitor queueing: the next due batch goes out now.
         if self.due(sess):
             self.submit(sess)
 
@@ -686,27 +579,25 @@ class Brain:
         if not answer:
             emit("NO_VERBS", sess.title)
             return
-        now = time.monotonic()
+        nowm = time.monotonic()
         out, digests = [], []
-        for verb, target, body, line in answer:
+        for verb, target, body in answer:
             digest = hashlib.sha1(
                 f"{sess.net}\0{target}\0{body}".encode()).hexdigest()
             if digest in self.recent:
                 continue                  # a model echoing itself must not loop
             if verb in policy.CHAT_VERBS:
                 key = (sess.net, target.lower())
-                if now - self.last_sent.get(key, -1e9) < RATE:
+                if nowm - self.last_sent.get(key, -1e9) < RATE:
                     emit("RATE_LIMITED", sess.title, target)
                     continue
-                if now - self.last_global < GLOBAL_RATE:
+                if nowm - self.last_global < GLOBAL_RATE:
                     emit("RATE_LIMITED", sess.title, "global")
                     continue
-                digests.append(digest)
-                self.last_sent[key] = now
-                self.last_global = now
-            else:
-                digests.append(digest)    # JOIN/QUIT storms get the same guard
-            out.append(line)
+                self.last_sent[key] = nowm
+                self.last_global = nowm
+            digests.append(digest)
+            out.append(f"{verb} {target} {body}" if target or body else verb)
         if not out:
             return
         n = write_fifo(out, self.net_by_name[sess.net].fifo)
@@ -715,14 +606,14 @@ class Brain:
 
     # -- agent guard (wedged turns) ---------------------------------------------------
     def guard_tick(self):
-        now = time.monotonic()
+        nowm = time.monotonic()
         with self.lock:
             busy = [s for s in self.sessions.values()
                     if s.busy_since is not None]
         for sess in busy:
-            if now - sess.busy_since < TURN_TIMEOUT:
+            if nowm - sess.busy_since < TURN_TIMEOUT:
                 continue
-            emit("WEDGED", sess.title, f"{now - sess.busy_since:.0f}s")
+            emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
             self.total_wedges += 1
             sess.wedges += 1
             try:
@@ -736,11 +627,7 @@ class Brain:
 
     # -- permission gate -----------------------------------------------------------------
     def gate(self, props):
-        """permission.asked: reject on sight, announce over the FIFO.
-
-        The reference's gate-permission.py exists because an interactive
-        prompt dead-locks a headless agent: deny fast, tell the human on IRC.
-        """
+        """permission.asked: reject on sight, announce over the FIFO."""
         req_id = props.get("id") or ""
         sess = self.by_sid.get(props.get("sessionID"))
         what = props.get("permission") or "unknown"
@@ -797,8 +684,6 @@ class Brain:
             self.mem.log_compaction()
             emit("COMPACTED", sess.title if sess
                  else str(props.get("sessionID", "")))
-            self.mem.append_activity(
-                f"session compacted: {sess.title if sess else 'unknown'}")
 
     # -- watchdog plumbing --------------------------------------------------------------
     def heartbeat(self):
@@ -833,7 +718,6 @@ class Brain:
         self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
         emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
         self.api = Api(self.serve.url)
-        self.attach()
         tailers = [(n.name, Tailer(n.events, from_start=FROM_START))
                    for n in self.nets]
         threading.Thread(target=self.sse_loop, daemon=True).start()
@@ -847,7 +731,7 @@ class Brain:
                     self.submit(sess)
             self.guard_tick()
             # Managed serve died: respawn, then drop session state so every
-            # channel re-attaches (or recreates) against the new server.
+            # channel re-attaches against the new server.
             if self.serve.managed and self.serve.managed.poll() is not None:
                 emit("SERVE_DOWN", f"exit={self.serve.managed.returncode}")
                 try:
@@ -871,7 +755,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="build and print prompts, never submit them")
     args = ap.parse_args(argv)
-    brain = Brain(dry_run=args.dry_run or DRY_RUN)
+    brain = Brain(dry_run=args.dry_run)
 
     def _term(*_):
         brain.stop_flag = True
