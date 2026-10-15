@@ -82,9 +82,9 @@ spec:
             - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
             - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
             - {name: IRC_NICK, value: ocbot}
-            # Serve binds the pod IP so the watchdog pod (via oc-brain:46099)
-            # can poll it; the brain itself always talks to 127.0.0.1.
-            - {name: BRAIN_SERVE_HOST, value: 0.0.0.0}
+            # `opencode serve` binds 127.0.0.1, full stop (hardcoded in
+            # brain.py): it is the agent's unauthenticated control plane, and
+            # the watchdog polls it from the same pod's loopback.
             - name: OPENCODE_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -109,18 +109,9 @@ spec:
           env:
             - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
             - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
-            - {name: BRAIN_SERVE_URL, value: "http://oc-brain:46099"}
+            # Same pod as the brain: loopback reaches its serve. There is no
+            # Service on purpose — the agent API must stay pod-local.
+            - {name: BRAIN_SERVE_URL, value: "http://127.0.0.1:46099"}
           volumeMounts:
             - {name: code, mountPath: /code, readOnly: true}
             - {name: data, mountPath: /data}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: oc-brain
-  namespace: hermes-generated-content
-  labels: {app: oc-brain}
-spec:
-  selector: {app: oc-brain}
-  ports:
-    - {name: serve, port: 46099, targetPort: 46099}

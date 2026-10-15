@@ -36,10 +36,12 @@ its workspace, or attaches to a running one via `BRAIN_SERVE_URL`):
   per reply.
 - **Streaming replies.** An SSE thread on `GET /event` wakes on
   `session.idle`, fetches the last assistant message, parses FIFO verbs and
-  writes them to the right network's FIFO.
-- **Cancellation.** A turn stuck beyond `TURN_TIMEOUT` (180 s) is cancelled
-  with `POST /session/{id}/abort`; liveness is polled via
-  `GET /session/status`.
+  writes them to the right network's FIFO. On a reconnect it first polls
+  `/session/{id}/message` for busy sessions, so an idle lost to a connection
+  blip cannot strand a finished reply.
+- **Cancellation.** A turn stuck beyond `TURN_TIMEOUT` (180 s, env-tunable)
+  is cancelled with `POST /session/{id}/abort`; the `session.status`
+  SSE events (busy/retry) arm and update the wedge clock.
 
 **Measured latency** (real `opencode serve` v1.19.0, 2026-10-15): a warm
 session answers in **~1.0 s** (0.94–1.00 s across three turns); the first
@@ -64,9 +66,13 @@ agent.
 **Multi-network.** `bot.py` is env-parameterised, so one process per IRC
 network shares one brain: `IRC_NETWORKS=azzurra,libera` (plus
 `networks.json` per-label overrides) makes the brain tail
-`events.<net>.log` and write `bot.send.<net>` per network. Run one bot
-instance per network — a `oc-ircbot-bot@.service` template unit on a host,
-one container each in Docker/Kubernetes.
+`events.<net>.log` and write `bot.send.<net>` per network. `nets.py` is the
+supervisor that mechanises it — one `bot.py` child per network, restart
+backoff on a dead child, and a clean `QUIT` through every FIFO on SIGTERM —
+and it is the container entrypoint (`Dockerfile.bot` CMD, k8s `bot`
+containers): a rolling update parts the bot instead of ghost-flapping the
+nick. On a host, the `oc-ircbot-bot@.service` template unit runs one
+instance per network with the same effect.
 
 **The Monitor-equivalent.** `opencode serve` has no mid-turn notification
 API, but `prompt_async` is accepted while a turn streams (verified: the
@@ -100,10 +106,14 @@ SAY <target> <text>
 ACT <target> <text>
 NOTICE <nick> <text>
 JOIN <chan> | PART <chan> | WHOIS <nick> | QUIT [reason]
-RAW <irc line>
 ```
 
-Everything else in the answer is prose and is ignored. Bodies are stripped
+Everything else in the answer is prose and is ignored — **including `RAW`**:
+the arbitrary-line verb exists for trusted sidecars at the bot's FIFO only,
+never in the model-facing grammar (a prompt-injected `RAW QUIT :bye` must not
+be able to kill the connection). Non-chat verbs are additionally capped per
+answer, and the rate gates apply per answer, so a multi-line reply is never
+eaten line-by-line. Bodies are stripped
 of ANSI/control characters, so a reply can never forge a second FIFO line
 inside a message. Silence is the default (`policy.build_system`): the prompt
 is an opportunity, not an obligation. The system prompt also carries the
@@ -201,7 +211,7 @@ Brain variables:
 |---|---|---|
 | `BRAIN_MODEL` | `opencode/deepseek-v4.1-flash-free` | model for new sessions |
 | `BRAIN_SERVE_URL` | *(empty)* | attach to a running serve (else spawn one) |
-| `BRAIN_SERVE_PORT` / `BRAIN_SERVE_HOST` | `46099` / `127.0.0.1` | spawn port; host `0.0.0.0` lets a sidecar poll it |
+| `BRAIN_SERVE_PORT` | `46099` | port of the spawned serve; the bind is **always `127.0.0.1`** (hardcoded: the agent's unauthenticated control plane never leaves the host — the watchdog shares its netns to reach it) |
 | `BRAIN_WORKDIR` | `/data/workspace` | serve cwd: `opencode.json`, sessions.json, memory |
 | `BRAIN_MEMORY_DIR` | `$WORKDIR/memory` | agent memory (index + activity log) |
 | `BRAIN_AGENT_STATUS` | `/data/agent.status` | JSON snapshot for the watchdog |
@@ -211,13 +221,14 @@ Brain variables:
 | `BRAIN_ADDRESS_ONLY` | `0` | wake only when addressed |
 | `registers.json` | *(none)* | per-channel register text, in `BRAIN_WORKDIR` |
 | `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` | `1.0` / `3.0` | batching |
-| `BRAIN_RATE` / `BRAIN_GLOBAL_RATE` | `3.0` / `1.0` | send rate limits (s) |
+| `BRAIN_RATE` / `BRAIN_GLOBAL_RATE` | `3.0` / `1.0` | send rate limits (s), applied per answer |
+| `BRAIN_MAX_TURNS` / `BRAIN_TURN_TIMEOUT` | `150` / `180` | session turn cap / wedged-turn abort (env-tunable: a free-tier model can turn for minutes) |
+| `BRAIN_DRY_RUN` | `0` | print prompts instead of submitting (compose/k8s can dry-run without editing the command) |
 | `BRAIN_FROM_START` | `0` | read event logs from the top on start |
-| `brain.py --dry-run` | — | print the prompt instead of submitting |
 
-Session-guard constants live in `brain.py` (`MAX_TURNS` 150, `TURN_TIMEOUT`
-180 s, ring 8, batch max 5, 64 channels); the refusal patterns are
-`policy.DEFAULT_REFUSAL_PATTERNS`.
+Remaining session constants live in `brain.py` (ring 8, batch max 5, 64
+channels, 32 queued events, 4 non-chat verbs per answer); the refusal
+patterns are `policy.DEFAULT_REFUSAL_PATTERNS`.
 
 Watchdog variables: `WATCHDOG_POLL` (`10`), `WATCHDOG_STALL` (`30`),
 `WATCHDOG_MAX_STALLS` (`3`), `WATCHDOG_WEDGED` (`300`),

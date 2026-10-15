@@ -54,9 +54,9 @@ services:
       BRAIN_AGENT_STATUS: /data/agent.status
       BRAIN_MODEL: ${BRAIN_MODEL:-opencode/deepseek-v4.1-flash-free}
       BRAIN_SERVE_PORT: ${BRAIN_SERVE_PORT:-46099}
-      # 0.0.0.0 so the watchdog container can poll serve health across the
-      # compose network; the brain itself always talks to 127.0.0.1.
-      BRAIN_SERVE_HOST: 0.0.0.0
+      # `opencode serve` always binds 127.0.0.1 (hardcoded in brain.py — it is
+      # the agent's unauthenticated control plane). The watchdog reaches it by
+      # joining this container's network namespace (see below).
       # Attach to an already-running serve instead of spawning one:
       # BRAIN_SERVE_URL: http://host:46099
       BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
@@ -64,6 +64,9 @@ services:
       BRAIN_BATCH_WINDOW: ${BRAIN_BATCH_WINDOW:-3.0}
       BRAIN_RATE: ${BRAIN_RATE:-3.0}
       BRAIN_GLOBAL_RATE: ${BRAIN_GLOBAL_RATE:-1.0}
+      BRAIN_MAX_TURNS: ${BRAIN_MAX_TURNS:-150}
+      BRAIN_TURN_TIMEOUT: ${BRAIN_TURN_TIMEOUT:-180}
+      BRAIN_DRY_RUN: ${BRAIN_DRY_RUN:-0}
       BRAIN_MUTE: ${BRAIN_MUTE:-}
       BRAIN_ADDRESS_ONLY: ${BRAIN_ADDRESS_ONLY:-0}
     volumes:
@@ -77,10 +80,13 @@ services:
       context: .
       dockerfile: Dockerfile.watchdog
     image: oc-ircbot-watchdog
+    # Share the brain's network namespace: serve is loopback-only, and this is
+    # how the watchdog reaches it without ever widening the bind.
+    network_mode: "service: brain"
     environment:
       BRAIN_HEARTBEAT: /data/brain.heartbeat
       BRAIN_AGENT_STATUS: /data/agent.status
-      BRAIN_SERVE_URL: http://brain:${BRAIN_SERVE_PORT:-46099}
+      BRAIN_SERVE_URL: http://127.0.0.1:${BRAIN_SERVE_PORT:-46099}
       WATCHDOG_POLL: ${WATCHDOG_POLL:-10}
       WATCHDOG_STALL: ${WATCHDOG_STALL:-30}
       WATCHDOG_MAX_STALLS: ${WATCHDOG_MAX_STALLS:-3}

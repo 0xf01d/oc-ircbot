@@ -67,10 +67,15 @@ are logged to the activity log when they arrive on SSE).
    GLOBAL_RATE throttle chat verbs, and `write_fifo` writes to the network's
    FIFO with a deadline (a bot that is down never wedges the brain).
 
-The FIFO verb grammar is the bot's full set — `SAY`, `ACT`, `NOTICE`, `JOIN`,
-`PART`, `WHOIS`, `QUIT`, `RAW` — not just `SAY` (round 1 accepted one verb).
-`policy._clean` strips ANSI and control characters from every body, so a
-model answer can never forge a second FIFO line inside a message body.
+The FIFO verb grammar is the bot's full set minus `RAW` — `SAY`, `ACT`,
+`NOTICE`, `JOIN`, `PART`, `WHOIS`, `QUIT` — not just `SAY` (round 1 accepted
+one verb). `RAW` stays a bot-level sidecar verb only: "orders only from
+TRUSTED users" lives in the prompt, so the arbitrary-line verb cannot live in
+the model-facing grammar (one injected `RAW QUIT :bye` would kill the
+connection). `policy._clean` strips ANSI and control characters from every
+body, so a model answer can never forge a second FIFO line inside a message
+body, and the rate gates apply per answer — a multi-line reply is dropped
+whole or sent whole, never eaten line-by-line.
 
 ## Permission gate (gate-permission.py port)
 

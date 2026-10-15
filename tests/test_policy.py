@@ -75,6 +75,18 @@ def test_wakes_model_matrix():
         policy.parse_event("[09:00] JOIN TO=#c FROM=x"), nick)
 
 
+def test_wakes_model_gates_ctcp_and_notice_too():
+    # An untrusted `CTCP PING` must not be able to buy a model turn: the
+    # address gate covers CTCP/NOTICE, not just MSG. They still ride the ring
+    # and reach the model as context with the next real batch.
+    ctcp = policy.parse_event("[12:00] CTCP FROM=evil HOST=h TO=bot BODY=PING")
+    notice = policy.parse_event("[12:00] NOTICE FROM=n HOST=h TO=#c BODY=hi")
+    assert not policy.wakes_model(ctcp, "bot", address_only=True)
+    assert not policy.wakes_model(notice, "bot", address_only=True)
+    assert policy.wakes_model(ctcp, "bot")
+    assert policy.wakes_model(notice, "bot")
+
+
 # --- refusal patterns ---------------------------------------------------------
 def test_refusal_hits_default_patterns():
     assert policy.refusal_hits("I can't help with that request.")
@@ -99,7 +111,6 @@ JOIN #other
 PART #gone
 WHOIS vjt
 QUIT :goodbye
-RAW PRIVMSG #x :direct
 """
     assert policy.parse_answer(text) == [
         ("SAY", "#test", "hello world"),
@@ -109,8 +120,16 @@ RAW PRIVMSG #x :direct
         ("PART", "", "#gone"),
         ("WHOIS", "", "vjt"),
         ("QUIT", "", ":goodbye"),
-        ("RAW", "", "PRIVMSG #x :direct"),
     ]
+
+
+def test_parse_answer_never_accepts_raw_from_the_model():
+    # RAW is the bot's sidecar verb, never the model's: "orders only from
+    # TRUSTED users" lives in the prompt, so the arbitrary-line verb cannot
+    # live in the grammar — one injected `RAW QUIT :bye` must not execute.
+    assert policy.parse_answer("SAY #c hi\nRAW QUIT :bye") == \
+        [("SAY", "#c", "hi")]
+    assert "RAW" not in policy.VERBS
 
 
 def test_parse_answer_ignores_prose_and_injection():

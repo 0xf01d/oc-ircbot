@@ -82,3 +82,9 @@ services:
     depends_on:
       - stub-serve
       - mock-irc
+
+  # The watchdog shares the brain's netns (base file); in the smoke the serve
+  # it monitors is the stub, so point it there and its server layer is live.
+  watchdog:
+    environment:
+      BRAIN_SERVE_URL: http://stub-serve:46099

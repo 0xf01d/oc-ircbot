@@ -26,7 +26,10 @@ jobs:
         run: |
           printf '[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi\n' \
             > "$BOT_EVENTS"
-          timeout 5 python brain.py --dry-run || true
+          # The step must be able to fail: assert the prompt actually came out
+          # (a crashed brain leaves a traceback, and the grep goes red).
+          timeout 5 python brain.py --dry-run > dry.out || true
+          grep -q "Network: irc" dry.out
       - name: End-to-end smoke without Docker (mock IRC + stub serve)
         run: sh tests/smoke_local.sh
 
@@ -41,6 +44,10 @@ jobs:
         run: |
           docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
             up --abort-on-container-exit --exit-code-from mock-irc
+      - name: serve binds loopback only (real opencode serve, in-container)
+        run: |
+          docker run --rm oc-ircbot-brain \
+            python3 /app/tests/serve_bind_check.py
       - name: Dump logs on failure
         if: failure()
         run: |

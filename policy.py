@@ -91,14 +91,21 @@ def is_addressed(ev, nick):
 
 
 def wakes_model(ev, nick, address_only=False):
-    """May this event (alone) justify a model turn?"""
-    if ev.get("kind") not in ACTIONABLE:
+    """May this event (alone) justify a model turn? The address gate covers
+    CTCP/NOTICE too: an untrusted `CTCP PING` must not be able to buy a model
+    turn (cost DoS, and attacker text lands in the prompt as a fresh event).
+    Under BRAIN_ADDRESS_ONLY they still reach the model as ring context."""
+    kind = ev.get("kind")
+    if kind not in ACTIONABLE:
         return False
-    if ev.get("kind") == "MSG":
+    if kind == "MSG":
         if not (ev.get("body") or "").strip():
             return False
         if address_only:
             return is_addressed(ev, nick)
+        return True
+    if kind in ("CTCP", "NOTICE"):
+        return not address_only
     return True
 
 
@@ -120,10 +127,16 @@ def refusal_hits(text, patterns=DEFAULT_REFUSAL_PATTERNS):
 
 
 # --- FIFO verb grammar ------------------------------------------------------
-VERBS = ("SAY", "ACT", "NOTICE", "JOIN", "PART", "WHOIS", "QUIT", "RAW")
+# The MODEL-facing grammar. RAW is deliberately absent: it is the bot's
+# sidecar escape hatch (bot.py keeps it), but from the model it is one
+# prompt-injected `RAW QUIT :bye` away from killing the connection — the
+# "orders only from TRUSTED users" rule lives in the prompt, so the
+# arbitrary-line verb cannot live in the grammar (review should-fix).
+VERBS = ("SAY", "ACT", "NOTICE", "JOIN", "PART", "WHOIS", "QUIT")
 _VERB_LINE = re.compile(rf"^({'|'.join(VERBS)})\s+(.+)$", re.IGNORECASE)
-CHAT_VERBS = {"SAY", "ACT", "NOTICE"}   # the ones we rate-limit and dedupe
+CHAT_VERBS = {"SAY", "ACT", "NOTICE"}
 _OWN_DROP_VERBS = {"SAY", "ACT", "NOTICE"}  # allowed to name others, not us
+NON_CHAT_CAP = 4       # JOIN/PART/WHOIS/QUIT lines one answer may carry
 
 
 def _clean(text):
@@ -143,7 +156,7 @@ def parse_answer(text):
         if m:
             verb = m.group(1).upper()
             rest = m.group(2).strip()
-            if verb in ("JOIN", "PART", "WHOIS", "QUIT", "RAW"):
+            if verb in ("JOIN", "PART", "WHOIS", "QUIT"):
                 if not rest:
                     continue
                 out.append((verb, "", rest))
@@ -220,7 +233,7 @@ def build_system(nick, net, channel, registers=None, extra=""):
         "  SAY <target> <text>     - a normal channel/DM message",
         "  ACT <target> <text>     - a /me action",
         "  NOTICE <target> <text>  - a notice",
-        "  JOIN <chan> / PART <chan> / WHOIS <nick> / QUIT [reason] / RAW <line>",
+        "  JOIN <chan> / PART <chan> / WHOIS <nick> / QUIT [reason]",
         "An empty answer (or a reply without command lines) means silence — "
         "that is allowed and often right. Keep messages short and human.",
     ]

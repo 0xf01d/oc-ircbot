@@ -19,6 +19,7 @@ import pytest
 import brain
 import memory_log
 import networks
+import policy
 from stub_opencode_serve import StubServe
 
 
@@ -387,6 +388,111 @@ def test_write_fifo_gives_up_without_reader(tmp_path, capsys):
     assert "FIFO_WRITE_TIMEOUT" in capsys.readouterr().out
 
 
+# --- dispatch: per-answer gates (review blocker 2) -----------------------------
+def _bare_brain(tmp_path):
+    """A Brain with no threads and one net; dispatch/feed are called direct."""
+    mem = memory_log.Memory(str(tmp_path / "mem"))
+    mem.ensure()
+    os.mkfifo(str(tmp_path / "bot.send"))
+    net = networks.Net("irc", str(tmp_path / "events.log"),
+                       str(tmp_path / "bot.send"), str(tmp_path / "bot.log"),
+                       {"IRC_NICK": "ocbot"})
+    return brain.Brain(nets=[net], mem=mem)
+
+
+def _sess_on(brain_obj, chan="#test"):
+    sess = brain.Session("s1", "irc", chan, "ocbot", "sys")
+    brain_obj.sessions[("irc", chan)] = sess
+    brain_obj.by_sid["s1"] = sess
+    return sess
+
+
+def test_dispatch_multiline_answer_is_not_eaten_by_the_rate_gates(tmp_path):
+    # Review blocker 2, verbatim repro: with the shipped defaults, a 3-line
+    # answer used to deliver only line one (per-line RATE) and a follow-up
+    # dispatch lost everything to GLOBAL_RATE. Both gates are per answer now:
+    # one check, drop whole or send whole.
+    b = _bare_brain(tmp_path)
+    sess = _sess_on(b)
+    with mock.patch.object(brain, "RATE", 3.0), \
+            mock.patch.object(brain, "GLOBAL_RATE", 1.0), \
+            mock.patch.object(brain, "write_fifo", return_value=3) as wf:
+        b.dispatch(sess, "SAY #test one\nSAY #test two\nSAY #test three")
+        assert wf.call_args.args[0] == ["SAY #test one", "SAY #test two",
+                                        "SAY #test three"]
+        time.sleep(0.3)
+        b.dispatch(sess, "SAY #other four\nSAY #other five")
+        assert wf.call_count == 1          # hot global gate: whole answer waits
+        b.last_global = 0.0                # ...and once it passes, ALL lines go
+        b.dispatch(sess, "SAY #other four\nSAY #other five")
+        assert wf.call_args.args[0] == ["SAY #other four", "SAY #other five"]
+
+
+def test_dispatch_caps_non_chat_verbs_per_answer(tmp_path):
+    # A prompt-injected answer must not be able to storm the connection with
+    # JOINs; the cap trims the tail instead of executing all of it.
+    b = _bare_brain(tmp_path)
+    sess = _sess_on(b)
+    with mock.patch.object(brain, "write_fifo", return_value=4) as wf:
+        b.dispatch(sess, "\n".join(f"JOIN #{i}" for i in range(6)))
+        assert wf.call_args.args[0] == [f"JOIN #{i}" for i in range(4)]
+
+
+def test_pending_queue_is_capped(tmp_path):
+    # A slow model + busy channel must not grow the next batch without bound.
+    b = _bare_brain(tmp_path)
+    sess = _sess_on(b)
+    for i in range(60):
+        b.feed("irc", policy.parse_event(
+            f"[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY=m{i}"))
+    assert len(sess.pending) == brain.PENDING_MAX
+
+
+def test_sse_reconnect_catches_up_a_missed_idle(world):
+    # A session.idle lost to a connection blip must not strand the finished
+    # reply: on reconnect, busy sessions with unseen assistant turns are
+    # collected and dispatched.
+    world.open_fifo()
+    world.say("[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi bot")
+    deadline = time.monotonic() + 10
+    key = ("irc", "#test")
+    while key not in world.brain.sessions and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert key in world.brain.sessions
+    world.read_fifo(1)                      # the normal path already collected
+    sess = world.brain.sessions[key]
+    deadline = time.monotonic() + 10
+    while sess.turns < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    # Simulate the blip: the turn finished but its idle was never processed.
+    sess.busy_since = time.monotonic()
+    sess.last_count = 0
+    world.brain.recent.clear()
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        world.brain.catch_up_missed_idles()
+        assert wf.call_args.args[0] == ["SAY #test stub-ok"]
+
+
+def test_sse_catchup_leaves_running_turns_alone(world):
+    world.say("[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi bot")
+    deadline = time.monotonic() + 10
+    key = ("irc", "#test")
+    while key not in world.brain.sessions and time.monotonic() < deadline:
+        time.sleep(0.05)
+    sess = world.brain.sessions[key]
+    deadline = time.monotonic() + 10
+    while sess.busy_since is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    # Last message is not yet an assistant turn: the turn is still running
+    # and its own idle will collect it — catch-up must not pre-empt it.
+    with mock.patch.object(world.brain.api, "messages",
+                           return_value=[{"info": {"role": "user"},
+                                          "parts": []}]), \
+            mock.patch.object(brain, "write_fifo") as wf:
+        world.brain.catch_up_missed_idles()
+    wf.assert_not_called()
+
+
 def test_registers_config_from_file(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "WORKDIR", str(tmp_path))
     assert brain.registers() == {}
@@ -407,6 +513,30 @@ def test_turn_knobs_and_dry_run_env_tunable(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], env=env, check=True,
                          capture_output=True, text=True, timeout=30).stdout
     assert out.split() == ["7", "240.5", "True"]
+
+
+def test_serve_spawn_binds_loopback_only():
+    # Review blocker 1, pinned at the level of the real spawn argv: the
+    # agent's control plane never binds anything but 127.0.0.1.
+    seen = {}
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **_kw):
+        seen["argv"] = argv
+        return FakeProc()
+
+    with mock.patch.object(brain.subprocess, "Popen", fake_popen), \
+            mock.patch.object(brain.Serve, "_wait_healthy",
+                              return_value=True), \
+            mock.patch.object(brain, "WORKDIR", "/tmp"):
+        serve = brain.Serve.spawned()
+    argv = seen["argv"]
+    assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
+    assert "0.0.0.0" not in argv
+    assert serve.url.startswith("http://127.0.0.1:")
 
 
 def test_setup_workdir_installs_config_and_memory(tmp_path, monkeypatch):

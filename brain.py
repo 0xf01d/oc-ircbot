@@ -129,14 +129,17 @@ class Serve:
 
     @classmethod
     def spawned(cls):
-        """Start `opencode serve` and wait for /global/health.
+        """Start `opencode serve` on loopback and wait for /global/health.
 
-        BRAIN_SERVE_HOST exists for stacks where a sidecar (the watchdog)
-        polls the server over the container network; the brain itself always
-        talks to 127.0.0.1.
+        Serve is the agent's whole control plane (sessions, prompts, aborts,
+        history) and has no auth of its own: the loopback bind IS the boundary.
+        The brain talks to 127.0.0.1 here, and so does the watchdog — compose
+        gives it `network_mode: service: brain`, k8s puts both containers in
+        one pod — so the API is never reachable beyond the host (review
+        blocker 1). There is deliberately no env knob to change this.
         """
         install_api_key()
-        host = env("BRAIN_SERVE_HOST", "127.0.0.1")
+        host = "127.0.0.1"
         last_err = "unknown"
         for attempt in range(5):
             port = SERVE_PORT + attempt
@@ -325,7 +328,7 @@ class Tailer:
 # --- sessions ----------------------------------------------------------------
 class Session:
     __slots__ = ("sid", "net", "chan", "nick", "system", "turns", "busy_since",
-                 "wedges", "refusals", "pending", "ring")
+                 "wedges", "refusals", "pending", "ring", "last_count")
 
     def __init__(self, sid, net, chan, nick, system):
         self.sid = sid
@@ -339,6 +342,7 @@ class Session:
         self.refusals = 0
         self.pending = []                  # (fed_monotonic, event)
         self.ring = deque(maxlen=RING)
+        self.last_count = 0                # messages already collected
 
     @property
     def title(self):
@@ -506,6 +510,8 @@ class Brain:
             return
         with self.lock:
             sess.pending.append((time.monotonic(), ev))
+            del sess.pending[:-PENDING_MAX]   # a slow model must not grow
+                                              # the batch past the context
 
     def due(self, sess):
         with self.lock:
@@ -549,10 +555,12 @@ class Brain:
         if sess is None:
             return
         try:
-            text = last_assistant_text(self.api.messages(sid))
+            msgs = self.api.messages(sid)
         except OSError as e:
             emit("COLLECT_ERROR", sess.title, repr(e))
-            text = ""
+            return
+        sess.last_count = len(msgs)
+        text = last_assistant_text(msgs)
         with self.lock:
             sess.busy_since = None
         self.record_turn(sess, text)
@@ -585,26 +593,53 @@ class Brain:
             emit("NO_VERBS", sess.title)
             return
         nowm = time.monotonic()
+        # The rate gates apply per ANSWER, not per line: lines 2..N of one
+        # reply ride the same FIFO write, and a per-line check ate every line
+        # after the first (review blocker 2: `SAY #t one\nSAY #t two\nSAY #t
+        # three` delivered only `one`). An answer failing a gate is dropped
+        # whole — never partially.
+        targets = sorted({t.lower() for v, t, _b in answer
+                          if v in policy.CHAT_VERBS and t})
+        if targets:
+            for t in targets:
+                if nowm - self.last_sent.get((sess.net, t), -1e9) < RATE:
+                    emit("RATE_LIMITED", sess.title, t)
+                    return
+            if nowm - self.last_global < GLOBAL_RATE:
+                emit("RATE_LIMITED", sess.title, "global")
+                return
+        # A prompt-injected answer must not be able to storm the connection
+        # either: non-chat verbs are capped per answer (review should-fix).
+        non_chat = [a for a in answer if a[0] not in policy.CHAT_VERBS]
+        if len(non_chat) > policy.NON_CHAT_CAP:
+            emit("VERB_STORM", sess.title, f"{len(non_chat)} non-chat lines, "
+                 f"keeping {policy.NON_CHAT_CAP}")
+            kept, room = [], policy.NON_CHAT_CAP
+            for a in answer:
+                if a[0] in policy.CHAT_VERBS:
+                    kept.append(a)
+                elif room > 0:
+                    kept.append(a)
+                    room -= 1
+            answer = kept
         out, digests = [], []
         for verb, target, body in answer:
             digest = hashlib.sha1(
                 f"{sess.net}\0{target}\0{body}".encode()).hexdigest()
             if digest in self.recent:
                 continue                  # a model echoing itself must not loop
-            if verb in policy.CHAT_VERBS:
-                key = (sess.net, target.lower())
-                if nowm - self.last_sent.get(key, -1e9) < RATE:
-                    emit("RATE_LIMITED", sess.title, target)
-                    continue
-                if nowm - self.last_global < GLOBAL_RATE:
-                    emit("RATE_LIMITED", sess.title, "global")
-                    continue
-                self.last_sent[key] = nowm
-                self.last_global = nowm
             digests.append(digest)
-            out.append(f"{verb} {target} {body}" if target or body else verb)
+            if target:
+                out.append(f"{verb} {target} {body}")
+            elif body:
+                out.append(f"{verb} {body}")
+            else:
+                out.append(verb)
         if not out:
             return
+        for t in targets:                 # commit only on a real send
+            self.last_sent[(sess.net, t)] = nowm
+        self.last_global = nowm
         n = write_fifo(out, self.net_by_name[sess.net].fifo)
         self.recent.extend(digests)
         emit("SENT", n, sess.title, " ".join(out)[:200])
@@ -651,10 +686,31 @@ class Brain:
                        self.net_by_name[sess.net].fifo)
 
     # -- SSE loop ------------------------------------------------------------------------
+    def catch_up_missed_idles(self):
+        """Run on every (re)connect: collect turns that finished while the
+        stream was down. A session.idle lost to a connection blip would
+        otherwise leave the finished reply unfetched — channel silence, then a
+        wedged-reset 180 s later for good measure (review should-fix). A turn
+        still running shows a non-assistant last message and is left alone."""
+        for sess in list(self.sessions.values()):
+            if sess.busy_since is None:
+                continue
+            try:
+                msgs = self.api.messages(sess.sid)
+            except OSError:
+                continue
+            if len(msgs) <= sess.last_count:
+                continue
+            if msgs[-1].get("info", {}).get("role") != "assistant":
+                continue
+            emit("SSE_CATCHUP", sess.title)
+            self.on_idle(sess.sid)
+
     def sse_loop(self):
         backoff = 1.0
         while not self.stop_flag:
             try:
+                self.catch_up_missed_idles()
                 for ev in self.api.events():
                     self.on_event(ev)
                     backoff = 1.0
