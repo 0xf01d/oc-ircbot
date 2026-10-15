@@ -10,7 +10,7 @@ RUN apt-get update \
 RUN npm install -g opencode-ai
 
 WORKDIR /app
-COPY brain.py policy.py networks.py memory_log.py opencode.json ./
+COPY brain.py policy.py networks.py memory_log.py util.py opencode.json ./
 # tests/ ships the stub serve so the image is smoke-testable offline.
 COPY tests/ ./tests/
 

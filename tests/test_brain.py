@@ -385,11 +385,8 @@ def test_write_fifo_gives_up_without_reader(tmp_path, capsys):
     assert "FIFO_WRITE_TIMEOUT" in capsys.readouterr().out
 
 
-def test_registers_config_from_env_and_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("BRAIN_REGISTERS", json.dumps({"#c": "gruff"}))
+def test_registers_config_from_file(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "WORKDIR", str(tmp_path))
-    assert brain.registers() == {"#c": "gruff"}
-    monkeypatch.delenv("BRAIN_REGISTERS")
     assert brain.registers() == {}
     (tmp_path / "registers.json").write_text('{"#d": "calm"}')
     assert brain.registers() == {"#d": "calm"}
@@ -408,20 +405,22 @@ def test_setup_workdir_installs_config_and_memory(tmp_path, monkeypatch):
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "opencode.json")))
     assert (tmp_path / "memory" / "MEMORY.md").exists()
-    # A missing repo config falls back to the embedded default.
-    monkeypatch.setattr(brain, "HERE", str(tmp_path / "nonexistent"))
+    # A missing repo config is a hard error: the gate must never silently vanish.
+    monkeypatch.setattr(brain, "__file__",
+                        str(tmp_path / "nonexistent" / "brain.py"))
     (tmp_path / "opencode.json").unlink()
+    with pytest.raises(RuntimeError):
+        brain.setup_workdir()
+
+
+def test_archive_trim_runs_at_brain_start(tmp_path, monkeypatch):
+    import datetime
+    monkeypatch.setattr(brain, "WORKDIR", str(tmp_path))
+    monkeypatch.setattr(brain, "MEMORY_DIR", str(tmp_path / "memory"))
+    mem = brain.setup_workdir()
+    old = (datetime.date(2020, 1, 1)).isoformat()
+    with open(mem.path(memory_log.ACTIVITY_LOG), "a") as f:
+        f.write(f"## {old}\n\n- ancient\n")
     brain.setup_workdir()
-    assert json.load(open(tmp_path / "opencode.json")) == \
-        brain.DEFAULT_OPENCODE_JSON
-
-
-def test_refusal_patterns_config(monkeypatch):
-    monkeypatch.setenv("BRAIN_REFUSAL_PATTERNS",
-                       json.dumps(["custom-thing"]))
-    assert brain.refusal_patterns() == ("custom-thing",)
-    monkeypatch.setenv("BRAIN_REFUSAL_PATTERNS", "not json")
-    assert brain.refusal_patterns() == \
-        brain.policy.DEFAULT_REFUSAL_PATTERNS
-    monkeypatch.delenv("BRAIN_REFUSAL_PATTERNS")
-    assert brain.refusal_patterns() == brain.policy.DEFAULT_REFUSAL_PATTERNS
+    assert "ancient" not in mem.read(memory_log.ACTIVITY_LOG)
+    assert "ancient" in mem.read(memory_log.ACTIVITY_ARCHIVE)

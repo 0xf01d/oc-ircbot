@@ -71,7 +71,6 @@ spec:
         - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
         - {name: IRC_NICK, value: ocbot}
         - {name: BRAIN_FROM_START, value: "1"}
-        - {name: BRAIN_TURN_TIMEOUT, value: "180"}
         - name: OPENCODE_API_KEY
           valueFrom:
             secretKeyRef:

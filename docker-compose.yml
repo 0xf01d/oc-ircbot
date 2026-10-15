@@ -9,8 +9,8 @@
 #
 # Single-network layout: one bot container on the implicit "irc" network
 # (BOT_EVENTS / BOT_FIFO / BOT_LOG). For several IRC networks at once run
-# nets.py instead (it spawns one bot per networks.json entry, each with its
-# own files) — see README.md, "Multi-network".
+# one bot instance per network with its own files — see README.md,
+# "Multi-network".
 
 services:
   bot:
@@ -64,12 +64,8 @@ services:
       BRAIN_BATCH_WINDOW: ${BRAIN_BATCH_WINDOW:-3.0}
       BRAIN_RATE: ${BRAIN_RATE:-3.0}
       BRAIN_GLOBAL_RATE: ${BRAIN_GLOBAL_RATE:-1.0}
-      BRAIN_MAX_TURNS: ${BRAIN_MAX_TURNS:-150}
-      BRAIN_TURN_TIMEOUT: ${BRAIN_TURN_TIMEOUT:-180}
       BRAIN_MUTE: ${BRAIN_MUTE:-}
       BRAIN_ADDRESS_ONLY: ${BRAIN_ADDRESS_ONLY:-0}
-      BRAIN_REGISTERS: ${BRAIN_REGISTERS:-}
-      BRAIN_REFUSAL_PATTERNS: ${BRAIN_REFUSAL_PATTERNS:-}
     volumes:
       - botdata:/data
     depends_on:

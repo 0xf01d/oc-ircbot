@@ -1,39 +1,27 @@
 #!/usr/bin/env python3
-"""networks.py — per-network config shared by the bot supervisor and the brain.
+"""networks.py — per-network config shared by the bots and the brain.
 
-The reference runs one `bot.py` process per IRC network — same code,
-per-network env and files ("a second network is a second process with its own
-env, not a threading model inside the bot"). This module is the single source
-of truth for those paths so `nets.py` (which spawns the bots) and `brain.py`
+One `bot.py` process per IRC network: same code, per-network env and files
+("a second network is a second process with its own env"). This module is the
+single source of truth for those paths, so the spawned bots and the brain
 (which tails their events and writes their FIFOs) can never disagree.
 
-Config sources, in order:
-  1. `IRC_NETWORKS` — space/comma-separated network labels, e.g.
-     `IRC_NETWORKS="azzurra libera"`. When unset: a single implicit network
-     named `irc` whose paths come straight from BOT_EVENTS / BOT_FIFO /
-     BOT_LOG, reproducing the single-instance layout byte for byte.
-  2. `networks.json` (next to this file, or $BOT_NETWORKS_FILE) — per-label
-     env overrides, e.g.
+  1. `IRC_NETWORKS` — space/comma-separated labels, e.g. "azzurra libera".
+     Unset: a single implicit network `irc` whose paths come straight from
+     BOT_EVENTS / BOT_FIFO / BOT_LOG (the single-instance layout).
+  2. `networks.json` (next to this file) — per-label env overrides, e.g.
      {"libera": {"IRC_HOST": "irc.libera.chat", "BOT_TRUST": "bot.trust.libera"}}
 
-For every labelled network the data files derive from the label:
-  events  <data>/events.<label>.log      (brain tails; bot appends)
-  fifo    <data>/bot.send.<label>        (brain writes; bot reads)
-  log     <data>/bot.<label>.log         (raw traffic)
-unless the label's overrides set BOT_EVENTS / BOT_FIFO / BOT_LOG explicitly.
+Labelled networks derive data files from the label (events.<label>.log,
+bot.send.<label>, bot.<label>.log) unless the label's overrides set the
+BOT_EVENTS / BOT_FIFO / BOT_LOG paths explicitly.
 """
 import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _cfg(key, default):
-    return os.environ.get(key, default)
-
-
-DATA_DIR = _cfg("BOT_DATA", "/data")
-NETWORKS_FILE = _cfg("BOT_NETWORKS_FILE", os.path.join(HERE, "networks.json"))
+DATA_DIR = "/data"
+NETWORKS_FILE = os.path.join(HERE, "networks.json")
 
 
 class Net:
@@ -64,14 +52,8 @@ def load_overrides(path=None):
 
 
 def net_for(label, data_dir=None, overrides=None, base_env=None):
-    """Derive one Net from a label + optional per-label env overrides.
-
-    Paths are label-derived (`events.<label>.log`, ...) unless the label's
-    overrides set BOT_EVENTS / BOT_FIFO / BOT_LOG explicitly. `base_env`
-    defaults to os.environ; the returned `env` is base_env merged with the
-    overrides and the resolved paths, exactly what a bot subprocess for this
-    network should run with.
-    """
+    """Derive one Net from a label + overrides; `env` is what a bot subprocess
+    for this network runs with (base_env + overrides + resolved paths)."""
     data_dir = data_dir or DATA_DIR
     base_env = dict(base_env if base_env is not None else os.environ)
     overrides = dict(overrides or {})
@@ -85,19 +67,15 @@ def net_for(label, data_dir=None, overrides=None, base_env=None):
     fifo = resolve("BOT_FIFO", "bot.send.{label}")
     log = resolve("BOT_LOG", "bot.{label}.log")
 
-    env = dict(base_env)
-    env.update(overrides)
-    env["BOT_EVENTS"], env["BOT_FIFO"], env["BOT_LOG"] = events, fifo, log
-    return Net(label, events, fifo, log, env)
+    env_ = dict(base_env)
+    env_.update(overrides)
+    env_["BOT_EVENTS"], env_["BOT_FIFO"], env_["BOT_LOG"] = events, fifo, log
+    return Net(label, events, fifo, log, env_)
 
 
 def load(data_dir=None, overrides_path=None, base_env=None):
-    """All configured networks, in IRC_NETWORKS order.
-
-    With IRC_NETWORKS unset this is the single implicit network `irc`, whose
-    paths come straight from the environment's BOT_EVENTS / BOT_FIFO / BOT_LOG
-    (the round-1 single-instance layout) with the given defaults.
-    """
+    """All configured networks, in IRC_NETWORKS order; unset means the single
+    implicit network `irc` from the environment's BOT_* paths."""
     base_env = base_env if base_env is not None else os.environ
     data_dir = data_dir or DATA_DIR
     overrides = load_overrides(overrides_path)
