@@ -86,7 +86,7 @@ def quit_all(nets, reason="bye"):
         except OSError:
             continue
         try:
-            os.write(fd, f"QUIT :{reason}\n".encode())
+            os.write(fd, f"QUIT {reason}\n".encode())
         except OSError:
             pass
         finally:

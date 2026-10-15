@@ -16,7 +16,7 @@ EnvironmentFile=-%h/oc-ircbot/.env.%i
 ExecStart=/usr/bin/python3 -u %h/oc-ircbot/bot.py
 # Clean part on stop: QUIT through the FIFO before SIGTERM. `timeout` guards
 # the write — if the bot is already gone, opening the FIFO would block.
-ExecStop=/usr/bin/timeout 5 /bin/sh -c 'echo "QUIT :bye" >> "${BOT_FIFO:-bot.send}"'
+ExecStop=/usr/bin/timeout 5 /bin/sh -c 'echo "QUIT bye" >> "${BOT_FIFO:-bot.send}"'
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
 RestartSec=30

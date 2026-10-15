@@ -95,6 +95,7 @@ class LeakGuard:
             with open(tmp, "w") as f:
                 for _ts, target, body in self.lines:
                     f.write(f"{target}\t{body}\n")
+            os.chmod(tmp, 0o600)
             os.replace(tmp, self.store_file)
         except OSError:
             pass
