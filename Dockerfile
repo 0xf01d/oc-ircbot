@@ -33,6 +33,10 @@ CMD ["python3", "-u", "watchdog.py"]
 # OpenCode CLI. node:22-slim + apt python3 is fewer lines than the reverse
 # (nodesource setup) and keeps the image small.
 FROM node:22-slim AS brain
+# This stage is not FROM runtime-base, so it re-states the /app layout the
+# other images inherit; without it `COPY ./` lands code at / and the CI
+# serve-bind check (`/app/tests/...`) finds nothing.
+WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 ca-certificates \
  && rm -rf /var/lib/apt/lists/*

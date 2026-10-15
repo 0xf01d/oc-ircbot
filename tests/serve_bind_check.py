@@ -2,7 +2,7 @@
 """serve_bind_check.py — assert the REAL `opencode serve` binds loopback only.
 
 Run inside a container that has the opencode CLI (the brain image; CI does
-`docker run --network none oc-ircbot-brain python3 .../serve_bind_check.py`).
+`docker run --rm oc-ircbot-brain python3 /app/tests/serve_bind_check.py`).
 Spawns the brain's managed Serve, then reads /proc/net/tcp{,6}: every LISTEN
 socket on the serve port must be 127.0.0.1 (or ::1) — nothing may bind
 0.0.0.0, ::, or a routable address. Exit 0 + SERVE_BIND_OK on success.

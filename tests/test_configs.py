@@ -24,7 +24,7 @@ def test_no_config_mentions_a_serve_host_override():
 
 def test_compose_watchdog_shares_brain_netns_and_dials_loopback():
     compose = read("docker-compose.yml")
-    assert re.search(r'network_mode:\s*"service: brain"', compose), \
+    assert re.search(r'network_mode:\s*"service:\s*brain"', compose), \
         "watchdog must join the brain's netns to reach a loopback-only serve"
     assert "BRAIN_SERVE_URL: http://127.0.0.1:" in compose
     assert "BRAIN_SERVE_URL: http://brain:" not in compose
