@@ -1,0 +1,27 @@
+# The bot's three little config files for the live run on irc.freebnc.net,
+# mounted read-only at /conf in the bot container (BOT_TRUST / BOT_RESERVED /
+# BOT_STARTUP point there). Nothing here is secret: the trust model is
+# "nick listed + host glob + WHOIS-verified account to services", so even the
+# broad host glob below still requires katia to be identified to Ergo.
+#
+# Any NickServ / API secret lives in oc-ircbot-secrets, created out-of-band —
+# never in git (see 10-deployment.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oc-ircbot-live
+  namespace: hermes-generated-content
+  labels:
+    app: oc-ircbot
+    tier: bridge
+data:
+  bot.trust: |
+    # katia runs the place: any host, but services must confirm the account.
+    katia *
+  bot.startup: |
+    # replayed after connect (no NickServ pass -> right after 001)
+    JOIN #hermes
+  bot.reserved: |
+    # empty on purpose: the bot sits only in #hermes today; leak_guard has
+    # nothing to guard between channels. Uncomment to add private targets.
+    # #hermes-staff
