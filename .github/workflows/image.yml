@@ -11,8 +11,11 @@ name: image
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [master, lane/oc-ircbot]
     paths:
+      # image.yml itself is in the list so the workflow can (re)trigger from
+      # a non-default branch, where workflow_dispatch is not offered.
+      - '.github/workflows/image.yml'
       - 'Dockerfile'
       - '*.py'
       - 'bot.say'
