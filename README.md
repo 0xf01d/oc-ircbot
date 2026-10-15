@@ -155,6 +155,24 @@ bot instance per network — `oc-ircbot-bot@azzurra`, `oc-ircbot-bot@libera`,
 own `.env.<net>` and its own trust file. Trust does not travel between
 networks.
 
+### Peek inside the containers (tmux)
+
+Each service runs **inside a detached tmux session** named after it
+(`tmuxsup.py` is the entrypoint: it starts the session and restarts it if it
+dies — and stops restarting after 5 crashes in 5 minutes, leaving the
+container up with a `CRASH_LOOP` marker). Attach from outside:
+
+```bash
+docker compose exec bot tmux attach -t bot        # live terminal, detach: C-b d
+docker compose exec brain tmux capture-pane -p -t brain | tail -30   # read-only peek
+docker compose exec brain tmux ls                 # what's running
+```
+
+Scrollback is included in the pane, and the output is *also* mirrored to the
+container stdout (`tmux pipe-pane`), so `docker compose logs -f brain` keeps
+working exactly as before — the session is the interactive window, not the
+only record.
+
 ### systemd (Docker-less host)
 
 ```bash

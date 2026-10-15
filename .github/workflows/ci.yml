@@ -43,6 +43,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build images
         run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml build
+      - name: tmux sessions come up inside the images (vjt-style entrypoints)
+        run: |
+          docker run -d --name tmux-bot -e IRC_HOST=127.0.0.1 \
+            -e IRC_PORT=1 -e IRC_TLS=0 oc-ircbot-bot
+          docker run -d --name tmux-brain -e BRAIN_DRY_RUN=1 oc-ircbot-brain
+          docker run -d --name tmux-watchdog oc-ircbot-watchdog
+          ok=""
+          for i in $(seq 1 30); do
+            if docker exec tmux-bot tmux has-session -t bot >/dev/null 2>&1 \
+               && docker exec tmux-brain tmux has-session -t brain >/dev/null 2>&1 \
+               && docker exec tmux-watchdog tmux has-session -t watchdog >/dev/null 2>&1; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          test -n "$ok" || { echo "tmux sessions never came up"; exit 1; }
+          sleep 2   # let the first service output land in the panes
+          docker exec tmux-bot tmux ls
+          docker exec tmux-brain tmux ls
+          docker exec tmux-watchdog tmux ls
+          # the pane carries the service's output, and pipe-pane mirrors it
+          # to the container stdout `docker logs` reads:
+          docker exec tmux-bot sh -c 'tmux capture-pane -p -t bot | grep -q NETS'
+          docker logs tmux-bot 2>&1 | grep -q 'NETS START'
+          docker exec tmux-watchdog sh -c 'tmux capture-pane -p -t watchdog | grep -q WATCHDOG'
+          docker rm -f tmux-bot tmux-brain tmux-watchdog >/dev/null
       - name: End-to-end smoke (mock IRC + real bot + real brain + stub serve)
         run: |
           docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
