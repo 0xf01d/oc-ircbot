@@ -72,8 +72,6 @@ spec:
             - {name: BRAIN_FROM_START, value: "1"}
             - {name: BRAIN_POLL, value: "0.3"}
             - {name: BRAIN_BATCH_WINDOW, value: "1.0"}
-            - {name: BRAIN_RATE, value: "0"}
-            - {name: BRAIN_GLOBAL_RATE, value: "0"}
             # Optional: absent in stub mode, injected for a live run.
             - name: OPENCODE_API_KEY
               valueFrom:

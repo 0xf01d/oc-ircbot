@@ -32,7 +32,7 @@ jobs:
           # The step must be able to fail: assert the prompt actually came out
           # (a crashed brain leaves a traceback, and the grep goes red).
           timeout 5 python brain.py --dry-run > dry.out || true
-          grep -q "Network: irc" dry.out
+          grep -q "irc|#test <alice>: hi (trusted; HOST=h)" dry.out
       - name: End-to-end smoke without Docker (mock IRC + stub serve)
         run: sh tests/smoke_local.sh
 

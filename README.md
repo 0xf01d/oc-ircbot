@@ -2,14 +2,15 @@
 
 A re-creation of [vjt/claude-ircbot](https://github.com/vjt/claude-ircbot)
 where the brain is a **long-running OpenCode agent** — `opencode serve` runs
-once and every IRC channel owns one warm, persistent session — and the whole
-stack runs in **Docker**, on **Kubernetes**, or as plain **systemd** user
-units.
+once and **ONE warm, persistent session spans every network and channel**
+(the model sees one continuous conversation; vjt's live Monitor, exactly) —
+and the whole stack runs in **Docker**, on **Kubernetes**, or as plain
+**systemd** user units.
 
 The bridge is a near-verbatim port of the original: same events, same FIFO
 grammar, same trust model. Round 1 swapped Claude Code's Monitor
 for a per-reply `opencode run`; round 2 replaced that with the real thing:
-persistent sessions, streaming replies, an agent guard, disk-backed memory
+one persistent session, streaming replies, an agent guard, disk-backed memory
 and a permission gate. The bridge itself never changed.
 
 ```
@@ -19,8 +20,8 @@ and a permission gate. The bridge itself never changed.
                   │ events               │ FIFO verbs       │ heartbeat/status
    IRC net A ── bot.py ──────────▶ brain.py ────────────────▶ watchdog.py
    IRC net B ── bot.py            │ opencode serve (1×)      3 layers: process /
-   (one process per network)      │ 1 warm session per       server / agent
-                                  │ (network, channel)
+   (one process per network)      │ ONE session, every       server / agent
+                                  │ net + channel in it
 ```
 
 ## Architecture
@@ -28,17 +29,20 @@ and a permission gate. The bridge itself never changed.
 **One `opencode serve` process for the whole stack** (`brain.py` spawns it in
 its workspace, or attaches to a running one via `BRAIN_SERVE_URL`):
 
-- **One session per (network, channel).** The session pointer persists in
-  `workspace/sessions.json`; a brain restart re-attaches to the warm session
-  and re-counts its turns from the server's history.
-- **Non-blocking submit.** New events are batched per channel and submitted
+- **ONE session, every network in it.** The brain holds a single session
+  (`irc:global`); every event arrives prefixed `[HH:MM] net|target <nick>:`
+  so one continuous conversation carries all channels. The session pointer
+  persists in `workspace/sessions.json`; a brain restart re-attaches to the
+  warm session and re-counts its turns from the server's history.
+- **Non-blocking, serialized submit.** New events are batched and submitted
   with `POST /session/{id}/prompt_async` (HTTP 204) — never a cold process
-  per reply.
-- **Streaming replies.** An SSE thread on `GET /event` wakes on
-  `session.idle`, fetches the last assistant message, parses FIFO verbs and
-  writes them to the right network's FIFO. On a reconnect it first polls
-  `/session/{id}/message` for busy sessions, so an idle lost to a connection
-  blip cannot strand a finished reply.
+  per reply. One conversation means one turn at a time: while the model is
+  busy, later batches queue and drain on the next idle.
+- **Streaming replies, answer-carried routing.** An SSE thread on `GET /event`
+  wakes on `session.idle`, fetches the last assistant message, parses FIFO
+  verbs and routes each by its `net|` prefix to that network's FIFO. On a
+  reconnect it first polls `/session/{id}/message` for busy sessions, so an
+  idle lost to a connection blip cannot strand a finished reply.
 - **Cancellation.** A turn stuck beyond `TURN_TIMEOUT` (180 s, env-tunable)
   is cancelled with `POST /session/{id}/abort`; the `session.status`
   SSE events (busy/retry) arm and update the wedge clock.
@@ -99,26 +103,29 @@ would plug into. A sidecar needs no changes to `bot.py` or `brain.py`, ever.
 
 ## The reply policy
 
-The model's reply must be zero or more FIFO command lines, one per line:
+The model's reply must be zero or more FIFO command lines, one per line.
+One session spans every network, so each line routes itself — network, a
+`|`, then the bot's own grammar verbatim:
 
 ```
-SAY <target> <text>
-ACT <target> <text>
-NOTICE <nick> <text>
-JOIN <chan> | PART <chan> | WHOIS <nick> | QUIT [reason]
+SAY azzurra|#channel text      - a channel message
+SAY libera|nick text           - a private message
+ACT azzurra|#channel text      - a /me action
+NOTICE libera|nick text
+JOIN azzurra|#chan | PART azzurra|#chan | WHOIS azzurra|nick
+QUIT azzurra|[reason]
 ```
 
 Everything else in the answer is prose and is ignored — **including `RAW`**:
 the arbitrary-line verb exists for trusted sidecars at the bot's FIFO only,
 never in the model-facing grammar (a prompt-injected `RAW QUIT :bye` must not
-be able to kill the connection). Non-chat verbs are additionally capped per
-answer, and the rate gates apply per answer, so a multi-line reply is never
-eaten line-by-line. Bodies are stripped
-of ANSI/control characters, so a reply can never forge a second FIFO line
-inside a message. Silence is the default (`policy.build_system`): the prompt
-is an opportunity, not an obligation. The system prompt also carries the
-identity-discipline rule (never claim to be a human; refuse spoofed-identity
-games) and, optionally, per-channel registers
+be able to kill the connection). A line without a known `net|` prefix is
+dropped **loudly** (`ROUTE_ERROR` in the brain log) — nothing is silently
+eaten. Bodies are stripped of ANSI/control characters, so a reply can never
+forge a second FIFO line inside a message. Silence is the default
+(`policy.build_system`): the prompt is an opportunity, not an obligation. The
+system prompt also carries the identity-discipline rule (never claim to be a
+human; refuse spoofed-identity games) and, optionally, per-channel registers
 (`registers.json`).
 
 Send a command by hand exactly as the original documented:
@@ -239,14 +246,14 @@ Brain variables:
 | `BRAIN_ADDRESS_ONLY` | `0` | wake only when addressed |
 | `registers.json` | *(none)* | per-channel register text, in `BRAIN_WORKDIR` |
 | `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` | `1.0` / `3.0` | batching |
-| `BRAIN_RATE` / `BRAIN_GLOBAL_RATE` | `3.0` / `1.0` | send rate limits (s), applied per answer |
 | `BRAIN_MAX_TURNS` / `BRAIN_TURN_TIMEOUT` | `150` / `180` | session turn cap / wedged-turn abort (env-tunable: a free-tier model can turn for minutes) |
 | `BRAIN_DRY_RUN` | `0` | print prompts instead of submitting (compose/k8s can dry-run without editing the command) |
 | `BRAIN_FROM_START` | `0` | read event logs from the top on start |
 
-Remaining session constants live in `brain.py` (ring 8, batch max 5, 64
-channels, 32 queued events, 4 non-chat verbs per answer); the refusal
-patterns are `policy.DEFAULT_REFUSAL_PATTERNS`.
+Remaining session constants live in `brain.py` (batch max 5; events are
+**never dropped for being late** — while the model is busy they queue, and a
+backlog of 128+ is announced in the log and counted in `agent.status`); the
+refusal patterns are `policy.DEFAULT_REFUSAL_PATTERNS`.
 
 Watchdog variables: `WATCHDOG_POLL` (`10`), `WATCHDOG_STALL` (`30`),
 `WATCHDOG_MAX_STALLS` (`3`), `WATCHDOG_WEDGED` (`300`),
@@ -275,7 +282,7 @@ real cluster.
 
 `.github/workflows/ci.yml` runs on every push:
 
-1. unit tests (`pytest`, 72 of them) — including a full brain round trip per
+1. unit tests (`pytest`, 98 of them) — including a full brain round trip per
    test against the stub SSE server, the policy layer, multi-network
    derivation, memory archiving and the three-layer watchdog;
 2. the Docker-less end-to-end smoke (`tests/smoke_local.sh`);
@@ -288,17 +295,18 @@ Run the units locally with `python -m pytest tests -q`.
 ## Differences from vjt/claude-ircbot
 
 - **The brain.** Claude Code's Monitor is replaced by `brain.py` driving
-  `opencode serve` with persistent sessions (`docs/monitor.md` records what
-  is honestly different). This is the whole point of the project.
+  `opencode serve` with one persistent session for every network and channel
+  (`docs/monitor.md` records what is honestly different). This is the whole
+  point of the project.
 - **The agent guard.** `aup_watchdog.py` is ported *into* the brain as the
   turn-cap / refusal / wedge resets; the watchdog sidecar gains the serve and
   agent layers.
 - **The permission gate.** `gate-permission.py`'s deny-fast rationale is
   re-implemented headlessly: `opencode.json` + auto-reject + admin NOTICE.
 - **chan_filter.awk** returns as `BRAIN_MUTE`.
-- **Multi-network** is first-class: per-network bot processes, FIFOs and
-  brain sessions (`networks.py`, `bot.trust.libera`,
-  `oc-ircbot-bot@.service`).
+- **Multi-network** is first-class: per-network bot processes and FIFOs,
+  all served by the brain's one session via `net|` routing (`networks.py`,
+  `bot.trust.libera`, `oc-ircbot-bot@.service`).
 - **Packaging.** One multi-stage `Dockerfile` (`--target` per image) + compose
   + `k8s/` alongside the original's
   systemd approach (both shipped; the bot units grow a template and a clean

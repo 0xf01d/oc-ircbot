@@ -33,34 +33,38 @@ stream per session:
 
 ## The emulation
 
-brain.py (one session per network+channel):
+brain.py (ONE session; every network's events interleave in it):
 
-1. `Tailer` reads the network's `events.log`; `feed()` appends each event to
-   the session's **ring** (context) and, when `policy.wakes_model()` says the
-   event warrants a turn, to its **pending** batch.
+1. `Tailer` reads each network's `events.log`; `feed()` renders the event as
+   a vjt-style line — `[HH:MM] net|target <nick>: text (trusted; HOST=…)`,
+   the Monitor-never-host-blind rule — and appends it to the session's
+   **pending** batch (`policy.wakes_model()`: every event wakes the model,
+   like Monitor; only muted channels and `BRAIN_ADDRESS_ONLY` stay out).
 2. `due()` releases the batch after `BRAIN_BATCH_WINDOW` seconds (or at once
    at `BRAIN_BATCH_MAX` events), so events that land close together reach the
    model as one prompt instead of N turns.
-3. `submit()` renders ring context + the new batch via `policy.build_prompt`
-   and calls `prompt_async`. If a turn is already streaming, the server
-   queues it — the brain does not block, does not poll for the answer.
+3. `submit()` renders the new batch via `policy.build_prompt` and calls
+   `prompt_async`. If a turn is already streaming, the server queues it —
+   the brain does not block, does not poll for the answer; batches that
+   arrive mid-turn queue in `sess.pending` and drain on the next idle.
 4. The SSE thread wakes on `session.idle`, fetches the messages, parses FIFO
    verbs, dispatches — and **if the pending queue is non-empty, submits the
    next batch immediately**. That last step is what makes the emulation
    tight: during a burst the agent effectively runs back-to-back turns, one
    per batch, without waiting for a new trigger.
 
-The ring buffer does the rest of Monitor's job: every prompt carries the last
-`BRAIN_RING` events of the channel, so a turn always sees what it "heard"
-earlier, exactly as Monitor notifications stayed in Claude Code's context.
+The one continuous session does the rest of Monitor's job: every prompt
+lands in the same conversation the agent has been reading all along, exactly
+as Monitor notifications stayed in Claude Code's context — there is no
+context window to reconstruct, because it never left.
 
 ## What is honestly different
 
 | Monitor (Claude Code) | this brain |
 |---|---|
 | Events injected **mid-turn** | Events delivered at the earliest model boundary: folded into a streaming turn when the server does that (observed on v1.19.0), otherwise the next turn starts immediately on idle (the drain step below) |
-| One conversation for everything | One session **per (network, channel)** — deliberate: per-channel registers, isolated blast radius when a guard resets a session |
-| Agent could act with tools mid-turn | The agent acts only through FIFO verbs parsed from its reply text (`SAY`/`ACT`/`NOTICE`/`JOIN`/`PART`/`WHOIS`/`QUIT`/`RAW`), under the `opencode.json` permission gate |
+| One conversation for everything | **The same**: ONE session spans every network and channel; the `[HH:MM] net\|target` prefixes carry the routing, and each answer line routes itself (`SAY azzurra\|#c text`) |
+| Agent could act with tools mid-turn | The agent acts only through FIFO verbs parsed from its reply text (`SAY`/`ACT`/`NOTICE`/`JOIN`/`PART`/`WHOIS`/`QUIT`, each net-routed), under the `opencode.json` permission gate |
 | Context continuity was the session itself | Continuity is rebuilt from **disk** (`memory/MEMORY.md` + 14-day activity log) on every new/rehydrated session, so resets and compaction do not amnesia the agent |
 
 The last row is the practical compensation: because the agent rehydrates from

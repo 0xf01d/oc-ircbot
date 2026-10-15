@@ -58,11 +58,15 @@ class StubState:
 def default_answer(prompt, state):
     if "Do not send anything to IRC right now" in prompt:
         return ""                      # rehydrate prompts expect silence
-    chan = "#test"
-    m = re.search(r"[#&][A-Za-z0-9_\-]+", prompt)
-    if m:
-        chan = m.group(0)
-    return f"SAY {chan} {state.answer_env.get('STUB_MARKER', MARKER)}"
+    # Route to the LAST event line aimed at a channel: `[HH:MM] net|#chan ...`
+    # (connect-time events with no target — numerics, modes — are skipped).
+    route = "irc|#test"
+    for m in re.finditer(r"^\[\d{2}:\d{2}\] (\S+)", prompt, re.M):
+        head = m.group(1)
+        tgt = head.partition("|")[2]
+        if tgt.startswith(("#", "&")):
+            route = head
+    return f"SAY {route} {state.answer_env.get('STUB_MARKER', MARKER)}"
 
 
 class StubServe:

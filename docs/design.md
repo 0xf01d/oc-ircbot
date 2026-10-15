@@ -24,19 +24,26 @@ to agree on anything except those paths.
 ## Event stream
 
 Unchanged from round 1 (see `bot.py`): `[HH:MM] KIND [fields…]` lines in
-`Europe/Rome`, appended to the network's `BOT_EVENTS` file. The brain treats
-`MSG`, `INVITE`, `IDLE`, `CTCP`, `KICK`, `NOTICE` as actionable
-(`policy.wakes_model`), and — new in round 2 — everything first passes the
-mute filter (`BRAIN_MUTE`, the chan_filter.awk port): a muted channel's
-events never create a session, never enter a ring, never wake the model,
-"neanche se interpellato".
+`Europe/Rome`, appended to the network's `BOT_EVENTS` file. **Every event
+wakes the model** (`policy.wakes_model`) — joins, parts, idles and notices
+are social signal, exactly like vjt's Monitor — and everything first passes
+the mute filter (`BRAIN_MUTE`, the chan_filter.awk port): a muted channel's
+events never create the session, never enter the conversation, never wake
+the model, "neanche se interpellato". The only other gate at intake is
+`BRAIN_ADDRESS_ONLY` — the operator's explicit choice, never a silent
+heuristic.
 
-## Sessions: one per (network, channel)
+## ONE session, every network in it
 
-`brain.get_session(net, chan)` finds or creates **the** `opencode` session
-for a channel. The live pointer persists in `WORKDIR/sessions.json`, so a
-brain restart re-attaches to the warm session instead of forking a new one;
-the turn count is re-derived from the server's message history at re-attach.
+The brain holds **one** `opencode` session (`irc:global`) for its whole
+life. Every event is rendered as a vjt-style conversation line
+(`[HH:MM] net|target <nick>: text`, with `HOST=` and the trust tag on every
+line that has them — the Monitor is never host-blind) and appended to the
+one conversation; while a turn streams, later batches queue and drain on
+the next idle. The session pointer persists in `WORKDIR/sessions.json`, so
+a brain restart re-attaches to the warm session instead of forking a new
+one; the turn count is re-derived from the server's message history at
+re-attach.
 
 A session is deliberately thrown away and rebuilt by three guards (the
 aup_watchdog triggers, ported into the loop):
@@ -56,26 +63,27 @@ are logged to the activity log when they arrive on SSE).
 
 ## Reply path
 
-1. `policy.build_prompt(batch, ring, …)` renders recent channel context, the
-   new events (`[ADDRESSED]`-marked when the nick is addressed), the channel
-   register (`registers.json`) and the verb contract.
+1. `policy.build_prompt(batch, addressed_ids)` renders the new events as
+   prefixed conversation lines (`[ADDRESSED]`-marked where the nick is
+   addressed) — the session's own history is the context; nothing is
+   re-attached, nothing re-read.
 2. `prompt_async` submits it (HTTP 204; accepted even while a turn streams —
    see `docs/monitor.md` for why this is the Monitor-equivalent).
 3. On SSE `session.idle`, the last assistant message is fetched and parsed by
-   `policy.parse_answer` into FIFO verb lines, `filter_answer` drops lines
-   addressed to the bot's own nick, a digest set dedupes loops, RATE /
-   GLOBAL_RATE throttle chat verbs, and `write_fifo` writes to the network's
-   FIFO with a deadline (a bot that is down never wedges the brain).
+   `policy.parse_answer` into FIFO verb lines; `filter_answer` drops lines
+   speaking as the bot's own per-network nick, and each line is routed by
+   its `net|` prefix to that network's FIFO with a deadline (a bot that is
+   down never wedges the brain). A line with a missing or unknown `net|`
+   prefix is dropped **loudly** (`ROUTE_ERROR`), never silently.
 
 The FIFO verb grammar is the bot's full set minus `RAW` — `SAY`, `ACT`,
-`NOTICE`, `JOIN`, `PART`, `WHOIS`, `QUIT` — not just `SAY` (round 1 accepted
-one verb). `RAW` stays a bot-level sidecar verb only: "orders only from
+`NOTICE`, `JOIN`, `PART`, `WHOIS`, `QUIT` — each with the `net|` routing
+prefix. `RAW` stays a bot-level sidecar verb only: "orders only from
 TRUSTED users" lives in the prompt, so the arbitrary-line verb cannot live in
 the model-facing grammar (one injected `RAW QUIT :bye` would kill the
 connection). `policy._clean` strips ANSI and control characters from every
 body, so a model answer can never forge a second FIFO line inside a message
-body, and the rate gates apply per answer — a multi-line reply is dropped
-whole or sent whole, never eaten line-by-line.
+body.
 
 ## Permission gate (gate-permission.py port)
 

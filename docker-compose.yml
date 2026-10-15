@@ -50,7 +50,7 @@ services:
       BOT_FIFO: /data/bot.send
       IRC_NICK: ${IRC_NICK:-vjt-claude}
       BRAIN_ADMIN: ${BRAIN_ADMIN:-admin}
-      # Persistent serve + per-channel sessions live under /data.
+      # Persistent serve + the one session live under /data.
       BRAIN_WORKDIR: /data/workspace
       BRAIN_MEMORY_DIR: /data/workspace/memory
       BRAIN_HEARTBEAT: /data/brain.heartbeat
@@ -65,8 +65,6 @@ services:
       BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
       BRAIN_POLL: ${BRAIN_POLL:-1.0}
       BRAIN_BATCH_WINDOW: ${BRAIN_BATCH_WINDOW:-3.0}
-      BRAIN_RATE: ${BRAIN_RATE:-3.0}
-      BRAIN_GLOBAL_RATE: ${BRAIN_GLOBAL_RATE:-1.0}
       BRAIN_MAX_TURNS: ${BRAIN_MAX_TURNS:-150}
       BRAIN_TURN_TIMEOUT: ${BRAIN_TURN_TIMEOUT:-180}
       BRAIN_DRY_RUN: ${BRAIN_DRY_RUN:-0}

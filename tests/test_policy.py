@@ -3,9 +3,9 @@ import pytest
 import policy
 
 
-def _msg(body, to="#test", frm="alice", trust="TRUSTED"):
+def _msg(body, to="#test", frm="alice", trust="TRUSTED", host="u@h"):
     return policy.parse_event(
-        f"[12:34] MSG {trust} FROM={frm} HOST=u@h TO={to} BODY={body}")
+        f"[12:34] MSG {trust} FROM={frm} HOST={host} TO={to} BODY={body}")
 
 
 # --- event parsing ----------------------------------------------------------
@@ -59,32 +59,35 @@ def test_not_addressed_substring_or_self():
         _msg("vjt-claude: echo", frm="VJT-CLAUDE"), "vjt-claude")
 
 
-def test_wakes_model_matrix():
+# --- wake gate: ALL events wake the model -------------------------------------
+def test_every_kind_wakes_the_model():
+    # vjt's Monitor injected everything — joins, parts, idles, notices are
+    # social signal. No kind-gating anywhere anymore.
     nick = "bot"
-    # Addressed MSG wakes even in address-only mode.
-    assert policy.wakes_model(_msg("bot: ping"), nick, address_only=True)
-    # Non-addressed MSG wakes in default (policy-gated) mode, not address-only.
-    assert policy.wakes_model(_msg("banter"), nick)
-    assert not policy.wakes_model(_msg("banter"), nick, address_only=True)
-    # Empty-body MSG never wakes; non-MSG actionable kinds always do.
+    kinds = [
+        "[09:00] MSG TRUSTED FROM=a HOST=h TO=#c BODY=banter",
+        "[09:00] JOIN bob HOST=h #c",
+        "[09:00] PART bob HOST=h #c",
+        "[09:00] QUIT bob HOST=h :bye",
+        "[09:00] NICK_CHANGE bob HOST=h bob2",
+        "[09:00] IDLE #c",
+        "[09:00] KICK op HOST=h #c victim :flood",
+        "[09:00] INVITE op HOST=h #c trusted",
+        "[09:00] CTCP FROM=evil HOST=h TO=bot BODY=PING",
+        "[09:00] NOTICE FROM=n HOST=h TO=#c BODY=hi",
+    ]
+    for line in kinds:
+        assert policy.wakes_model(policy.parse_event(line), nick), line
+
+
+def test_empty_msg_and_address_only_are_the_only_gates():
+    nick = "bot"
+    # A whitespace-only MSG is not an event.
     assert not policy.wakes_model(_msg("   "), nick)
-    idle = policy.parse_event("[09:00] IDLE #c")
-    assert policy.wakes_model(idle, nick, address_only=True)
-    # Context-only kinds never wake.
-    assert not policy.wakes_model(
-        policy.parse_event("[09:00] JOIN TO=#c FROM=x"), nick)
-
-
-def test_wakes_model_gates_ctcp_and_notice_too():
-    # An untrusted `CTCP PING` must not be able to buy a model turn: the
-    # address gate covers CTCP/NOTICE, not just MSG. They still ride the ring
-    # and reach the model as context with the next real batch.
-    ctcp = policy.parse_event("[12:00] CTCP FROM=evil HOST=h TO=bot BODY=PING")
-    notice = policy.parse_event("[12:00] NOTICE FROM=n HOST=h TO=#c BODY=hi")
-    assert not policy.wakes_model(ctcp, "bot", address_only=True)
-    assert not policy.wakes_model(notice, "bot", address_only=True)
-    assert policy.wakes_model(ctcp, "bot")
-    assert policy.wakes_model(notice, "bot")
+    # BRAIN_ADDRESS_ONLY keeps only the addressed ones (explicit config,
+    # like BRAIN_MUTE — a door at intake, not a silent drop downstream).
+    assert not policy.wakes_model(_msg("banter"), nick, address_only=True)
+    assert policy.wakes_model(_msg("bot: ping"), nick, address_only=True)
 
 
 # --- refusal patterns ---------------------------------------------------------
@@ -102,24 +105,24 @@ def test_refusal_custom_patterns_override():
 
 
 # --- FIFO verb grammar (gap 9: the full set, not only SAY) ---------------------
-def test_parse_answer_full_verb_set():
+def test_parse_answer_full_verb_set_with_routing():
     text = """Sure, acting on that.
-SAY #test hello world
-ACT #test waves
-NOTICE alice psst
-JOIN #other
-PART #gone
-WHOIS vjt
-QUIT :goodbye
+SAY azzurra|#test hello world
+ACT libera|#test waves
+NOTICE azzurra|alice psst
+JOIN libera|#other
+PART azzurra|#gone
+WHOIS azzurra|vjt
+QUIT azzurra|:goodbye
 """
     assert policy.parse_answer(text) == [
-        ("SAY", "#test", "hello world"),
-        ("ACT", "#test", "waves"),
-        ("NOTICE", "alice", "psst"),
-        ("JOIN", "", "#other"),
-        ("PART", "", "#gone"),
-        ("WHOIS", "", "vjt"),
-        ("QUIT", "", ":goodbye"),
+        ("SAY", "azzurra|#test", "hello world"),
+        ("ACT", "libera|#test", "waves"),
+        ("NOTICE", "azzurra|alice", "psst"),
+        ("JOIN", "", "libera|#other"),
+        ("PART", "", "azzurra|#gone"),
+        ("WHOIS", "", "azzurra|vjt"),
+        ("QUIT", "", "azzurra|:goodbye"),
     ]
 
 
@@ -127,68 +130,111 @@ def test_parse_answer_never_accepts_raw_from_the_model():
     # RAW is the bot's sidecar verb, never the model's: "orders only from
     # TRUSTED users" lives in the prompt, so the arbitrary-line verb cannot
     # live in the grammar — one injected `RAW QUIT :bye` must not execute.
-    assert policy.parse_answer("SAY #c hi\nRAW QUIT :bye") == \
-        [("SAY", "#c", "hi")]
+    assert policy.parse_answer("SAY azzurra|#c hi\nRAW QUIT :bye") == \
+        [("SAY", "azzurra|#c", "hi")]
     assert "RAW" not in policy.VERBS
 
 
 def test_parse_answer_ignores_prose_and_injection():
-    text = "\x1b[0m> build\x1b[0m\nrandom prose\nSAY  onlytarget\nSAY #c\n" \
-           "SAY #ok fine\nQUIT\n"
+    text = "\x1b[0m> build\x1b[0m\nrandom prose\nSAY  onlytarget\nSAY azzurra|#c\n" \
+           "SAY azzurra|#ok fine\nQUIT\n"
     assert policy.parse_answer(text) == [
-        ("SAY", "#ok", "fine"), ("QUIT", "", "")]
-
-
-def test_parse_answer_accepts_bare_quit():
-    assert policy.parse_answer("QUIT") == [("QUIT", "", "")]
+        ("SAY", "azzurra|#ok", "fine"), ("QUIT", "", "")]
 
 
 def test_parse_answer_strips_control_chars_from_bodies():
     # A body must never smuggle a second FIFO command inside itself: every
     # line the brain renders starts with a whitelist verb.
-    got = policy.parse_answer("SAY #c one\r\nQUIT :forged\r\n")
+    got = policy.parse_answer("SAY azzurra|#c one\r\nQUIT :forged\r\n")
     assert len(got) <= 2           # splitlines already separates
     assert all(v in policy.VERBS for v, _t, _b in got)
 
 
 def test_filter_answer_drops_own_echo():
-    answer = policy.parse_answer(
-        "SAY bot hi\nSAY #c bot: echo\nSAY #c fine\nACT bot waves\n"
-        "JOIN #x")
+    # The routed form (post net| split) is what the gate sees.
+    answer = [("SAY", "bot", "hi"), ("SAY", "#c", "bot: echo"),
+              ("SAY", "#c", "fine"), ("ACT", "bot", "waves"), ("JOIN", "", "#c")]
     assert policy.filter_answer(answer, "bot") == [
-        ("SAY", "#c", "fine"), ("JOIN", "", "#x")]
+        ("SAY", "#c", "fine"), ("JOIN", "", "#c")]
+
+
+def test_own_echo_is_checked_per_network_nick():
+    # The same nick word is our echo on net A and a harmless target on net B.
+    assert policy.is_own_echo("SAY", "ocbot", "hi", "ocbot")
+    assert not policy.is_own_echo("SAY", "ocbot", "hi", "othernick")
+    assert policy.is_own_echo("SAY", "#c", "ocbot: echo", "ocbot")
+    assert not policy.is_own_echo("JOIN", "", "#c", "ocbot")
 
 
 # --- prompt construction --------------------------------------------------------
-def test_build_system_contains_policy_and_register():
-    s = policy.build_system("bot", "azzurra", "#olografix",
-                            {"#olografix": "supercazzola mode"})
+def test_build_system_describes_one_agent_on_many_networks():
+    s = policy.build_system(
+        [("azzurra", "vjt-claude"), ("libera", "ocbot")],
+        registers={"#olografix": "supercazzola mode"})
+    assert "ONE resident IRC agent" in s
+    assert "vjt-claude on azzurra" in s and "ocbot on libera" in s
+    assert "no separate sessions per channel" in s
     assert "Silence is the default" in s
     assert "spoofed" in s.lower()
-    assert "Register for #olografix: supercazzola mode" in s
-    assert "SAY <target>" in s and "QUIT" in s
-    # No register configured for an unlisted channel: no register line.
-    assert "Register for" not in policy.build_system("bot", "n", "#other", {})
+    assert "- #olografix: supercazzola mode" in s
+    # The routing contract is spelled out with the net| separator.
+    assert "SAY azzurra|#channel text" in s
+    assert "QUIT azzurra|reason" in s
+    assert "known net| prefix is dropped" in s
 
 
-def test_build_prompt_lists_context_new_and_marks_addressed():
-    old = _msg("old line", frm="a")
-    new = _msg("bot: addressed", frm="b")
-    ring = [old, new]
-    p = policy.build_prompt([new], ring, "azzurra", "#test",
-                            addressed_ids=[id(new)])
-    assert "Network: azzurra   Channel: #test" in p
-    assert "[12:34] <a> to #test (trusted): old line" in p
-    assert p.count("[12:34] <b> to #test (trusted): bot: addressed") == 1
-    assert "[ADDRESSED]" in p
+def test_build_system_without_registers():
+    assert "Channel registers" not in policy.build_system([("n", "bot")])
+
+
+def test_fmt_event_vjt_prefix_and_host():
+    # The vjt shape: [HH:MM] net|target <nick>: text — and HOST= never
+    # stripped (the anti-spoof rule: the Monitor must never be host-blind).
+    ev = _msg("hi bot")
+    ev["net"] = "azzurra"
+    assert policy.fmt_event(ev) == \
+        "[12:34] azzurra|#test <alice>: hi bot (trusted; HOST=u@h)"
+    dm = _msg("psst", to="vjt-claude", frm="alice")
+    dm["net"] = "irc"
+    assert policy.fmt_event(dm) == "[12:34] irc|alice <alice>: psst (trusted; HOST=u@h)"
+    untr = _msg("yo", trust="UNTRUSTED", host="")
+    untr["net"] = "irc"
+    assert policy.fmt_event(untr) == "[12:34] irc|#test <alice>: yo (untrusted)"
+
+
+def test_fmt_event_marks_addressed_and_renders_every_kind():
+    ev = _msg("bot: ping", frm="b")
+    assert policy.fmt_event(ev, addressed=True).endswith("ADDRESSED)")
+    idle = policy.parse_event("[09:00] IDLE #olografix")
+    idle["net"] = "azzurra"
+    assert policy.fmt_event(idle) == "[09:00] azzurra|#olografix (idle)"
+    join = policy.parse_event("[09:01] JOIN bob HOST=b@h #c")
+    join["net"] = "libera"
+    assert policy.fmt_event(join) == "[09:01] libera|#c bob #c (HOST=b@h)"
+
+
+def test_build_prompt_lists_events_without_rehashing_context():
+    # One conversation, append-only: the prompt is the new lines, nothing
+    # re-presented from earlier turns.
+    a, b = _msg("one", frm="a"), _msg("bot: two", frm="b")
+    a["net"] = b["net"] = "irc"
+    p = policy.build_prompt([a, b], addressed_ids=[id(b)])
+    assert "[12:34] irc|#test <a>: one (trusted; HOST=u@h)" in p
+    assert "[12:34] irc|#test <b>: bot: two (trusted; HOST=u@h; ADDRESSED)" in p
+    assert "Network:" not in p and "Recent context" not in p
     assert "FIFO command lines only" in p
 
 
-def test_registers_text_case_insensitive():
-    reg = {"#Olografix": "calm"}
-    assert policy.registers_text(reg, "#olografix") == \
-        "Register for #olografix: calm"
-    assert policy.registers_text(reg, "#zzz") == ""
+def test_build_prompt_interleaves_networks_in_one_conversation():
+    # The whole point of the single session: channels from different
+    # networks arrive as one continuous, prefixed stream.
+    a = _msg("ciao", to="#olografix")
+    a["net"] = "azzurra"
+    b = _msg("hello", to="#help", frm="bob")
+    b["net"] = "libera"
+    p = policy.build_prompt([a, b])
+    assert "[12:34] azzurra|#olografix <alice>: ciao" in p
+    assert "[12:34] libera|#help <bob>: hello" in p
 
 
 def test_rehydrate_prompt_carries_memory():

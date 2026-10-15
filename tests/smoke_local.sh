@@ -37,7 +37,7 @@ BOT_EVENTS="$D/events.log" BOT_FIFO="$D/bot.send" IRC_NICK=ocbot \
   BRAIN_SERVE_URL="http://127.0.0.1:$SPORT" BRAIN_WORKDIR="$D/workspace" \
   BRAIN_MEMORY_DIR="$D/workspace/memory" BRAIN_HEARTBEAT="$D/hb" \
   BRAIN_AGENT_STATUS="$D/agent.status" BRAIN_FROM_START=1 \
-  BRAIN_POLL=0.3 BRAIN_BATCH_WINDOW=1 BRAIN_RATE=0 BRAIN_GLOBAL_RATE=0 \
+  BRAIN_POLL=0.3 BRAIN_BATCH_WINDOW=1 \
   python3 -u brain.py > "$D/brain.log" 2>&1 &
 BRAIN=$!
 

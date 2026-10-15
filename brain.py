@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""brain.py — persistent OpenCode sessions, one per (network, channel).
+"""brain.py — ONE persistent OpenCode session, vjt's live-conversation model.
 
-    opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one); every
-    (network, channel) gets ONE warm session; events are tailed per network
-    and submitted with POST /session/{id}/prompt_async (HTTP 204, never
-    blocking); replies stream back over SSE GET /event and are parsed into
-    FIFO verb lines. A wedged turn is cancelled with /abort; refusals, turn
-    caps and repeated wedges reset the session, which rehydrates from disk
-    memory (memory_log.py). Permission requests are rejected on sight and
-    announced to the admin over the bot FIFO — an interactive prompt would
-    dead-lock a headless agent, so deny fast and surface on IRC.
+    opencode serve runs ONCE (or BRAIN_SERVE_URL attaches to one); the brain
+    holds ONE session — the same continuous conversation vjt's Monitor fed,
+    with every network and channel interleaved in it. Events are tailed per
+    network and submitted as `[HH:MM] net|target <nick>: text` lines with
+    POST /session/{id}/prompt_async (HTTP 204, never blocking); while the
+    model turns, batches queue and drain on idle — one conversation,
+    serialized, no per-channel parallelism. Routing comes from the ANSWER:
+    every FIFO verb line carries its network (`SAY azzurra|#chan text`) and
+    is written to that network's bot FIFO. A wedged turn is cancelled with
+    /abort; refusals, turn caps and repeated wedges reset the session, which
+    rehydrates from disk memory (memory_log.py). Permission requests are
+    rejected on sight and announced to the admin over the bot FIFO — an
+    interactive prompt would dead-lock a headless agent, so deny fast and
+    surface on IRC.
 """
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -21,7 +25,6 @@ import sys
 import threading
 import time
 import urllib.request
-from collections import deque
 from functools import partial
 
 import memory_log
@@ -44,8 +47,6 @@ SERVE_URL = env("BRAIN_SERVE_URL", "")         # attach mode (tests/CI)
 SERVE_PORT = int(env("BRAIN_SERVE_PORT", "46099"))
 POLL = float(env("BRAIN_POLL", "1.0"))
 BATCH_WINDOW = float(env("BRAIN_BATCH_WINDOW", "3.0"))
-RATE = float(env("BRAIN_RATE", "3.0"))         # min seconds between sends/target
-GLOBAL_RATE = float(env("BRAIN_GLOBAL_RATE", "1.0"))
 FROM_START = env_bool("BRAIN_FROM_START")
 MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
              if c.strip())                     # chan_filter.awk port
@@ -53,10 +54,11 @@ ADDRESS_ONLY = env_bool("BRAIN_ADDRESS_ONLY")
 API_KEY = env("OPENCODE_API_KEY", "")
 
 OPENCODE_BIN = "opencode"
-RING = 8               # events of context carried in every prompt
 BATCH_MAX = 5          # submit a batch once it grows this big
-MAX_CHANS = 64
-PENDING_MAX = 32       # unsubmitted events kept per session, newest wins
+# Nothing is ever dropped for being late (vjt's model: the writer queues, the
+# agent catches up) — a large backlog is only announced, loudly, here and in
+# agent.status.
+PENDING_BACKLOG = 128
 # A free-tier model can legitimately turn for minutes: these stay env-tunable
 # so a slow deploy can tune around guaranteed abort->wedge->reset loops.
 MAX_TURNS = int(env("BRAIN_MAX_TURNS", "150"))          # turn cap per session
@@ -325,28 +327,21 @@ class Tailer:
         return [ln for ln in whole if ln.strip()]
 
 
-# --- sessions ----------------------------------------------------------------
+# --- the one session ----------------------------------------------------------
 class Session:
-    __slots__ = ("sid", "net", "chan", "nick", "system", "turns", "busy_since",
-                 "wedges", "refusals", "pending", "ring", "last_count")
+    __slots__ = ("sid", "title", "system", "turns", "busy_since",
+                 "wedges", "refusals", "pending", "last_count")
 
-    def __init__(self, sid, net, chan, nick, system):
+    def __init__(self, sid, title, system):
         self.sid = sid
-        self.net = net
-        self.chan = chan
-        self.nick = nick
+        self.title = title
         self.system = system
         self.turns = 0
         self.busy_since = None
         self.wedges = 0
         self.refusals = 0
         self.pending = []                  # (fed_monotonic, event)
-        self.ring = deque(maxlen=RING)
         self.last_count = 0                # messages already collected
-
-    @property
-    def title(self):
-        return f"irc:{self.net}:{self.chan}"
 
 
 def last_assistant_text(messages):
@@ -375,11 +370,7 @@ class Brain:
         self.api = None
         self.serve = None
         self.lock = threading.Lock()
-        self.sessions = {}                 # (net, chan_lower) -> Session
-        self.by_sid = {}                   # sessionID -> Session
-        self.last_sent = {}                # (net, target) -> monotonic
-        self.last_global = 0.0
-        self.recent = deque(maxlen=64)     # digests of lines just sent
+        self.sess = None                   # THE session (created lazily)
         self.loop_count = 0
         self.total_turns = 0
         self.total_refusals = 0
@@ -387,89 +378,80 @@ class Brain:
         self.registers = registers()
         self.model = split_model(MODEL)
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
-        self.stored = {}                   # (net, chan) -> sid, from disk
+        self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
 
     # -- session management -----------------------------------------------------
-    def _system_for(self, net, chan, nick):
-        return policy.build_system(nick, net, chan, self.registers)
+    def _net_nick(self, net_name):
+        net = self.net_by_name.get(net_name)
+        return net.env.get("IRC_NICK", NICK) if net else NICK
+
+    def _roster(self):
+        return [(n.name, n.env.get("IRC_NICK", NICK)) for n in self.nets]
 
     def _store_path(self):
         return os.path.join(WORKDIR, "sessions.json")
 
     def load_session_store(self):
-        """{(net, chan): sid} across brain restarts: the pointer to the LIVE
-        session per channel (dead ones were removed by reset)."""
+        """The ONE session's sid across brain restarts."""
         try:
             with open(self._store_path()) as f:
                 data = json.loads(f.read())
-            if isinstance(data, dict):
-                self.stored = {tuple(k.split(":", 1)): v
-                               for k, v in data.items()}
+            self.stored_sid = data.get("session") \
+                if isinstance(data, dict) else None
         except (OSError, ValueError):
-            self.stored = {}
+            self.stored_sid = None
 
     def save_session_store(self):
         try:
             with open(self._store_path(), "w") as f:
-                json.dump({f"{net}:{chan}": sess.sid
-                           for (net, chan), sess in self.sessions.items()}, f)
+                json.dump({"session": self.sess.sid} if self.sess else {}, f)
         except OSError:
             pass
 
-    def get_session(self, net, chan, nick=None):
-        """The (net, chan) session, created or re-attached on first use.
-        Main-thread only (feed drives it); the SSE thread never creates."""
-        key = (net, chan)
+    def ensure_session(self):
+        """THE one session, created or re-attached on first use. Main-thread
+        only (feed drives it); the SSE thread never creates."""
         with self.lock:
-            sess = self.sessions.get(key)
+            sess = self.sess
         if sess:
             return sess
-        if len(self.sessions) >= MAX_CHANS:
-            emit("CHAN_OVERFLOW", net, chan)
-            return None
-        env_ = self.net_by_name[net].env
-        nick = nick or env_.get("IRC_NICK", NICK)
-        title = f"irc:{net}:{chan}"
-        if self.api is None:  # dry-run: synthesize a local-only session
-            sess = Session("dry-" + title, net, chan, nick,
-                           self._system_for(net, chan, nick))
+        title = "irc:global"
+        system = policy.build_system(self._roster(), self.registers)
+        if self.api is None:  # dry-run: a local-only stand-in
+            sess = Session("dry", title, system)
             with self.lock:
-                self.sessions[key] = sess
+                self.sess = sess
             return sess
         known = {s.get("id") for s in self.api.list_sessions()}
-        sid = None
-        if key in self.stored and self.stored[key] in known:
-            sid = self.stored[key]
-        if sid is None:
+        if self.stored_sid and self.stored_sid in known:
+            # Re-attached: count existing turns so the cap survives restarts.
+            sess = Session(self.stored_sid, title, system)
             try:
-                sid = self.api.create_session(title)["id"]
-            except (OSError, KeyError, ValueError) as e:
-                emit("SESSION_CREATE_ERROR", title, repr(e))
-                return None
-            sess = Session(sid, net, chan, nick, self._system_for(net, chan, nick))
+                sess.turns = assistant_turn_count(self.api.messages(sess.sid))
+            except OSError:
+                sess.turns = 0
             with self.lock:
-                self.sessions[key] = sess
-                self.by_sid[sid] = sess
-            self.save_session_store()
-            emit("SESSION_NEW", title, sid)
-            self.rehydrate(sess)
+                self.sess = sess
+            emit("SESSION_ATTACHED", title, sess.sid, f"turns={sess.turns}")
             return sess
-        # Re-attached: count existing turns so the cap survives restarts.
-        sess = Session(sid, net, chan, nick, self._system_for(net, chan, nick))
         try:
-            sess.turns = assistant_turn_count(self.api.messages(sid))
-        except OSError:
-            sess.turns = 0
+            sid = self.api.create_session(title)["id"]
+        except (OSError, KeyError, ValueError) as e:
+            emit("SESSION_CREATE_ERROR", title, repr(e))
+            return None
+        sess = Session(sid, title, system)
         with self.lock:
-            self.sessions[key] = sess
-            self.by_sid[sid] = sess
-        emit("SESSION_ATTACHED", title, sid, f"turns={sess.turns}")
+            self.sess = sess
+        self.save_session_store()
+        emit("SESSION_NEW", title, sid)
+        self.rehydrate(sess)
         return sess
 
     def rehydrate(self, sess):
         """Wake a fresh session from disk memory (the /resume ritual)."""
-        prompt = policy.rehydrate_prompt(sess.nick, self.mem.index_text(),
+        nick = self._net_nick(self.nets[0].name if self.nets else "")
+        prompt = policy.rehydrate_prompt(nick, self.mem.index_text(),
                                          self.mem.today_body())
         try:
             self.api.prompt_async(sess.sid, prompt, system=sess.system,
@@ -487,37 +469,41 @@ class Brain:
         except OSError:
             pass
         with self.lock:
-            self.sessions.pop((sess.net, sess.chan), None)
-            self.by_sid.pop(sess.sid, None)
+            if self.sess is sess:
+                self.sess = None
             leftover = sess.pending
         self.save_session_store()
         emit("SESSION_RESET", sess.title, reason, f"turns={sess.turns}")
         self.mem.append_activity(
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
-        fresh = self.get_session(sess.net, sess.chan, sess.nick)
+        self.registers = registers()      # registers live like the session
+        fresh = self.ensure_session()
         if fresh is not None and leftover:
             with self.lock:
                 fresh.pending = leftover + fresh.pending
 
     # -- event intake -------------------------------------------------------------
-    def feed(self, net, ev):
+    def feed(self, net_name, ev):
         if ev is None:
             return
         if policy.is_muted(ev, MUTE):
             return
-        sess = self.get_session(net, policy.channel_of(ev))
+        sess = self.ensure_session()
         if sess is None:
             return
-        src = (ev.get("from") or "").lower()
-        if src and src == sess.nick.lower():
-            return
-        sess.ring.append(ev)
-        if not policy.wakes_model(ev, sess.nick, ADDRESS_ONLY):
+        nick = self._net_nick(net_name)
+        if (ev.get("from") or "").lower() == nick.lower():
+            return                        # our own lines do not exist
+        ev["net"] = net_name
+        if not policy.wakes_model(ev, nick, ADDRESS_ONLY):
             return
         with self.lock:
             sess.pending.append((time.monotonic(), ev))
-            del sess.pending[:-PENDING_MAX]   # a slow model must not grow
-                                              # the batch past the context
+            depth = len(sess.pending)
+        if depth >= PENDING_BACKLOG and depth % PENDING_BACKLOG == 0:
+            # Visible, never dropped: a slow model must not strand events
+            # silently (vjt never discards; neither do we).
+            emit("PENDING_BACKLOG", sess.title, f"events={depth}")
 
     def due(self, sess):
         with self.lock:
@@ -535,10 +521,9 @@ class Brain:
             batch = sess.pending
             sess.pending = []
         addressed = [id(ev) for _t, ev in batch
-                     if policy.is_addressed(ev, sess.nick)]
-        prompt = policy.build_prompt([ev for _t, ev in batch],
-                                     list(sess.ring), sess.net,
-                                     sess.chan, addressed)
+                     if policy.is_addressed(
+                         ev, self._net_nick(ev.get("net")))]
+        prompt = policy.build_prompt([ev for _t, ev in batch], addressed)
         if self.dry_run:
             emit("DRY_RUN_PROMPT", sess.title)
             print(prompt, flush=True)
@@ -557,8 +542,8 @@ class Brain:
 
     # -- collect ----------------------------------------------------------------------
     def on_idle(self, sid):
-        sess = self.by_sid.get(sid)
-        if sess is None:
+        sess = self.sess
+        if sess is None or sess.sid != sid:
             return
         try:
             msgs = self.api.messages(sid)
@@ -594,88 +579,66 @@ class Brain:
                 f"{sess.title}: turn {sess.turns}, {len(text)} chars")
 
     def dispatch(self, sess, text):
-        answer = policy.filter_answer(policy.parse_answer(text), sess.nick)
+        answer = policy.parse_answer(text)
         if not answer:
             emit("NO_VERBS", sess.title)
             return
-        nowm = time.monotonic()
-        # The rate gates apply per ANSWER, not per line: lines 2..N of one
-        # reply ride the same FIFO write, and a per-line check ate every line
-        # after the first (review blocker 2: `SAY #t one\nSAY #t two\nSAY #t
-        # three` delivered only `one`). An answer failing a gate is dropped
-        # whole — never partially.
-        targets = sorted({t.lower() for v, t, _b in answer
-                          if v in policy.CHAT_VERBS and t})
-        if targets:
-            for t in targets:
-                if nowm - self.last_sent.get((sess.net, t), -1e9) < RATE:
-                    emit("RATE_LIMITED", sess.title, t)
-                    return
-            if nowm - self.last_global < GLOBAL_RATE:
-                emit("RATE_LIMITED", sess.title, "global")
-                return
-        # A prompt-injected answer must not be able to storm the connection
-        # either: non-chat verbs are capped per answer (review should-fix).
-        non_chat = [a for a in answer if a[0] not in policy.CHAT_VERBS]
-        if len(non_chat) > policy.NON_CHAT_CAP:
-            emit("VERB_STORM", sess.title, f"{len(non_chat)} non-chat lines, "
-                 f"keeping {policy.NON_CHAT_CAP}")
-            kept, room = [], policy.NON_CHAT_CAP
-            for a in answer:
-                if a[0] in policy.CHAT_VERBS:
-                    kept.append(a)
-                elif room > 0:
-                    kept.append(a)
-                    room -= 1
-            answer = kept
-        out, digests = [], []
+        # Routing comes from the ANSWER: `VERB net|rest` — the net selects the
+        # bot FIFO, the rest is that bot's own grammar verbatim. A line whose
+        # net is missing or unknown is dropped loudly, never guessed. Nothing
+        # else gates an answer: no rate limits, no dedup, no per-answer caps
+        # (vjt's bot drops nothing; the model owns its own pacing).
+        by_net = {}
         for verb, target, body in answer:
-            digest = hashlib.sha1(
-                f"{sess.net}\0{target}\0{body}".encode()).hexdigest()
-            if digest in self.recent:
-                continue                  # a model echoing itself must not loop
-            digests.append(digest)
-            if target:
-                out.append(f"{verb} {target} {body}")
-            elif body:
-                out.append(f"{verb} {body}")
-            else:
-                out.append(verb)
-        if not out:
-            return
-        for t in targets:                 # commit only on a real send
-            self.last_sent[(sess.net, t)] = nowm
-        self.last_global = nowm
-        n = write_fifo(out, self.net_by_name[sess.net].fifo)
-        self.recent.extend(digests)
-        emit("SENT", n, sess.title, " ".join(out)[:200])
+            raw = f"{target} {body}".strip() if target else body
+            if verb == "QUIT" and not raw:
+                if len(self.nets) == 1:
+                    by_net.setdefault(self.nets[0].name, []).append("QUIT")
+                else:
+                    emit("ROUTE_ERROR", sess.title, "bare QUIT, many networks")
+                continue
+            net_name, sep, arg = raw.partition("|")
+            if not sep or net_name not in self.net_by_name:
+                emit("ROUTE_ERROR", sess.title, repr(raw[:80]))
+                continue
+            nick = self._net_nick(net_name)
+            head, _, tail = arg.partition(" ")
+            if policy.is_own_echo(verb, head, tail, nick):
+                continue
+            by_net.setdefault(net_name, []).append(f"{verb} {arg}".rstrip())
+        for net_name, lines in by_net.items():
+            n = write_fifo(lines, self.net_by_name[net_name].fifo)
+            emit("SENT", n, sess.title, net_name, " ".join(lines)[:200])
 
     # -- agent guard (wedged turns) ---------------------------------------------------
     def guard_tick(self):
-        nowm = time.monotonic()
         with self.lock:
-            busy = [s for s in self.sessions.values()
-                    if s.busy_since is not None]
-        for sess in busy:
-            if nowm - sess.busy_since < TURN_TIMEOUT:
-                continue
-            emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
-            self.total_wedges += 1
-            sess.wedges += 1
-            try:
-                self.api.abort(sess.sid)
-            except OSError as e:
-                emit("ABORT_ERROR", sess.title, repr(e))
-            with self.lock:
-                sess.busy_since = None
-            if sess.wedges >= 2:
-                self.reset_session(sess, "wedged-twice")
+            sess = self.sess
+            busy = sess is not None and sess.busy_since is not None
+        if not busy:
+            return
+        nowm = time.monotonic()
+        if nowm - sess.busy_since < TURN_TIMEOUT:
+            return
+        emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
+        self.total_wedges += 1
+        sess.wedges += 1
+        try:
+            self.api.abort(sess.sid)
+        except OSError as e:
+            emit("ABORT_ERROR", sess.title, repr(e))
+        with self.lock:
+            sess.busy_since = None
+        if sess.wedges >= 2:
+            self.reset_session(sess, "wedged-twice")
 
     # -- permission gate -----------------------------------------------------------------
     def gate(self, props):
         """permission.asked: reject on sight, announce over the FIFO."""
         req_id = props.get("id") or ""
-        sess = self.by_sid.get(props.get("sessionID"))
+        sess = self.sess
+        if sess is not None and sess.sid != props.get("sessionID"):
+            sess = None
         what = props.get("permission") or "unknown"
         patterns = ",".join(props.get("patterns") or [])[:120]
         emit("PERMISSION_DENIED", what, patterns)
@@ -687,9 +650,9 @@ class Brain:
         except OSError as e:
             emit("PERMISSION_REPLY_ERROR", repr(e))
         if sess is not None:
-            write_fifo([f"NOTICE {ADMIN} [gate] denied {what} ({patterns}) "
-                        f"on {sess.net}{sess.chan}"],
-                       self.net_by_name[sess.net].fifo)
+            line = (f"NOTICE {ADMIN} [gate] denied {what} ({patterns})")
+            for net in self.nets:
+                write_fifo([line], net.fifo)
 
     # -- SSE loop ------------------------------------------------------------------------
     def catch_up_missed_idles(self):
@@ -698,19 +661,19 @@ class Brain:
         otherwise leave the finished reply unfetched — channel silence, then a
         wedged-reset 180 s later for good measure (review should-fix). A turn
         still running shows a non-assistant last message and is left alone."""
-        for sess in list(self.sessions.values()):
-            if sess.busy_since is None:
-                continue
-            try:
-                msgs = self.api.messages(sess.sid)
-            except OSError:
-                continue
-            if len(msgs) <= sess.last_count:
-                continue
-            if msgs[-1].get("info", {}).get("role") != "assistant":
-                continue
-            emit("SSE_CATCHUP", sess.title)
-            self.on_idle(sess.sid)
+        sess = self.sess
+        if sess is None or sess.busy_since is None:
+            return
+        try:
+            msgs = self.api.messages(sess.sid)
+        except OSError:
+            return
+        if len(msgs) <= sess.last_count:
+            return
+        if msgs[-1].get("info", {}).get("role") != "assistant":
+            return
+        emit("SSE_CATCHUP", sess.title)
+        self.on_idle(sess.sid)
 
     def sse_loop(self):
         backoff = 1.0
@@ -737,21 +700,23 @@ class Brain:
         if etype == "session.idle":
             self.on_idle(props.get("sessionID"))
         elif etype == "session.status":
-            sess = self.by_sid.get(props.get("sessionID"))
-            status = props.get("status") or {}
-            if sess and status.get("type") == "retry":
-                emit("SESSION_RETRY", sess.title,
-                     str(status.get("message", ""))[:120])
-            elif sess and status.get("type") == "busy":
-                sess.busy_since = sess.busy_since or time.monotonic()
+            sess = self.sess
+            if sess is not None and sess.sid == props.get("sessionID"):
+                status = props.get("status") or {}
+                if status.get("type") == "retry":
+                    emit("SESSION_RETRY", sess.title,
+                         str(status.get("message", ""))[:120])
+                elif status.get("type") == "busy":
+                    sess.busy_since = sess.busy_since or time.monotonic()
         elif etype == "session.error":
             emit("SESSION_ERROR", str(props)[:200])
         elif etype == "permission.asked":
             self.gate(props)
         elif etype in ("session.next.compaction.ended", "session.compacted"):
-            sess = self.by_sid.get(props.get("sessionID"))
+            sess = self.sess
             self.mem.log_compaction()
-            emit("COMPACTED", sess.title if sess
+            emit("COMPACTED", sess.title if sess and
+                 sess.sid == props.get("sessionID")
                  else str(props.get("sessionID", "")))
 
     # -- watchdog plumbing --------------------------------------------------------------
@@ -763,10 +728,13 @@ class Brain:
         except OSError:
             pass
         with self.lock:
-            snap = {s.title: {"turns": s.turns, "refusals": s.refusals,
-                              "wedges": s.wedges,
-                              "busy": s.busy_since is not None}
-                    for s in self.sessions.values()}
+            sess = self.sess
+            snap = ({sess.title: {"turns": sess.turns,
+                                  "refusals": sess.refusals,
+                                  "wedges": sess.wedges,
+                                  "busy": sess.busy_since is not None,
+                                  "pending": len(sess.pending)}}
+                    if sess else {})
         try:
             with open(AGENT_STATUS, "w") as f:
                 json.dump({"ts": time.time(), "turns": self.total_turns,
@@ -781,7 +749,7 @@ class Brain:
         emit("START", f"nets={','.join(n.name for n in self.nets)}",
              f"model={MODEL}", "dry-run" if self.dry_run else "live",
              f"mute={','.join(MUTE) or '-'}",
-             "address-only" if ADDRESS_ONLY else "policy-gated")
+             "address-only" if ADDRESS_ONLY else "all-events")
         self.mem = self.mem or setup_workdir()
         self.load_session_store()
         if not self.dry_run:
@@ -799,12 +767,11 @@ class Brain:
             for net_name, tail in tailers:
                 for line in tail.read_new():
                     self.feed(net_name, policy.parse_event(line))
-            for sess in list(self.sessions.values()):
-                if self.due(sess):
-                    self.submit(sess)
+            if self.sess is not None and self.due(self.sess):
+                self.submit(self.sess)
             self.guard_tick()
-            # Managed serve died: respawn, then drop session state so every
-            # channel re-attaches against the new server.
+            # Managed serve died: respawn, then drop session state so the
+            # session re-attaches against the new server.
             if self.serve and self.serve.managed and self.serve.managed.poll() is not None:
                 emit("SERVE_DOWN", f"exit={self.serve.managed.returncode}")
                 try:
@@ -816,8 +783,7 @@ class Brain:
                     self.serve = fresh
                     self.api = Api(fresh.url)
                     with self.lock:
-                        self.sessions.clear()
-                        self.by_sid.clear()
+                        self.sess = None
                     emit("SERVE_UP", fresh.url)
             time.sleep(POLL)
         if self.serve:

@@ -76,8 +76,6 @@ services:
       BRAIN_FROM_START: "1"
       BRAIN_POLL: "0.3"
       BRAIN_BATCH_WINDOW: "1.0"
-      BRAIN_RATE: "0"
-      BRAIN_GLOBAL_RATE: "0"
       IRC_NICK: ocbot
     depends_on:
       - stub-serve
