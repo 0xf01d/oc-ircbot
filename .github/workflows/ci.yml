@@ -23,6 +23,9 @@ jobs:
           BOT_FIFO: ${{ runner.temp }}/bot.send
           BRAIN_FROM_START: "1"
           BRAIN_BATCH_WINDOW: "0.5"
+          BRAIN_WORKDIR: ${{ runner.temp }}/workspace
+          BRAIN_HEARTBEAT: ${{ runner.temp }}/brain.heartbeat
+          BRAIN_AGENT_STATUS: ${{ runner.temp }}/agent.status
         run: |
           printf '[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi\n' \
             > "$BOT_EVENTS"
