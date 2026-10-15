@@ -1,0 +1,63 @@
+# Offline smoke overlay: adds a mock IRC server and points the stack at it,
+# with a stub brain instead of the real OpenCode CLI. Used by CI and by the
+# on-cluster test (the k8s/ manifests mirror the same topology).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
+#       up --abort-on-container-exit --exit-code-from mock-irc
+#
+# The mock exits 0 as soon as it records the brain's PRIVMSG (marker
+# MOCK_EXPECT, default `stub-ok`); that exit code is the smoke assertion.
+
+services:
+  mock-irc:
+    image: python:3.12-slim
+    command:
+      - python3
+      - -u
+      - /app/tests/mock_irc_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6667"
+      - --inject
+      - ${MOCK_INJECT:-#test hello bot}
+      - --out
+      - /tmp/mock.out
+      - --expect
+      - ${MOCK_EXPECT:-stub-ok}
+      - --timeout
+      - "90"
+    volumes:
+      - ./tests:/app/tests:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import socket;socket.create_connection(('127.0.0.1',6667),2).close()
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: "no"
+
+  bot:
+    environment:
+      IRC_HOST: mock-irc
+      IRC_PORT: "6667"
+      IRC_TLS: "0"
+      IRC_NICK: ocbot
+      IRC_IDENT: ocbot
+      IRC_REAL: oc-ircbot smoke
+    depends_on:
+      mock-irc:
+        condition: service_healthy
+
+  brain:
+    environment:
+      OC_BRAIN_CMD: python3 /app/tests/stub_brain.py
+      BRAIN_FROM_START: "1"
+      BRAIN_POLL: "0.3"
+      BRAIN_BATCH_WINDOW: "1.0"
+      BRAIN_RATE: "0"
+      BRAIN_GLOBAL_RATE: "0"
+      IRC_NICK: ocbot

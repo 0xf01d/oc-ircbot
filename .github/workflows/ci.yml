@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: unit tests (stdlib + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Run unit tests
+        run: python -m pytest tests -q
+      - name: brain --dry-run smoke (prints the prompt, invokes nothing)
+        env:
+          BOT_EVENTS: ${{ runner.temp }}/events.log
+          BOT_FIFO: ${{ runner.temp }}/bot.send
+          BRAIN_FROM_START: "1"
+          BRAIN_BATCH_WINDOW: "0.5"
+        run: |
+          printf '[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi\n' \
+            > "$BOT_EVENTS"
+          timeout 5 python brain.py --dry-run || true
+
+  docker:
+    name: docker build + end-to-end smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml build
+      - name: End-to-end smoke (mock IRC + real bot + stub brain)
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
+            up --abort-on-container-exit --exit-code-from mock-irc
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.smoke.yml logs || true

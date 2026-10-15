@@ -1,0 +1,15 @@
+# bot image — the brain-agnostic IRC bridge (stdlib only).
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY bot.py leak_guard.py bot.say ./
+COPY bot.trust bot.trust.ircnet bot.reserved bot.startup ./
+
+# Shared data volume: bot.log, bot.send FIFO, events.log, heartbeat.
+RUN mkdir -p /data
+ENV BOT_LOG=/data/bot.log \
+    BOT_FIFO=/data/bot.send \
+    BOT_EVENTS=/data/events.log \
+    BOT_RESERVED_STORE=/data/reserved_recent.tsv
+
+CMD ["python3", "-u", "bot.py"]

@@ -1,0 +1,10 @@
+# watchdog image — one small heartbeat sidecar (stdlib only).
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY watchdog.py ./
+
+RUN mkdir -p /data
+ENV BRAIN_HEARTBEAT=/data/brain.heartbeat
+
+CMD ["python3", "-u", "watchdog.py"]

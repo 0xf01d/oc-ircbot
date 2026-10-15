@@ -1,0 +1,77 @@
+# oc-ircbot — the three-container stack.
+#
+#   bot  (bridge)  ->  brain (OpenCode)  <-  watchdog (heartbeat)
+#
+# The shared `botdata` volume carries bot.log / bot.send / events.log /
+# brain.heartbeat between the containers. Nothing here is secret except
+# OPENCODE_API_KEY, which is passed through from the environment (documented
+# in README.md); no key is committed.
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    image: oc-ircbot-bot
+    environment:
+      IRC_HOST: ${IRC_HOST:-irc.azzurra.chat}
+      IRC_PORT: ${IRC_PORT:-6697}
+      IRC_NICK: ${IRC_NICK:-vjt-claude}
+      IRC_IDENT: ${IRC_IDENT:-claude}
+      IRC_REAL: ${IRC_REAL:-github.com/0xf01d/oc-ircbot}
+      IRC_BIND: ${IRC_BIND:-}
+      IRC_TLS: ${IRC_TLS:-1}
+      IRC_TLS_VERIFY: ${IRC_TLS_VERIFY:-1}
+      BOT_LOG: /data/bot.log
+      BOT_FIFO: /data/bot.send
+      BOT_EVENTS: /data/events.log
+      NICKSERV_PASS: ${NICKSERV_PASS:-}
+    volumes:
+      - botdata:/data
+    restart: unless-stopped
+
+  brain:
+    build:
+      context: .
+      dockerfile: Dockerfile.brain
+    image: oc-ircbot-brain
+    environment:
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      BOT_EVENTS: /data/events.log
+      BOT_FIFO: /data/bot.send
+      BRAIN_HEARTBEAT: /data/brain.heartbeat
+      BRAIN_MODEL: ${BRAIN_MODEL:-opencode/deepseek-v4.1-flash-free}
+      BRAIN_SYSTEM: ${BRAIN_SYSTEM:-}
+      BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
+      BRAIN_RING: ${BRAIN_RING:-8}
+      BRAIN_TIMEOUT: ${BRAIN_TIMEOUT:-120}
+      BRAIN_RATE: ${BRAIN_RATE:-3.0}
+      # Stub seam: set to e.g. "python3 /app/tests/stub_brain.py" for offline
+      # runs (CI and the on-cluster smoke test). Empty = real OpenCode CLI.
+      OC_BRAIN_CMD: ${OC_BRAIN_CMD:-}
+      IRC_NICK: ${IRC_NICK:-vjt-claude}
+    volumes:
+      - botdata:/data
+    depends_on:
+      - bot
+    restart: unless-stopped
+
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    image: oc-ircbot-watchdog
+    environment:
+      BRAIN_HEARTBEAT: /data/brain.heartbeat
+      WATCHDOG_POLL: ${WATCHDOG_POLL:-10}
+      WATCHDOG_STALL: ${WATCHDOG_STALL:-30}
+      WATCHDOG_MAX_STALLS: ${WATCHDOG_MAX_STALLS:-3}
+      WATCHDOG_EXIT_ON_STALL: ${WATCHDOG_EXIT_ON_STALL:-0}
+    volumes:
+      - botdata:/data
+    depends_on:
+      - brain
+    restart: unless-stopped
+
+volumes:
+  botdata:
