@@ -41,7 +41,7 @@ class Memory:
     def path(self, name):
         return os.path.join(self.root, name)
 
-    def ensure(self):
+    def ensure(self, today=None):
         """Create the root, seed the index and today's heading. Idempotent."""
         os.makedirs(self.root, exist_ok=True)
         idx = self.path(MEMORY_INDEX)
@@ -55,7 +55,7 @@ class Memory:
                 body = f.read()
         except FileNotFoundError:
             pass
-        head = today_heading()
+        head = today_heading(today)
         if head not in body:
             with open(log, "a") as f:
                 if body and not body.endswith("\n"):

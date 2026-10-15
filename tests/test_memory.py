@@ -28,8 +28,8 @@ def test_append_activity_goes_under_today(tmp_path):
 
 def test_archive_older_than_moves_old_days(tmp_path):
     m = Memory(str(tmp_path))
-    m.ensure()
     today = date(2026, 10, 15)
+    m.ensure(today=today)
     old = (today - timedelta(days=20)).isoformat()
     recent = (today - timedelta(days=2)).isoformat()
     with open(m.path(ACTIVITY_LOG), "a") as f:
@@ -48,8 +48,8 @@ def test_archive_older_than_moves_old_days(tmp_path):
 
 def test_archive_keeps_everything_within_window(tmp_path):
     m = Memory(str(tmp_path))
-    m.ensure()
     today = date(2026, 10, 15)
+    m.ensure(today=today)
     d13 = (today - timedelta(days=13)).isoformat()
     with open(m.path(ACTIVITY_LOG), "a") as f:
         f.write(f"## {d13}\n\n- young enough\n")

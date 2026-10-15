@@ -431,6 +431,12 @@ class Brain:
         env_ = self.net_by_name[net].env
         nick = nick or env_.get("IRC_NICK", NICK)
         title = f"irc:{net}:{chan}"
+        if self.api is None:  # dry-run: synthesize a local-only session
+            sess = Session("dry-" + title, net, chan, nick,
+                           self._system_for(net, chan, nick))
+            with self.lock:
+                self.sessions[key] = sess
+            return sess
         known = {s.get("id") for s in self.api.list_sessions()}
         sid = None
         if key in self.stored and self.stored[key] in known:
@@ -708,6 +714,8 @@ class Brain:
 
     def sse_loop(self):
         backoff = 1.0
+        if self.dry_run:
+            return
         while not self.stop_flag:
             try:
                 self.catch_up_missed_idles()
@@ -776,9 +784,13 @@ class Brain:
              "address-only" if ADDRESS_ONLY else "policy-gated")
         self.mem = self.mem or setup_workdir()
         self.load_session_store()
-        self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
-        emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
-        self.api = Api(self.serve.url)
+        if not self.dry_run:
+            self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
+            emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
+            self.api = Api(self.serve.url)
+        else:
+            self.serve = None
+            self.api = None
         tailers = [(n.name, Tailer(n.events, from_start=FROM_START))
                    for n in self.nets]
         threading.Thread(target=self.sse_loop, daemon=True).start()
@@ -793,7 +805,7 @@ class Brain:
             self.guard_tick()
             # Managed serve died: respawn, then drop session state so every
             # channel re-attaches against the new server.
-            if self.serve.managed and self.serve.managed.poll() is not None:
+            if self.serve and self.serve.managed and self.serve.managed.poll() is not None:
                 emit("SERVE_DOWN", f"exit={self.serve.managed.returncode}")
                 try:
                     fresh = Serve.spawned()
@@ -808,7 +820,8 @@ class Brain:
                         self.by_sid.clear()
                     emit("SERVE_UP", fresh.url)
             time.sleep(POLL)
-        self.serve.stop()
+        if self.serve:
+            self.serve.stop()
 
 
 def main(argv=None):
