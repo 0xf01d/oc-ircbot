@@ -1,11 +1,16 @@
 # oc-ircbot — the three-container stack.
 #
-#   bot  (bridge)  ->  brain (OpenCode)  <-  watchdog (heartbeat)
+#   bot  (bridge)  ->  brain (OpenCode serve)  <-  watchdog (heartbeat+serve)
 #
 # The shared `botdata` volume carries bot.log / bot.send / events.log /
-# brain.heartbeat between the containers. Nothing here is secret except
-# OPENCODE_API_KEY, which is passed through from the environment (documented
-# in README.md); no key is committed.
+# brain.heartbeat / agent.status / workspace between the containers. Nothing
+# here is secret except OPENCODE_API_KEY, which is passed through from the
+# environment (documented in README.md); no key is committed.
+#
+# Single-network layout: one bot container on the implicit "irc" network
+# (BOT_EVENTS / BOT_FIFO / BOT_LOG). For several IRC networks at once run
+# nets.py instead (it spawns one bot per networks.json entry, each with its
+# own files) — see README.md, "Multi-network".
 
 services:
   bot:
@@ -37,19 +42,34 @@ services:
     image: oc-ircbot-brain
     environment:
       OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      # Implicit single network (the one the bot container above serves).
       BOT_EVENTS: /data/events.log
       BOT_FIFO: /data/bot.send
-      BRAIN_HEARTBEAT: /data/brain.heartbeat
-      BRAIN_MODEL: ${BRAIN_MODEL:-opencode/deepseek-v4.1-flash-free}
-      BRAIN_SYSTEM: ${BRAIN_SYSTEM:-}
-      BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
-      BRAIN_RING: ${BRAIN_RING:-8}
-      BRAIN_TIMEOUT: ${BRAIN_TIMEOUT:-120}
-      BRAIN_RATE: ${BRAIN_RATE:-3.0}
-      # Stub seam: set to e.g. "python3 /app/tests/stub_brain.py" for offline
-      # runs (CI and the on-cluster smoke test). Empty = real OpenCode CLI.
-      OC_BRAIN_CMD: ${OC_BRAIN_CMD:-}
       IRC_NICK: ${IRC_NICK:-vjt-claude}
+      BRAIN_ADMIN: ${BRAIN_ADMIN:-admin}
+      # Persistent serve + per-channel sessions live under /data.
+      BRAIN_WORKDIR: /data/workspace
+      BRAIN_MEMORY_DIR: /data/workspace/memory
+      BRAIN_HEARTBEAT: /data/brain.heartbeat
+      BRAIN_AGENT_STATUS: /data/agent.status
+      BRAIN_MODEL: ${BRAIN_MODEL:-opencode/deepseek-v4.1-flash-free}
+      BRAIN_SERVE_PORT: ${BRAIN_SERVE_PORT:-46099}
+      # 0.0.0.0 so the watchdog container can poll serve health across the
+      # compose network; the brain itself always talks to 127.0.0.1.
+      BRAIN_SERVE_HOST: 0.0.0.0
+      # Attach to an already-running serve instead of spawning one:
+      # BRAIN_SERVE_URL: http://host:46099
+      BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
+      BRAIN_POLL: ${BRAIN_POLL:-1.0}
+      BRAIN_BATCH_WINDOW: ${BRAIN_BATCH_WINDOW:-3.0}
+      BRAIN_RATE: ${BRAIN_RATE:-3.0}
+      BRAIN_GLOBAL_RATE: ${BRAIN_GLOBAL_RATE:-1.0}
+      BRAIN_MAX_TURNS: ${BRAIN_MAX_TURNS:-150}
+      BRAIN_TURN_TIMEOUT: ${BRAIN_TURN_TIMEOUT:-180}
+      BRAIN_MUTE: ${BRAIN_MUTE:-}
+      BRAIN_ADDRESS_ONLY: ${BRAIN_ADDRESS_ONLY:-0}
+      BRAIN_REGISTERS: ${BRAIN_REGISTERS:-}
+      BRAIN_REFUSAL_PATTERNS: ${BRAIN_REFUSAL_PATTERNS:-}
     volumes:
       - botdata:/data
     depends_on:
@@ -63,10 +83,17 @@ services:
     image: oc-ircbot-watchdog
     environment:
       BRAIN_HEARTBEAT: /data/brain.heartbeat
+      BRAIN_AGENT_STATUS: /data/agent.status
+      BRAIN_SERVE_URL: http://brain:${BRAIN_SERVE_PORT:-46099}
       WATCHDOG_POLL: ${WATCHDOG_POLL:-10}
       WATCHDOG_STALL: ${WATCHDOG_STALL:-30}
       WATCHDOG_MAX_STALLS: ${WATCHDOG_MAX_STALLS:-3}
+      WATCHDOG_WEDGED: ${WATCHDOG_WEDGED:-300}
+      WATCHDOG_SERVE_MAX_FAILS: ${WATCHDOG_SERVE_MAX_FAILS:-3}
       WATCHDOG_EXIT_ON_STALL: ${WATCHDOG_EXIT_ON_STALL:-0}
+      # Lever of last resort; a sidecar cannot restart its own container in
+      # Kubernetes, so this shell command is the honest escalation.
+      WATCHDOG_RESTART_CMD: ${WATCHDOG_RESTART_CMD:-}
     volumes:
       - botdata:/data
     depends_on:

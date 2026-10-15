@@ -27,6 +27,8 @@ jobs:
           printf '[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi\n' \
             > "$BOT_EVENTS"
           timeout 5 python brain.py --dry-run || true
+      - name: End-to-end smoke without Docker (mock IRC + stub serve)
+        run: sh tests/smoke_local.sh
 
   docker:
     name: docker build + end-to-end smoke
@@ -35,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build images
         run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml build
-      - name: End-to-end smoke (mock IRC + real bot + stub brain)
+      - name: End-to-end smoke (mock IRC + real bot + real brain + stub serve)
         run: |
           docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
             up --abort-on-container-exit --exit-code-from mock-irc

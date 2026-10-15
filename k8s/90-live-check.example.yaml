@@ -1,6 +1,6 @@
 # Self-contained LIVE check pod: mock IRC + bot + real OpenCode brain, in one
-# pod on an emptyDir. The brain runs the genuine CLI (no OC_BRAIN_CMD) with the
-# free model. Requires the API key (secret oc-ircbot-secrets key
+# pod on an emptyDir. The brain spawns `opencode serve` itself (persistent
+# sessions, no stub). Requires the API key (secret oc-ircbot-secrets key
 # OPENCODE_API_KEY); see k8s/README.md. Not applied with the smoke manifests.
 apiVersion: v1
 kind: Pod
@@ -64,11 +64,14 @@ spec:
       env:
         - {name: BOT_EVENTS, value: /data/events.log}
         - {name: BOT_FIFO, value: /data/bot.send}
+        - {name: BRAIN_WORKDIR, value: /data/workspace}
+        - {name: BRAIN_MEMORY_DIR, value: /data/workspace/memory}
         - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+        - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
         - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
         - {name: IRC_NICK, value: ocbot}
         - {name: BRAIN_FROM_START, value: "1"}
-        - {name: BRAIN_TIMEOUT, value: "180"}
+        - {name: BRAIN_TURN_TIMEOUT, value: "180"}
         - name: OPENCODE_API_KEY
           valueFrom:
             secretKeyRef:

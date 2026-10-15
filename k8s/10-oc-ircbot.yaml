@@ -5,6 +5,13 @@
 #
 # Code is mounted from the oc-ircbot-code ConfigMap (k8s/00-configmap.yaml),
 # so no image build is required: stock python:3.12-slim runs the scripts.
+#
+# The model server is stubbed here (stub-serve container running
+# tests/stub_opencode_serve.py on 127.0.0.1:46099) so the whole pipeline —
+# tail -> prompt_async -> SSE -> idle -> messages -> FIFO — runs offline.
+# For a live run: drop the stub-serve container, remove BRAIN_SERVE_URL (the
+# brain then spawns `opencode serve` itself, which needs the OpenCode CLI in
+# the image), and inject OPENCODE_API_KEY.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,18 +52,22 @@ spec:
               "import socket;socket.create_connection(('oc-mock-irc',6667),2).close()"
               2>/dev/null; do echo waiting for oc-mock-irc; sleep 1; done
       containers:
-        # --- main container: the OpenCode monitor stand-in ------------------
+        # --- main container: the persistent-session brain --------------------
         - name: brain
           image: python:3.12-slim
           command: ["python3", "-u", "/code/brain.py"]
           env:
             - {name: BOT_EVENTS, value: /data/events.log}
             - {name: BOT_FIFO, value: /data/bot.send}
-            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
-            - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
             - {name: IRC_NICK, value: ocbot}
-            # Stub seam. Remove/replace to use the real OpenCode CLI.
-            - {name: OC_BRAIN_CMD, value: "python3 /code/stub_brain.py"}
+            - {name: BRAIN_WORKDIR, value: /data/workspace}
+            - {name: BRAIN_MEMORY_DIR, value: /data/workspace/memory}
+            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
+            - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
+            # Attach to the stub-serve sidecar. A live run spawns its own
+            # serve instead: drop this var and the OPENCODE CLI to the image.
+            - {name: BRAIN_SERVE_URL, value: "http://127.0.0.1:46099"}
             - {name: BRAIN_FROM_START, value: "1"}
             - {name: BRAIN_POLL, value: "0.3"}
             - {name: BRAIN_BATCH_WINDOW, value: "1.0"}
@@ -85,6 +96,17 @@ spec:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {memory: 256Mi}
 
+        # --- the stub model server (smoke topology only) ----------------------
+        - name: stub-serve
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/stub_opencode_serve.py",
+                    "--host", "127.0.0.1", "--port", "46099"]
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+
         # --- the brain-agnostic IRC bridge ----------------------------------
         - name: bot
           image: python:3.12-slim
@@ -111,15 +133,23 @@ spec:
             requests: {cpu: 20m, memory: 32Mi}
             limits: {memory: 128Mi}
 
-        # --- the one honest sidecar -----------------------------------------
+        # --- the agent-aware sidecar -----------------------------------------
         - name: watchdog
           image: python:3.12-slim
           command: ["python3", "-u", "/code/watchdog.py"]
           env:
             - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
+            - {name: BRAIN_SERVE_URL, value: "http://127.0.0.1:46099"}
             - {name: WATCHDOG_POLL, value: "10"}
             - {name: WATCHDOG_STALL, value: "30"}
             - {name: WATCHDOG_MAX_STALLS, value: "3"}
+            - {name: WATCHDOG_WEDGED, value: "300"}
+            - {name: WATCHDOG_SERVE_MAX_FAILS, value: "3"}
+            # A sidecar cannot restart its own container in Kubernetes; the
+            # honest levers are these two (usually leave both off and let the
+            # livenessProbe + RestartPolicy do the restart).
+            - {name: WATCHDOG_EXIT_ON_STALL, value: "0"}
           volumeMounts:
             - {name: code, mountPath: /code, readOnly: true}
             - {name: data, mountPath: /data}

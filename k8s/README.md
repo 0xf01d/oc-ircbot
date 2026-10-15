@@ -32,15 +32,40 @@ kubectl logs -n hermes-generated-content deploy/oc-mock-irc --previous   # shows
 ```
 
 The mock injects `#test hello bot`, the bot emits it on `events.log`, the
-brain answers through the stub (`python3 /code/stub_brain.py`) with
-`SAY #test stub-ok`, and the mock records `PRIVMSG #test :stub-ok` and exits
-0. That exit-0 is the assertion.
+brain submits it to the stub-serve sidecar (`stub_opencode_serve.py`, the
+same pipeline as production: prompt_async -> SSE -> idle -> FIFO) and answers
+`SAY #test stub-ok`; the mock records `PRIVMSG #test :stub-ok` and exits 0.
+That exit-0 is the assertion.
+
+## Regenerating the ConfigMap
+
+`00-configmap.yaml` embeds the repo files verbatim. After changing any of
+them, regenerate it (from the repo root):
+
+```bash
+python3 - <<'EOF'
+files = ["bot.py", "leak_guard.py",
+         "brain.py", "policy.py", "networks.py", "memory_log.py", "watchdog.py",
+         "opencode.json",
+         "tests/mock_irc_server.py", "tests/stub_opencode_serve.py",
+         "bot.say", "bot.startup", "bot.trust", "bot.trust.ircnet", "bot.reserved"]
+out = ["# Generated from the repo files by the snippet in k8s/README.md —",
+       "# do not edit by hand.", "apiVersion: v1", "data:"]
+for f in files:
+    out.append(f"  {f.split('/')[-1]}: |")
+    out += [("    " + ln if ln.strip() else "") for ln in open(f).read().splitlines()]
+out += ["kind: ConfigMap", "metadata:", "  name: oc-ircbot-code",
+        "  namespace: hermes-generated-content"]
+open("k8s/00-configmap.yaml", "w").write("\n".join(out) + "\n")
+EOF
+```
 
 ## Go live
 
-Replace the brain container's `OC_BRAIN_CMD` with nothing and give it a Node
-image plus the API key (see `90-live-check.example.yaml`). The API key is
-never committed; inject it as an env var:
+Drop the `stub-serve` container, remove the brain's `BRAIN_SERVE_URL` (the
+brain then spawns `opencode serve` itself — put a Node image + the OpenCode
+CLI in the brain container, see `90-live-check.example.yaml`) and inject the
+API key. The key is never committed:
 
 ```bash
 kubectl create secret generic oc-ircbot-secrets \

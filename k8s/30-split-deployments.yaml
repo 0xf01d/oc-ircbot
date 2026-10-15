@@ -74,9 +74,15 @@ spec:
           env:
             - {name: BOT_EVENTS, value: /data/events.log}
             - {name: BOT_FIFO, value: /data/bot.send}
+            - {name: BRAIN_WORKDIR, value: /data/workspace}
+            - {name: BRAIN_MEMORY_DIR, value: /data/workspace/memory}
             - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
             - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
             - {name: IRC_NICK, value: ocbot}
+            # Serve binds the pod IP so the watchdog pod (via oc-brain:46099)
+            # can poll it; the brain itself always talks to 127.0.0.1.
+            - {name: BRAIN_SERVE_HOST, value: 0.0.0.0}
             - name: OPENCODE_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -100,6 +106,19 @@ spec:
           command: ["python3", "-u", "/code/watchdog.py"]
           env:
             - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
+            - {name: BRAIN_SERVE_URL, value: "http://oc-brain:46099"}
           volumeMounts:
             - {name: code, mountPath: /code, readOnly: true}
             - {name: data, mountPath: /data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oc-brain
+  namespace: hermes-generated-content
+  labels: {app: oc-brain}
+spec:
+  selector: {app: oc-brain}
+  ports:
+    - {name: serve, port: 46099, targetPort: 46099}
