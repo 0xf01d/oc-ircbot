@@ -86,7 +86,7 @@ services:
     image: oc-ircbot-watchdog
     # Share the brain's network namespace: serve is loopback-only, and this is
     # how the watchdog reaches it without ever widening the bind.
-    network_mode: "service: brain"
+    network_mode: "service:brain"
     environment:
       BRAIN_HEARTBEAT: /data/brain.heartbeat
       BRAIN_AGENT_STATUS: /data/agent.status
