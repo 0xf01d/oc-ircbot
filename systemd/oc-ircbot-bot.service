@@ -1,0 +1,18 @@
+[Unit]
+Description=oc-ircbot IRC bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+# IRC_HOST / IRC_PORT / IRC_NICK / BOT_EVENTS / ... go here.
+EnvironmentFile=-%h/oc-ircbot/.env
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/bot.py
+Restart=always
+RestartSec=30
+RestartSteps=5
+RestartStepsMax=1800
+
+[Install]
+WantedBy=default.target

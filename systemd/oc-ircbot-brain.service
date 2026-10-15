@@ -1,0 +1,16 @@
+[Unit]
+Description=oc-ircbot OpenCode brain (Monitor stand-in)
+After=oc-ircbot-bot.service
+Wants=oc-ircbot-bot.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+# OPENCODE_API_KEY / BRAIN_MODEL / BOT_EVENTS / BOT_FIFO go here.
+EnvironmentFile=-%h/oc-ircbot/.env
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/brain.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

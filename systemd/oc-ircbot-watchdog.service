@@ -1,0 +1,15 @@
+[Unit]
+Description=oc-ircbot brain heartbeat watchdog
+After=oc-ircbot-brain.service
+Wants=oc-ircbot-brain.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+Environment=BRAIN_HEARTBEAT=/data/brain.heartbeat
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/watchdog.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
