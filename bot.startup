@@ -1,0 +1,7 @@
+# bot.startup — FIFO-style commands replayed after auth, one per line,
+# with a 0.5 s delay between them. Lines starting with '#' are comments.
+#
+# Example:
+# RAW PRIVMSG ChanServ :INVITE #it-opers
+# JOIN #it-opers
+# JOIN #sniffo
