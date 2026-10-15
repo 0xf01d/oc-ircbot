@@ -31,8 +31,9 @@ model turns fail until the key lands.
 
 Images are built by `.github/workflows/image.yml` (buildx, one per
 Dockerfile target) and pushed to ghcr as the role tag plus an immutable
-`sha-<sha>` tag. The manifest uses the role tags with `imagePullPolicy:
-Always`, so:
+`sha-<sha>` tag. The package is anonymously pullable (verified live), so
+no imagePullSecret is needed. The manifest uses the role tags with
+`imagePullPolicy: Always`, so:
 
 ```bash
 # after code changes: rerun the build, then
@@ -74,9 +75,9 @@ kubectl -n hermes-generated-content exec deploy/oc-ircbot -c brain \
   -- tmux capture-pane -p -t brain | tail -40   # peek, no TTY
 ```
 
-Note: `tmuxsup.py` and the tmux entrypoints land with the in-flight
-lane work; images built before that commit run the services as plain
-PIDs — use `logs -f -c brain` until then.
+Every service runs INSIDE its detached tmux session (`tmuxsup.py`
+entrypoints, baked into the images since 4ef1993); pipe-pane mirrors the
+pane to the container stdout, so `logs -f` still shows everything.
 
 ## Flux
 
