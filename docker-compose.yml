@@ -7,10 +7,10 @@
 # here is secret except OPENCODE_API_KEY, which is passed through from the
 # environment (documented in README.md); no key is committed.
 #
-# Single-network layout: one bot container on the implicit "irc" network
-# (BOT_EVENTS / BOT_FIFO / BOT_LOG). For several IRC networks at once run
-# one bot instance per network with its own files — see README.md,
-# "Multi-network".
+# Single-network layout: one bot container (nets.py supervising bot.py) on
+# the implicit "irc" network (BOT_EVENTS / BOT_FIFO / BOT_LOG). For several
+# IRC networks at once set IRC_NETWORKS — nets.py spawns one bot per network
+# with its own files — see README.md, "Multi-network".
 
 services:
   bot:

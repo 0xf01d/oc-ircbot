@@ -56,8 +56,13 @@ OPENCODE_BIN = "opencode"
 RING = 8               # events of context carried in every prompt
 BATCH_MAX = 5          # submit a batch once it grows this big
 MAX_CHANS = 64
-MAX_TURNS = 150        # assistant turns before a session reset (turn cap)
-TURN_TIMEOUT = 180.0   # a turn busy this long is wedged: abort it
+PENDING_MAX = 32       # unsubmitted events kept per session, newest wins
+# A free-tier model can legitimately turn for minutes: these stay env-tunable
+# so a slow deploy can tune around guaranteed abort->wedge->reset loops.
+MAX_TURNS = int(env("BRAIN_MAX_TURNS", "150"))          # turn cap per session
+TURN_TIMEOUT = float(env("BRAIN_TURN_TIMEOUT", "180"))  # wedged-turn abort
+DRY_RUN = env_bool("BRAIN_DRY_RUN")   # lets compose/k8s dry-run without
+                                      # editing the container command
 
 
 def install_api_key():
@@ -755,7 +760,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="build and print prompts, never submit them")
     args = ap.parse_args(argv)
-    brain = Brain(dry_run=args.dry_run)
+    brain = Brain(dry_run=args.dry_run or DRY_RUN)
 
     def _term(*_):
         brain.stop_flag = True

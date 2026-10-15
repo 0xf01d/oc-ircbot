@@ -38,9 +38,10 @@ spec:
             defaultMode: 0555
         - name: data
           emptyDir: {}
-      # bot.py has no connect-retry (it dies and restarts, exactly as the
-      # original relies on systemd Restart=always). Wait for the mock first so
-      # the smoke run starts clean instead of burning a restart.
+      # nets.py babysits bot.py: dead children restart with a backoff, and a
+      # SIGTERM (rolling update) sends `QUIT` through the FIFO first — a clean
+      # part instead of a ping-timeout ghost. Wait for the mock first so the
+      # smoke run starts clean instead of burning a restart.
       initContainers:
         - name: wait-for-irc
           image: python:3.12-slim
@@ -110,7 +111,7 @@ spec:
         # --- the brain-agnostic IRC bridge ----------------------------------
         - name: bot
           image: python:3.12-slim
-          command: ["python3", "-u", "/code/bot.py"]
+          command: ["python3", "-u", "/code/nets.py"]
           env:
             - {name: IRC_HOST, value: oc-mock-irc}
             - {name: IRC_PORT, value: "6667"}

@@ -20,24 +20,18 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from functools import partial
 
 import networks
+from util import emit as _emit, env
+
+emit = partial(_emit, "NETS")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT_SCRIPT = os.path.join(HERE, "bot.py")
-RESTART_SEC = float(os.environ.get("NETS_RESTART_SEC", "30"))
-RESTART_MAX = float(os.environ.get("NETS_RESTART_MAX", "1800"))
-QUIT_GRACE = float(os.environ.get("NETS_QUIT_GRACE", "10"))
-
-_TZ = ZoneInfo("Europe/Rome")
-
-
-def emit(kind, *parts):
-    line = f"[{datetime.now(_TZ).strftime('%H:%M:%S')}] NETS {kind} " + \
-        " ".join(str(p) for p in parts)
-    print(line, flush=True)
+RESTART_SEC = float(env("NETS_RESTART_SEC", "30"))
+RESTART_MAX = float(env("NETS_RESTART_MAX", "1800"))
+QUIT_GRACE = float(env("NETS_QUIT_GRACE", "10"))
 
 
 class NetBot:

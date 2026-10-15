@@ -64,6 +64,8 @@ services:
       IRC_NICK: ocbot
       IRC_IDENT: ocbot
       IRC_REAL: oc-ircbot smoke
+      # A crashed bot must be back well inside the mock's 90 s window.
+      NETS_RESTART_SEC: "5"
     depends_on:
       mock-irc:
         condition: service_healthy

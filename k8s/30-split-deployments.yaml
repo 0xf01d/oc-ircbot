@@ -33,7 +33,9 @@ spec:
       containers:
         - name: bot
           image: python:3.12-slim
-          command: ["python3", "-u", "/code/bot.py"]
+          # nets.py: restart backoff + clean QUIT on SIGTERM (rolling updates
+          # part instead of ghost-flapping the nick).
+          command: ["python3", "-u", "/code/nets.py"]
           env:
             - {name: IRC_HOST, value: oc-mock-irc}
             - {name: IRC_PORT, value: "6667"}

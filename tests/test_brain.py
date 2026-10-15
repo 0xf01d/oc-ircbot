@@ -8,6 +8,8 @@ tail -> prompt_async -> SSE -> idle -> messages -> FIFO.
 """
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from unittest import mock
@@ -392,6 +394,19 @@ def test_registers_config_from_file(tmp_path, monkeypatch):
     assert brain.registers() == {"#d": "calm"}
     (tmp_path / "registers.json").write_text("not json")
     assert brain.registers() == {}
+
+
+def test_turn_knobs_and_dry_run_env_tunable(tmp_path):
+    # A free-tier model can turn for minutes: MAX_TURNS / TURN_TIMEOUT must
+    # stay env-tunable (hardcoding them made a slow turn an untouchable
+    # abort->wedge->reset loop), and BRAIN_DRY_RUN lets compose/k8s dry-run
+    # without editing the container command.
+    code = "import brain; print(brain.MAX_TURNS, brain.TURN_TIMEOUT, brain.DRY_RUN)"
+    env = dict(os.environ, BRAIN_MAX_TURNS="7", BRAIN_TURN_TIMEOUT="240.5",
+               BRAIN_DRY_RUN="1", BRAIN_WORKDIR=str(tmp_path))
+    out = subprocess.run([sys.executable, "-c", code], env=env, check=True,
+                         capture_output=True, text=True, timeout=30).stdout
+    assert out.split() == ["7", "240.5", "True"]
 
 
 def test_setup_workdir_installs_config_and_memory(tmp_path, monkeypatch):

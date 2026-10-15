@@ -6,7 +6,7 @@ import bot
 def test_split_say_short_is_verbatim():
     with mock.patch.object(bot, "send_raw") as sr:
         bot.split_say("#c", "  keep   spacing  ")
-    sr.assert_called_once_with("PRIVMSG #c :  keep   spacing  ")
+    sr.assert_called_once_with("PRIVMSG #c :  keep   spacing  ", None)
 
 
 def test_split_say_wraps_long_lines():
@@ -20,7 +20,7 @@ def test_split_say_wraps_long_lines():
 def test_process_cmd_say():
     with mock.patch.object(bot, "send_raw") as sr:
         bot.process_cmd("SAY #c hi there")
-    sr.assert_called_once_with("PRIVMSG #c :hi there")
+    sr.assert_called_once_with("PRIVMSG #c :hi there", None)
 
 
 def test_process_cmd_act_and_notice():
@@ -29,6 +29,66 @@ def test_process_cmd_act_and_notice():
         bot.process_cmd("NOTICE nick hello")
     assert sr.call_args_list[0].args[0] == "PRIVMSG #c :\x01ACTION waves\x01"
     assert sr.call_args_list[1].args[0] == "NOTICE nick :hello"
+
+
+def test_process_cmd_origin_tag_rides_the_line():
+    # The vjt sidecar contract: `VERB:<tag>` stamps the origin into the log
+    # and the wire, and must never degrade into an unknown verb (the simplify
+    # pass turned every `SAY:impiccato` from the existing sidecars into
+    # CMD_ERROR — that regression is what this test pins).
+    with mock.patch.object(bot, "send_raw") as sr:
+        bot.process_cmd("SAY:impiccato #c hi")
+    assert sr.call_args.args == ("PRIVMSG #c :hi", "impiccato")
+
+
+def test_process_cmd_bad_origin_tag_is_rejected_loudly():
+    with mock.patch.object(bot, "send_raw") as sr, \
+            mock.patch.object(bot, "emit") as em:
+        bot.process_cmd("SAY:bad.tag! #c hi")
+    sr.assert_not_called()
+    assert any(c.args[:2] == ("CMD_ERROR", "bad-origin-tag")
+               for c in em.call_args_list)
+
+
+def test_process_cmd_dcc_needs_nick_and_file():
+    with mock.patch.object(bot, "send_raw"), \
+            mock.patch.object(bot, "emit") as em:
+        bot.process_cmd("DCC")
+    assert any("DCC needs <nick> <file> [name]" in str(c.args)
+               for c in em.call_args_list)
+
+
+def test_dcc_send_transfers_the_file_over_loopback(tmp_path):
+    # Real offer + real transfer on 127.0.0.1: the CTCP announces an ephemeral
+    # port, the test plays the peer, and the bytes must arrive intact.
+    f = tmp_path / "artifact.txt"
+    payload = b"DCC payload \xe2\x9c\x93" * 5000  # > one 64 KiB-ish push
+    f.write_bytes(payload)
+    old = (bot.DCC_DIR, bot.DCC_BIND4, bot.DCC_ADDR4, bot.BIND)
+    try:
+        bot.DCC_DIR = str(tmp_path)
+        bot.DCC_BIND4 = "127.0.0.1"
+        bot.DCC_ADDR4 = "127.0.0.1"
+        bot.BIND = "127.0.0.1"
+        with mock.patch.object(bot, "send_raw") as sr:
+            bot.dcc_send("peer", "artifact.txt")
+        ctcp = sr.call_args.args[0]
+        assert "\x01DCC SEND artifact.txt " in ctcp
+        _pfx, port, size = ctcp.rstrip("\x01").split(" ")[-3:]
+        s = __import__("socket").create_connection(("127.0.0.1", int(port)),
+                                                   timeout=10)
+        got = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+            s.sendall(len(got).to_bytes(4, "big"))   # DCC ACK
+        s.close()
+        assert got == payload
+        assert int(size) == len(payload)
+    finally:
+        bot.DCC_DIR, bot.DCC_BIND4, bot.DCC_ADDR4, bot.BIND = old
 
 
 def test_process_cmd_unknown_verb_emits_error():
