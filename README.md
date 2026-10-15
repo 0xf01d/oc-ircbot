@@ -69,7 +69,7 @@ network shares one brain: `IRC_NETWORKS=azzurra,libera` (plus
 `events.<net>.log` and write `bot.send.<net>` per network. `nets.py` is the
 supervisor that mechanises it — one `bot.py` child per network, restart
 backoff on a dead child, and a clean `QUIT` through every FIFO on SIGTERM —
-and it is the container entrypoint (`Dockerfile.bot` CMD, k8s `bot`
+and it is the container entrypoint (`Dockerfile` `bot` target CMD, k8s `bot`
 containers): a rolling update parts the bot instead of ghost-flapping the
 nick. On a host, the `oc-ircbot-bot@.service` template unit runs one
 instance per network with the same effect.
@@ -281,7 +281,8 @@ Run the units locally with `python -m pytest tests -q`.
 - **Multi-network** is first-class: per-network bot processes, FIFOs and
   brain sessions (`networks.py`, `bot.trust.libera`,
   `oc-ircbot-bot@.service`).
-- **Packaging.** Dockerfiles + compose + `k8s/` alongside the original's
+- **Packaging.** One multi-stage `Dockerfile` (`--target` per image) + compose
+  + `k8s/` alongside the original's
   systemd approach (both shipped; the bot units grow a template and a clean
   QUIT on stop).
 - **One sidecar, not the zoo.** Only the watchdog was ported. The counters

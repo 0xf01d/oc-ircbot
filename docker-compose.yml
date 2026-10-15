@@ -16,7 +16,9 @@ services:
   bot:
     build:
       context: .
-      dockerfile: Dockerfile.bot
+      target: bot
+    # init: tini as PID 1 — reaps zombies, forwards SIGTERM (clean QUIT).
+    init: true
     image: oc-ircbot-bot
     environment:
       IRC_HOST: ${IRC_HOST:-irc.azzurra.chat}
@@ -38,7 +40,8 @@ services:
   brain:
     build:
       context: .
-      dockerfile: Dockerfile.brain
+      target: brain
+    init: true
     image: oc-ircbot-brain
     environment:
       OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
@@ -78,7 +81,8 @@ services:
   watchdog:
     build:
       context: .
-      dockerfile: Dockerfile.watchdog
+      target: watchdog
+    init: true
     image: oc-ircbot-watchdog
     # Share the brain's network namespace: serve is loopback-only, and this is
     # how the watchdog reaches it without ever widening the bind.
