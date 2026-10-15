@@ -336,7 +336,13 @@ def test_refusal_resets_the_session(tmp_path):
     try:
         w.say("[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY=hi")
         deadline = time.monotonic() + 10
-        while w.brain.total_refusals < 1 and time.monotonic() < deadline:
+        # Wait for the RESET to be fully done: the new session exists (the
+        # brain briefly holds sess=None mid-reset — never poke it there).
+        def reset_done():
+            s = w.brain.sess
+            return (w.brain.total_refusals >= 1 and s is not None
+                    and s.sid != "ses_stub000001")
+        while not reset_done() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert w.brain.total_refusals == 1
         # The old session was abandoned: a fresh one owns the conversation.
