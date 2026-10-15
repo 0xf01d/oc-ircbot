@@ -1,0 +1,128 @@
+# The bridge pod: brain (main) + watchdog (sidecar) + bot, sharing one
+# emptyDir mounted at /data. This is the same topology as the compose stack,
+# expressed as a single pod because emptyDir is pod-scoped and this namespace
+# cannot create PVCs. See k8s/README.md for the PVC-backed split.
+#
+# Code is mounted from the oc-ircbot-code ConfigMap (k8s/00-configmap.yaml),
+# so no image build is required: stock python:3.12-slim runs the scripts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-ircbot
+  namespace: hermes-generated-content
+  labels:
+    app: oc-ircbot
+    tier: bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oc-ircbot
+  template:
+    metadata:
+      labels:
+        app: oc-ircbot
+        tier: bridge
+    spec:
+      volumes:
+        - name: code
+          configMap:
+            name: oc-ircbot-code
+            defaultMode: 0555
+        - name: data
+          emptyDir: {}
+      # bot.py has no connect-retry (it dies and restarts, exactly as the
+      # original relies on systemd Restart=always). Wait for the mock first so
+      # the smoke run starts clean instead of burning a restart.
+      initContainers:
+        - name: wait-for-irc
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - >-
+              until python3 -c
+              "import socket;socket.create_connection(('oc-mock-irc',6667),2).close()"
+              2>/dev/null; do echo waiting for oc-mock-irc; sleep 1; done
+      containers:
+        # --- main container: the OpenCode monitor stand-in ------------------
+        - name: brain
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/brain.py"]
+          env:
+            - {name: BOT_EVENTS, value: /data/events.log}
+            - {name: BOT_FIFO, value: /data/bot.send}
+            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
+            - {name: IRC_NICK, value: ocbot}
+            # Stub seam. Remove/replace to use the real OpenCode CLI.
+            - {name: OC_BRAIN_CMD, value: "python3 /code/stub_brain.py"}
+            - {name: BRAIN_FROM_START, value: "1"}
+            - {name: BRAIN_POLL, value: "0.3"}
+            - {name: BRAIN_BATCH_WINDOW, value: "1.0"}
+            - {name: BRAIN_RATE, value: "0"}
+            - {name: BRAIN_GLOBAL_RATE, value: "0"}
+            # Optional: absent in stub mode, injected for a live run.
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oc-ircbot-secrets
+                  key: OPENCODE_API_KEY
+                  optional: true
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import os,sys,time;sys.exit(0 if time.time()-os.path.getmtime('/data/brain.heartbeat')<120 else 1)"
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+
+        # --- the brain-agnostic IRC bridge ----------------------------------
+        - name: bot
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/bot.py"]
+          env:
+            - {name: IRC_HOST, value: oc-mock-irc}
+            - {name: IRC_PORT, value: "6667"}
+            - {name: IRC_TLS, value: "0"}
+            - {name: IRC_NICK, value: ocbot}
+            - {name: IRC_IDENT, value: ocbot}
+            - {name: IRC_REAL, value: "github.com/0xf01d/oc-ircbot"}
+            - {name: BOT_LOG, value: /data/bot.log}
+            - {name: BOT_FIFO, value: /data/bot.send}
+            - {name: BOT_EVENTS, value: /data/events.log}
+            - {name: BOT_TRUST, value: /code/bot.trust}
+            - {name: BOT_RESERVED, value: /code/bot.reserved}
+            - {name: BOT_STARTUP, value: /code/bot.startup}
+            - {name: BOT_RESERVED_STORE, value: /data/reserved_recent.tsv}
+            - {name: BOT_ENV, value: /data/.env}
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+
+        # --- the one honest sidecar -----------------------------------------
+        - name: watchdog
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/watchdog.py"]
+          env:
+            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: WATCHDOG_POLL, value: "10"}
+            - {name: WATCHDOG_STALL, value: "30"}
+            - {name: WATCHDOG_MAX_STALLS, value: "3"}
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}

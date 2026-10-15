@@ -1,0 +1,105 @@
+# Production split: the bot as its own Deployment, the brain+watchdog as a
+# second Deployment, sharing a ReadWriteMany PVC. This is NOT applied on the
+# restricted namespace (PVCs are forbidden there); it is the layout to use
+# when a shared volume exists. The bot-stays-brain-agnostic rule is identical.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oc-ircbot-data
+  namespace: hermes-generated-content
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-bot
+  namespace: hermes-generated-content
+  labels: {app: oc-bot}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: oc-bot}
+  template:
+    metadata:
+      labels: {app: oc-bot}
+    spec:
+      volumes:
+        - {name: code, configMap: {name: oc-ircbot-code, defaultMode: 0555}}
+        - {name: data, persistentVolumeClaim: {claimName: oc-ircbot-data}}
+      containers:
+        - name: bot
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/bot.py"]
+          env:
+            - {name: IRC_HOST, value: oc-mock-irc}
+            - {name: IRC_PORT, value: "6667"}
+            - {name: IRC_TLS, value: "0"}
+            - {name: IRC_NICK, value: ocbot}
+            - {name: BOT_LOG, value: /data/bot.log}
+            - {name: BOT_FIFO, value: /data/bot.send}
+            - {name: BOT_EVENTS, value: /data/events.log}
+            - {name: BOT_TRUST, value: /code/bot.trust}
+            - {name: BOT_RESERVED, value: /code/bot.reserved}
+            - {name: BOT_STARTUP, value: /code/bot.startup}
+            - {name: BOT_RESERVED_STORE, value: /data/reserved_recent.tsv}
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-brain
+  namespace: hermes-generated-content
+  labels: {app: oc-brain}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: oc-brain}
+  template:
+    metadata:
+      labels: {app: oc-brain}
+    spec:
+      volumes:
+        - {name: code, configMap: {name: oc-ircbot-code, defaultMode: 0555}}
+        - {name: data, persistentVolumeClaim: {claimName: oc-ircbot-data}}
+      containers:
+        - name: brain
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/brain.py"]
+          env:
+            - {name: BOT_EVENTS, value: /data/events.log}
+            - {name: BOT_FIFO, value: /data/bot.send}
+            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+            - {name: BRAIN_MODEL, value: opencode/deepseek-v4.1-flash-free}
+            - {name: IRC_NICK, value: ocbot}
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oc-ircbot-secrets
+                  key: OPENCODE_API_KEY
+                  optional: true
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import os,sys,time;sys.exit(0 if time.time()-os.path.getmtime('/data/brain.heartbeat')<120 else 1)"
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 4
+        - name: watchdog
+          image: python:3.12-slim
+          command: ["python3", "-u", "/code/watchdog.py"]
+          env:
+            - {name: BRAIN_HEARTBEAT, value: /data/brain.heartbeat}
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
