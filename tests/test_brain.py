@@ -737,3 +737,29 @@ def test_demote_aborts_stuck_turn(tmp_path):
     assert b.model == ("opencode", "cat-jam-free")
     assert b.api.abort.called
     assert sess.busy_since is None
+
+
+def test_probe_promotes_when_best_recovers(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model = ("opencode", "cat-jam-free")
+    b.model_ladder = [("opencode", "longcat-2.5-preview-free")]
+    b._probe_next = 0.0
+    b._probe_state = "waiting"
+    b._probe_sid = "probe1"
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.api = mock.Mock()
+    b.api.messages.return_value = [{"role": "assistant"}]
+    b._probe_best(sess)
+    assert b.model == ("opencode", "longcat-2.5-preview-free")
+    assert b.model_ladder == []
+
+
+def test_probe_gated_by_time(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model = ("opencode", "cat-jam-free")
+    b.model_ladder = [("opencode", "longcat-2.5-preview-free")]
+    b._probe_next = time.monotonic() + 9999
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.api = mock.Mock()
+    b._probe_best(sess)
+    assert not b.api.prompt_async.called

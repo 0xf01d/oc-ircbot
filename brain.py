@@ -55,6 +55,7 @@ API_KEY = env("OPENCODE_API_KEY", "")
 
 OPENCODE_BIN = "opencode"
 BATCH_MAX = 5          # submit a batch once it grows this big
+PROBE_SECS = float(env("BRAIN_PROBE_SECS", "300"))  # best-model probe cadence
 # Nothing is ever dropped for being late (vjt's model: the writer queues, the
 # agent catches up) — a large backlog is only announced, loudly, here and in
 # agent.status.
@@ -386,6 +387,9 @@ class Brain:
                              if m.strip()]
         self._demoted_stack = []           # models climbed down from
         self._clean_turns = 0
+        self._probe_sid = None             # side session for best-model probes
+        self._probe_state = None           # None | 'waiting' | sid
+        self._probe_next = 0.0             # monotonic clock gate
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
@@ -790,6 +794,53 @@ class Brain:
         self._demoted_stack.pop()
         self._clean_turns = 0
 
+    # -- best-model probe --------------------------------------------------------------
+    def _probe_best(self, sess):
+        """While degraded, poke the best (top-of-ladder) model on a side
+        session every BRAIN_PROBE_SECS — chat traffic is never touched.
+        A completed turn with no retry means the best is alive again:
+        promote and drop the probe session."""
+        best = self.model_ladder[0] if self.model_ladder else None
+        if best is None or best == self.model:
+            return
+        now = time.monotonic()
+        if now < self._probe_next:
+            return
+        self._probe_next = now + PROBE_SECS
+        if self._probe_state == "waiting":
+            # a probe turn is out; check whether it finished cleanly
+            try:
+                msgs = self.api.messages(self._probe_sid)
+            except OSError:
+                return
+            last = msgs[-1] if msgs else None
+            if last and last.get("role") == "assistant":
+                emit("MODEL_PROMOTED", sess.title,
+                     f"model={best[0]}/{best[1]} (probe ok)")
+                self.model_ladder.pop(0)
+                self._demoted_stack.append(self.model)
+                self.model = best
+                self._clean_turns = 0
+                try:
+                    self.api.abort(self._probe_sid)  # silence leftovers
+                except OSError:
+                    pass
+                self._probe_sid, self._probe_state = None, None
+            return
+        # start a fresh probe turn
+        try:
+            if self._probe_sid is None:
+                self._probe_sid = self.api.create_session("irc:probe")["id"]
+            self.api.prompt_async(self._probe_sid,
+                                  "reply with: SAY #probe pong",
+                                  model=best)
+            self._probe_state = "waiting"
+            emit("MODEL_PROBE", sess.title, f"model={best[0]}/{best[1]}")
+        except OSError as e:
+            # refused to even start = still quota-dead; keep waiting
+            self._probe_sid, self._probe_state = None, None
+            emit("MODEL_PROBE_FAIL", sess.title, repr(e)[:80])
+
     # -- watchdog plumbing --------------------------------------------------------------
     def heartbeat(self):
         self.loop_count += 1
@@ -840,6 +891,8 @@ class Brain:
                     self.feed(net_name, policy.parse_event(line))
             if self.sess is not None and self.due(self.sess):
                 self.submit(self.sess)
+            if not self.dry_run and self.sess is not None:
+                self._probe_best(self.sess)
             self.guard_tick()
             # Managed serve died: respawn, then drop session state so the
             # session re-attaches against the new server.
