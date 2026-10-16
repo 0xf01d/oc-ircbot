@@ -494,15 +494,17 @@ def test_dispatch_routes_each_line_to_its_network(tmp_path):
     assert routed[nets[1].fifo] == ["ACT #help waves", "QUIT bye"]
 
 
-def test_dispatch_drops_unknown_net_loudly(tmp_path, capsys):
+def test_dispatch_single_net_routes_wrong_or_missing_net_home(tmp_path, capsys):
+    """Single network: unknown net name (or no net at all) routes home —
+    the model can't be trusted to echo the label, and vjt's bot never
+    dropped a line for that."""
     b, _nets = _bare_brain(tmp_path)
     sess = brain.Session("s1", "irc:global", "sys")
     b.sess = sess
     with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
         b.dispatch(sess, "SAY nosuch|#c hi\nSAY #c no-net\nSAY irc|#ok fine")
-        assert wf.call_args.args[0] == ["SAY #ok fine"]
-    out = capsys.readouterr().out
-    assert out.count("ROUTE_ERROR") == 2
+        assert wf.call_args.args[0] == [
+            "SAY #c hi", "SAY #c no-net", "SAY #ok fine"]
 
 
 def test_dispatch_bare_quit_single_network(tmp_path):
