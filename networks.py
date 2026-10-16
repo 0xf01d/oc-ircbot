@@ -21,7 +21,8 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/data"
-NETWORKS_FILE = os.path.join(HERE, "networks.json")
+NETWORKS_FILE = os.environ.get("NETWORKS_FILE",
+                               os.path.join(HERE, "networks.json"))
 
 
 class Net:
