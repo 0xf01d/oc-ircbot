@@ -598,14 +598,14 @@ class Brain:
                     emit("ROUTE_ERROR", sess.title, "bare QUIT, many networks")
                 continue
             net_name, sep, arg = raw.partition("|")
-            if not sep and len(self.nets) == 1:
-                net_name, sep = self.nets[0].name, True  # single-net: bare target ok
-            if not sep or net_name not in self.net_by_name:
-                if len(self.nets) == 1:
-                    net_name = self.nets[0].name  # wrong-name single-net: route home
-                else:
-                    emit("ROUTE_ERROR", sess.title, repr(raw[:80]))
-                    continue
+            if len(self.nets) == 1:
+                # single network: the net label is noise — accept it bare,
+                # wrong, or missing, and route home (vjt drops nothing).
+                if not sep:
+                    arg = raw
+                net_name = self.nets[0].name
+            elif not sep or net_name not in self.net_by_name:
+                emit("ROUTE_ERROR", sess.title, repr(raw[:80]))
                 continue
             nick = self._net_nick(net_name)
             head, _, tail = arg.partition(" ")
