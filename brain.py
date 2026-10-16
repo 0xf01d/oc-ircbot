@@ -757,6 +757,18 @@ class Brain:
                 self._clean_turns = 0          # promo clock restarts
                 emit("MODEL_DEMOTED", sess.title,
                      f"model={nxt[0]}/{nxt[1]}")
+                # The stuck turn is still riding the dead model's retry
+                # loop — kill it now so the next submit goes out on the
+                # new model immediately instead of wedging for WEDGED s.
+                if self.api is not None:
+                    try:
+                        self.api.abort(sess.sid)
+                        with self.lock:
+                            sess.busy_since = None
+                        emit("ABORT_SENT", sess.title,
+                             "quota-retry, switch models")
+                    except OSError as e:
+                        emit("ABORT_ERROR", sess.title, repr(e))
                 return
 
     def _note_clean_turn(self, sess):

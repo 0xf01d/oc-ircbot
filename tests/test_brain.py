@@ -724,3 +724,16 @@ def test_no_promote_before_threshold(tmp_path):
     for _ in range(5):
         b._note_clean_turn(sess)
     assert b.model == ("opencode", "cat-jam-free")
+
+
+def test_demote_aborts_stuck_turn(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.model_ladder = [("opencode", "cat-jam-free")]
+    b.model = ("opencode", "longcat-2.5-preview-free")
+    sess = brain.Session("s1", "irc:global", "sys")
+    sess.busy_since = 123.0
+    b._demote_model(sess, "Free usage exceeded, subscribe to Go")
+    assert b.model == ("opencode", "cat-jam-free")
+    assert b.api.abort.called
+    assert sess.busy_since is None
