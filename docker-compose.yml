@@ -25,7 +25,7 @@ services:
       IRC_PORT: ${IRC_PORT:-6697}
       IRC_NICK: ${IRC_NICK:-vjt-claude}
       IRC_IDENT: ${IRC_IDENT:-claude}
-      IRC_REAL: ${IRC_REAL:-github.com/0xf01d/oc-ircbot}
+      IRC_REAL: ${IRC_REAL:-ocbot}
       IRC_BIND: ${IRC_BIND:-}
       IRC_TLS: ${IRC_TLS:-1}
       IRC_TLS_VERIFY: ${IRC_TLS_VERIFY:-1}

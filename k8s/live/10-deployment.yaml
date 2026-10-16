@@ -92,7 +92,7 @@ spec:
             - {name: IRC_TLS_VERIFY, value: "1"}
             - {name: IRC_NICK, value: ocbot}
             - {name: IRC_IDENT, value: ocbot}
-            - {name: IRC_REAL, value: "github.com/0xf01d/oc-ircbot"}
+            - {name: IRC_REAL, value: "ocbot"}
             - {name: BOT_TRUST, value: /conf/bot.trust}
             - {name: BOT_RESERVED, value: /conf/bot.reserved}
             - {name: BOT_STARTUP, value: /conf/bot.startup}
