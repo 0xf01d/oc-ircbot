@@ -701,3 +701,26 @@ def test_demote_ignores_other_retries(tmp_path):
     sess = brain.Session("s1", "irc:global", "sys")
     b._demote_model(sess, "stream error: connection reset")
     assert b.model == ("opencode", "longcat-2.5-preview-free")
+
+
+def test_promote_back_after_clean_turns(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model = ("opencode", "cat-jam-free")
+    b._demoted_stack = [("opencode", "longcat-2.5-preview-free")]
+    b._clean_turns = 0
+    sess = brain.Session("s1", "irc:global", "sys")
+    for _ in range(20):
+        b._note_clean_turn(sess)
+    assert b.model == ("opencode", "longcat-2.5-preview-free")
+    assert b._demoted_stack == []
+
+
+def test_no_promote_before_threshold(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model = ("opencode", "cat-jam-free")
+    b._demoted_stack = [("opencode", "longcat-2.5-preview-free")]
+    b._clean_turns = 0
+    sess = brain.Session("s1", "irc:global", "sys")
+    for _ in range(5):
+        b._note_clean_turn(sess)
+    assert b.model == ("opencode", "cat-jam-free")

@@ -384,6 +384,8 @@ class Brain:
         ladder = os.environ.get("BRAIN_MODEL_LADDER", "")
         self.model_ladder = [split_model(m) for m in ladder.split(",")
                              if m.strip()]
+        self._demoted_stack = []           # models climbed down from
+        self._clean_turns = 0
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
@@ -562,6 +564,7 @@ class Brain:
         with self.lock:
             sess.busy_since = None
         self.record_turn(sess, text)
+        self._note_clean_turn(sess)
         self.dispatch(sess, text)
         # Monitor queueing: the next due batch goes out now.
         if self.due(sess):
@@ -749,10 +752,31 @@ class Brain:
         while self.model_ladder:
             nxt = self.model_ladder.pop(0)
             if nxt is not None and nxt != self.model:
+                self._demoted_stack.append(self.model)
                 self.model = nxt
+                self._clean_turns = 0          # promo clock restarts
                 emit("MODEL_DEMOTED", sess.title,
                      f"model={nxt[0]}/{nxt[1]}")
                 return
+
+    def _note_clean_turn(self, sess):
+        """A completed turn with no retry: count it; after PROMOTE_AFTER
+        clean turns on a demoted model, probe the previous (better) model
+        with one real turn — if it no longer errors, climb back up."""
+        target = os.environ.get("BRAIN_PROMOTE_AFTER", "20")
+        try:
+            need = max(2, int(target))
+        except ValueError:
+            need = 20
+        self._clean_turns = getattr(self, "_clean_turns", 0) + 1
+        if self._clean_turns < need or not self._demoted_stack:
+            return
+        prev = self._demoted_stack[-1]
+        emit("MODEL_PROMOTE_TRY", sess.title,
+             f"model={prev[0]}/{prev[1]}")
+        self.model = prev
+        self._demoted_stack.pop()
+        self._clean_turns = 0
 
     # -- watchdog plumbing --------------------------------------------------------------
     def heartbeat(self):
