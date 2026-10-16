@@ -94,7 +94,7 @@ def setup_workdir():
     """
     os.makedirs(WORKDIR, exist_ok=True)
     cfg_path = os.path.join(WORKDIR, "opencode.json")
-    if not os.path.exists(cfg_path):
+    if True:  # always reinstall: the image copy may be stale (permission drift)
         here = os.path.dirname(os.path.abspath(__file__))
         try:
             with open(os.path.join(here, "opencode.json")) as f:
