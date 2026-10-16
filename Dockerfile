@@ -47,7 +47,7 @@ FROM node:22-slim AS brain
 # serve-bind check (`/app/tests/...`) finds nothing.
 WORKDIR /app
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 ca-certificates tmux \
+ && apt-get install -y --no-install-recommends python3 ca-certificates tmux openssh-client \
  && rm -rf /var/lib/apt/lists/*
 # The OpenCode CLI (Node package). Pulls its own binary at install time.
 RUN npm install -g opencode-ai
