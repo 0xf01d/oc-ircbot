@@ -683,3 +683,21 @@ def test_archive_trim_runs_at_brain_start(tmp_path, monkeypatch):
     brain.setup_workdir()
     assert "ancient" not in mem.read(memory_log.ACTIVITY_LOG)
     assert "ancient" in mem.read(memory_log.ACTIVITY_ARCHIVE)
+
+
+def test_demote_model_on_quota_retry(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model_ladder = [("opencode", "cat-jam-free")]
+    b.model = ("opencode", "longcat-2.5-preview-free")
+    sess = brain.Session("s1", "irc:global", "sys")
+    b._demote_model(sess, "Free usage exceeded, subscribe to Go")
+    assert b.model == ("opencode", "cat-jam-free")
+
+
+def test_demote_ignores_other_retries(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.model_ladder = [("opencode", "cat-jam-free")]
+    b.model = ("opencode", "longcat-2.5-preview-free")
+    sess = brain.Session("s1", "irc:global", "sys")
+    b._demote_model(sess, "stream error: connection reset")
+    assert b.model == ("opencode", "longcat-2.5-preview-free")

@@ -377,6 +377,13 @@ class Brain:
         self.total_wedges = 0
         self.registers = registers()
         self.model = split_model(MODEL)
+        # Model ladder: free-tier quotas burn out mid-flight, so when the
+        # server reports a quota/rate/disabled retry we walk down the
+        # ladder per-request (prompt_async takes model each turn — no
+        # redeploy, no serve restart, the session stays warm).
+        ladder = os.environ.get("BRAIN_MODEL_LADDER", "")
+        self.model_ladder = [split_model(m) for m in ladder.split(",")
+                             if m.strip()]
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
@@ -710,8 +717,9 @@ class Brain:
             if sess is not None and sess.sid == props.get("sessionID"):
                 status = props.get("status") or {}
                 if status.get("type") == "retry":
-                    emit("SESSION_RETRY", sess.title,
-                         str(status.get("message", ""))[:120])
+                    msg = str(status.get("message", ""))
+                    emit("SESSION_RETRY", sess.title, msg[:120])
+                    self._demote_model(sess, msg)
                 elif status.get("type") == "busy":
                     sess.busy_since = sess.busy_since or time.monotonic()
         elif etype == "session.error":
@@ -724,6 +732,27 @@ class Brain:
             emit("COMPACTED", sess.title if sess and
                  sess.sid == props.get("sessionID")
                  else str(props.get("sessionID", "")))
+
+    # -- model ladder ---------------------------------------------------------------
+    _QUOTA_HINTS = ("free usage exceeded", "rate limit", "quota",
+                    "access is disabled", "subscription")
+
+    def _demote_model(self, sess, retry_msg):
+        """On a quota/rate retry walk one rung down BRAIN_MODEL_LADDER and
+        swap self.model in place — the next turn rides the new model with
+        no redeploy and no serve restart."""
+        low = retry_msg.lower()
+        if not any(h in low for h in self._QUOTA_HINTS):
+            return
+        if not self.model_ladder:
+            return
+        while self.model_ladder:
+            nxt = self.model_ladder.pop(0)
+            if nxt is not None and nxt != self.model:
+                self.model = nxt
+                emit("MODEL_DEMOTED", sess.title,
+                     f"model={nxt[0]}/{nxt[1]}")
+                return
 
     # -- watchdog plumbing --------------------------------------------------------------
     def heartbeat(self):
