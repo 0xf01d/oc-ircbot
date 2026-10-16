@@ -7,7 +7,8 @@ import networks
 def test_implicit_single_network_uses_env_paths():
     base = {"BOT_EVENTS": "/d/events.log", "BOT_FIFO": "/d/bot.send",
             "BOT_LOG": "/d/bot.log"}
-    nets = networks.load(data_dir="/d", base_env=base)
+    nets = networks.load(data_dir="/d", base_env=base,
+                         overrides_path="/nonexistent.json")
     assert len(nets) == 1
     n = nets[0]
     assert n.name == "irc"
@@ -17,11 +18,23 @@ def test_implicit_single_network_uses_env_paths():
 
 
 def test_implicit_single_network_defaults():
-    nets = networks.load(data_dir="/d", base_env={})
+    nets = networks.load(data_dir="/d", base_env={},
+                         overrides_path="/nonexistent.json")
     n = nets[0]
     assert n.events == "/d/events.log"
     assert n.fifo == "/d/bot.send"
     assert n.log == "/d/bot.log"
+
+
+def test_json_only_networks_added_at_runtime(tmp_path):
+    """networks.json may DEFINE networks: adding a block is enough, no env
+    change, no restart of the running bots (nets.py reconciles hot)."""
+    p = tmp_path / "networks.json"
+    p.write_text('{"libera": {"IRC_HOST": "irc.libera.chat"}}')
+    nets = networks.load(data_dir="/d", base_env={}, overrides_path=str(p))
+    assert [n.name for n in nets] == ["libera"]
+    assert nets[0].env["IRC_HOST"] == "irc.libera.chat"
+    assert nets[0].events == "/d/events.libera.log"
 
 
 def test_irc_networks_derive_labelled_paths():

@@ -876,9 +876,17 @@ class Brain:
             self.api = None
         tailers = [(n.name, Tailer(n.events, from_start=FROM_START))
                    for n in self.nets]
+        known = {name for name, _ in tailers}
         threading.Thread(target=self.sse_loop, daemon=True).start()
         while not self.stop_flag:
             self.heartbeat()
+            # hot reconfig: networks.json on /data may add networks
+            for n in networks.load():
+                if n.name not in known:
+                    known.add(n.name)
+                    self.net_by_name[n.name] = n
+                    tailers.append((n.name, Tailer(n.events)))
+                    emit("NET_ADDED", n.name, f"events={n.events}")
             for net_name, tail in tailers:
                 for line in tail.read_new():
                     self.feed(net_name, policy.parse_event(line))

@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from functools import partial
 
@@ -122,6 +123,34 @@ def main():
         time.sleep(1)
         for b in bots:
             b.poll()
+        # Hot reconfig: networks.json on the PVC is the source of truth.
+        # New labels spawn without touching running bots; removed labels
+        # get a clean QUIT through their FIFO, then a kill after grace.
+        current = {b.net.name: b for b in bots}
+        want = networks.load()
+        want_names = {n.name for n in want}
+        for n in want:
+            if n.name not in current:
+                nb = NetBot(n)
+                nb.spawn()
+                bots.append(nb)
+                emit("NET_ADDED", n.name, f"host={n.env.get('IRC_HOST', '?')}")
+        for name, b in list(current.items()):
+            if name not in want_names:
+                bots.remove(b)
+                try:
+                    fd = os.open(b.net.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    os.write(fd, b"QUIT :network removed\n")
+                    os.close(fd)
+                except OSError:
+                    pass
+                emit("NET_REMOVED", name)
+
+                def _kill(proc=b.proc, wait=QUIT_GRACE):
+                    time.sleep(wait)
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                threading.Thread(target=_kill, daemon=True).start()
 
 
 if __name__ == "__main__":

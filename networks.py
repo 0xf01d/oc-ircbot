@@ -78,9 +78,14 @@ def load(data_dir=None, overrides_path=None, base_env=None):
     implicit network `irc` from the environment's BOT_* paths."""
     base_env = base_env if base_env is not None else os.environ
     data_dir = data_dir or DATA_DIR
-    overrides = load_overrides(overrides_path)
+    defined = load_overrides(overrides_path)      # may also DEFINE networks
     raw = (base_env.get("IRC_NETWORKS") or "").replace(",", " ").split()
     if not raw:
+        raw = sorted(k for k in defined
+                     if isinstance(defined[k], dict)
+                     and "IRC_HOST" in defined[k])   # json-only networks
+    labels = list(dict.fromkeys(raw))
+    if not labels:
         return [Net(
             "irc",
             base_env.get("BOT_EVENTS", os.path.join(data_dir, "events.log")),
@@ -88,5 +93,5 @@ def load(data_dir=None, overrides_path=None, base_env=None):
             base_env.get("BOT_LOG", os.path.join(data_dir, "bot.log")),
             dict(base_env),
         )]
-    return [net_for(label, data_dir, overrides.get(label, {}), base_env)
-            for label in raw]
+    return [net_for(label, data_dir, defined.get(label, {}), base_env)
+            for label in labels]
