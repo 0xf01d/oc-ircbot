@@ -389,6 +389,7 @@ class Brain:
         self._clean_turns = 0
         self._probe_sid = None             # side session for best-model probes
         self._probe_state = None           # None | 'waiting' | sid
+        self._probe_model = None           # model the current probe rides
         self._probe_next = 0.0             # monotonic clock gate
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
@@ -796,12 +797,12 @@ class Brain:
 
     # -- best-model probe --------------------------------------------------------------
     def _probe_best(self, sess):
-        """While degraded, poke the best (top-of-ladder) model on a side
-        session every BRAIN_PROBE_SECS — chat traffic is never touched.
-        A completed turn with no retry means the best is alive again:
-        promote and drop the probe session."""
-        best = self.model_ladder[0] if self.model_ladder else None
-        if best is None or best == self.model:
+        """While degraded, poke EVERY model above the current one, starting
+        from the best, on a side session every BRAIN_PROBE_SECS — chat
+        traffic is never touched. First model that completes a turn
+        without retry wins: everything above it falls off the ladder and
+        we promote it (chat rides the strongest live model)."""
+        if not self.model_ladder:
             return
         now = time.monotonic()
         if now < self._probe_next:
@@ -815,31 +816,48 @@ class Brain:
                 return
             last = msgs[-1] if msgs else None
             if last and last.get("role") == "assistant":
+                winner = self._probe_model
+                # everything above the winner is quota-dead: drop it
+                idx = self.model_ladder.index(winner)
+                dead = self.model_ladder[:idx]
+                self.model_ladder = self.model_ladder[idx + 1:]
                 emit("MODEL_PROMOTED", sess.title,
-                     f"model={best[0]}/{best[1]} (probe ok)")
-                self.model_ladder.pop(0)
+                     f"model={winner[0]}/{winner[1]} (probe ok)",
+                     f"skipped={len(dead)}")
+                self._demoted_stack.extend(dead)
                 self._demoted_stack.append(self.model)
-                self.model = best
+                self.model = winner
                 self._clean_turns = 0
                 try:
                     self.api.abort(self._probe_sid)  # silence leftovers
                 except OSError:
                     pass
                 self._probe_sid, self._probe_state = None, None
+                self._probe_model = None
+            else:
+                # winner still wedged in retry: move on to the next model
+                self._probe_state = None
+                self._probe_model = None
             return
-        # start a fresh probe turn
+        # start a fresh probe turn on the next candidate (top-down)
+        cand = self.model_ladder[0]
         try:
             if self._probe_sid is None:
                 self._probe_sid = self.api.create_session("irc:probe")["id"]
             self.api.prompt_async(self._probe_sid,
                                   "reply with: SAY #probe pong",
-                                  model=best)
+                                  model=cand)
+            self._probe_model = cand
             self._probe_state = "waiting"
-            emit("MODEL_PROBE", sess.title, f"model={best[0]}/{best[1]}")
+            emit("MODEL_PROBE", sess.title,
+                 f"model={cand[0]}/{cand[1]}")
         except OSError as e:
-            # refused to even start = still quota-dead; keep waiting
+            # refused to even start = still quota-dead: rotate it out and
+            # let the next loop iteration probe the following model
+            self.model_ladder.append(self.model_ladder.pop(0))
             self._probe_sid, self._probe_state = None, None
-            emit("MODEL_PROBE_FAIL", sess.title, repr(e)[:80])
+            emit("MODEL_PROBE_FAIL", sess.title,
+                 f"model={cand[0]}/{cand[1]}", repr(e)[:60])
 
     # -- watchdog plumbing --------------------------------------------------------------
     def heartbeat(self):
