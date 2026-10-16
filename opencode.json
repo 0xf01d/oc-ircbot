@@ -1,6 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": ["memory/MEMORY.md"],
+  "instructions": [
+    "memory/MEMORY.md"
+  ],
   "compaction": {
     "auto": true,
     "prune": true,
@@ -12,16 +14,16 @@
     "grep": "allow",
     "list": "allow",
     "edit": {
-      "**": "deny",
-      "memory/**": "allow"
+      "**": "allow",
+      "/data/secrets/**": "deny"
     },
     "write": {
-      "**": "deny",
-      "memory/**": "allow"
+      "**": "allow",
+      "/data/secrets/**": "deny"
     },
-    "bash": "deny",
-    "webfetch": "deny",
-    "task": "deny",
-    "external_directory": "deny"
+    "bash": "allow",
+    "webfetch": "allow",
+    "task": "allow",
+    "external_directory": "allow"
   }
 }

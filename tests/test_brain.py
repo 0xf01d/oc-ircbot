@@ -658,7 +658,7 @@ def test_setup_workdir_installs_config_and_memory(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "MEMORY_DIR", str(tmp_path / "memory"))
     mem = brain.setup_workdir()
     cfg = json.load(open(tmp_path / "opencode.json"))
-    assert cfg["permission"]["bash"] == "deny"
+    assert cfg["permission"]["bash"] == "allow"  # full agent: capability-first, safety at transport
     assert cfg["instructions"] == ["memory/MEMORY.md"]
     assert cfg == json.load(open(os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
