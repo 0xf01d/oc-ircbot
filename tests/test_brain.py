@@ -744,7 +744,6 @@ def test_probe_promotes_when_best_recovers(tmp_path):
     b.model = ("opencode", "cat-jam-free")
     b.model_ladder = [("opencode", "longcat-2.5-preview-free")]
     b._probe_next = 0.0
-    b._probe_state = "waiting"
     b._probe_sid = "probe1"
     b._probe_model = ("opencode", "longcat-2.5-preview-free")
     sess = brain.Session("s1", "irc:global", "sys")
@@ -772,7 +771,6 @@ def test_probe_skips_dead_and_promotes_first_alive(tmp_path):
     b.model_ladder = [("opencode", "longcat-2.5-preview-free"),
                       ("opencode", "cat-jam-free")]
     b._probe_next = 0.0
-    b._probe_state = "waiting"
     b._probe_sid = "probe1"
     b._probe_model = ("opencode", "cat-jam-free")  # longcat dead, cat-jam ok
     sess = brain.Session("s1", "irc:global", "sys")
