@@ -367,6 +367,7 @@ class Brain:
         self.dry_run = dry_run
         self.nets = nets if nets is not None else networks.load()
         self.net_by_name = {n.name: n for n in self.nets}
+        self._nicks = {}                   # net -> actual nick (fallback-aware)
         self.mem = mem
         self.api = None
         self.serve = None
@@ -396,6 +397,8 @@ class Brain:
 
     # -- session management -----------------------------------------------------
     def _net_nick(self, net_name):
+        if net_name in self._nicks:            # learned from NICK_FALLBACK
+            return self._nicks[net_name]
         net = self.net_by_name.get(net_name)
         return net.env.get("IRC_NICK", NICK) if net else NICK
 
@@ -505,6 +508,9 @@ class Brain:
         if sess is None:
             return
         nick = self._net_nick(net_name)
+        if ev.get("kind") == "NICK_FALLBACK":
+            self._nicks[net_name] = (ev.get("raw").split()[-1]
+                                     if ev.get("raw") else "")
         if (ev.get("from") or "").lower() == nick.lower():
             return                        # our own lines do not exist
         ev["net"] = net_name

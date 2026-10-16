@@ -780,3 +780,20 @@ def test_probe_skips_dead_and_promotes_first_alive(tmp_path):
     assert b.model == ("opencode", "cat-jam-free")
     assert b.model_ladder == []
     assert ("opencode", "longcat-2.5-preview-free") in b._demoted_stack
+
+
+def test_learned_fallback_nick_addressed(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    b.feed("hackint", policy.parse_event(
+        "[04:33] NICK_FALLBACK ocbot-980"))
+    assert b._net_nick("hackint") == "ocbot-980"
+    b.feed("hackint", policy.parse_event(
+        "[04:43] MSG TRUSTED FROM=katia HOST=h TO=#katia-ab "
+        "BODY=ocbot-980, ping"))
+    b.api = mock.Mock()
+    with mock.patch.object(brain, "write_fifo", return_value=1):
+        b.submit(sess)
+    # the batch must contain the addressed event (no crash, pending drained)
+    assert sess.pending == []
