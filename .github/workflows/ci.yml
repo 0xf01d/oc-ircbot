@@ -26,6 +26,10 @@ jobs:
           BRAIN_WORKDIR: ${{ runner.temp }}/workspace
           BRAIN_HEARTBEAT: ${{ runner.temp }}/brain.heartbeat
           BRAIN_AGENT_STATUS: ${{ runner.temp }}/agent.status
+          # the repo's own networks.json defines label-nets whose events files
+          # are not the smoke's BOT_EVENTS: point the loader at nothing so the
+          # single implicit `irc` net reads the smoke's event file.
+          NETWORKS_FILE: ${{ runner.temp }}/no-networks.json
         run: |
           printf '[12:00] MSG TRUSTED FROM=alice HOST=h TO=#test BODY=hi\n' \
             > "$BOT_EVENTS"
