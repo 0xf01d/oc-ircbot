@@ -52,6 +52,10 @@ MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
              if c.strip())                     # chan_filter.awk port
 ADDRESS_ONLY = env_bool("BRAIN_ADDRESS_ONLY")
 API_KEY = env("OPENCODE_API_KEY", "")
+# !stats: instant telemetry reply to TRUSTED users, no model turn. The brain
+# answers itself over the net's FIFO — latency, tokens, tps, model, quota
+# state — data straight from the opencode API's own per-message records.
+STATS_CMD = env("BRAIN_STATS_CMD", "!stats")
 
 OPENCODE_BIN = "opencode"
 BATCH_MAX = 5          # submit a batch once it grows this big
@@ -331,7 +335,8 @@ class Tailer:
 # --- the one session ----------------------------------------------------------
 class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
-                 "wedges", "refusals", "pending", "last_count")
+                 "wedges", "refusals", "pending", "last_count",
+                 "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -343,6 +348,11 @@ class Session:
         self.refusals = 0
         self.pending = []                  # (fed_monotonic, event)
         self.last_count = 0                # messages already collected
+        self.lat_ms = None                 # last turn's first-token→end latency
+        self.out_tokens = 0                # last turn's output tokens
+        self.tps = None                    # last turn's output tokens/sec
+        self.model_id = None               # last turn's model
+        self.prompt_ts = None              # monotonic when submit() fired
 
 
 def last_assistant_text(messages):
@@ -516,6 +526,16 @@ class Brain:
         ev["net"] = net_name
         if not policy.wakes_model(ev, nick, ADDRESS_ONLY):
             return
+        # !stats: trusted users get telemetry straight from the brain — no
+        # model turn, no batch, the answer rides the FIFO right now.
+        body = (ev.get("body") or "").strip().lower()
+        if (ev.get("kind") == "MSG" and body == STATS_CMD
+                and ev.get("trust") == "TRUSTED"):
+            with self.lock:
+                sess2 = self.ensure_session()
+                if sess2 is not None:
+                    self.stats_reply(sess2, ev)
+            return
         with self.lock:
             sess.pending.append((time.monotonic(), ev))
             depth = len(sess.pending)
@@ -557,9 +577,53 @@ class Brain:
             return
         with self.lock:
             sess.busy_since = time.monotonic()
+            sess.prompt_ts = sess.busy_since
         emit("PROMPT_SENT", sess.title, f"events={len(batch)}")
 
     # -- collect ----------------------------------------------------------------------
+    def _note_metrics(self, sess, msgs):
+        """Pull the finished assistant turn's real numbers from the API's own
+        record: wall latency (created→completed), output tokens, tps, model."""
+        for msg in reversed(msgs):
+            info = msg.get("info", {})
+            if info.get("role") != "assistant":
+                continue
+            t = info.get("time") or {}
+            tok = info.get("tokens") or {}
+            if not t.get("completed"):
+                break                       # still streaming, skip
+            created, done = t.get("created"), t["completed"]
+            out = tok.get("output") or 0
+            sess.lat_ms = max(0, done - created) if created else None
+            sess.out_tokens = out
+            sess.tps = round(out / (sess.lat_ms / 1000.0), 1) \
+                if sess.lat_ms and out else None
+            sess.model_id = info.get("modelID")
+            break
+
+    def stats_reply(self, sess, ev):
+        """`!stats` — trusted-only, instant, no model turn. The brain speaks
+        over the FIFO itself with the numbers it already owns."""
+        q = (" DEMOTED" if self._demoted_stack
+             else " OK" if self.model_ladder else "")
+        lines = [
+            f"model: {sess.model_id or (self.model and self.model[1]) or '?'}"
+            f"{q} | turns: {self.total_turns}",
+            f"latency: {sess.lat_ms}ms | out: {sess.out_tokens} tok"
+            f" | tps: {sess.tps or '?'}",
+            f"refusals: {self.total_refusals} | wedges: {self.total_wedges}"
+            f" | pending: {len(sess.pending)}",
+            f"nets: {','.join(n.name for n in self.nets)}",
+        ]
+        target = policy.reply_target(ev)
+        net_name = ev.get("net")
+        net = self.net_by_name.get(net_name)
+        if net is None:
+            emit("STATS_ERROR", "unknown net", repr(net_name))
+            return
+        write_fifo([f"NOTICE {target} [stats] {l}" for l in lines], net.fifo)
+        emit("STATS_SENT", net_name, target)
+
     def on_idle(self, sid):
         sess = self.sess
         if sess is None or sess.sid != sid:
@@ -570,6 +634,7 @@ class Brain:
             emit("COLLECT_ERROR", sess.title, repr(e))
             return
         sess.last_count = len(msgs)
+        self._note_metrics(sess, msgs)
         text = last_assistant_text(msgs)
         with self.lock:
             sess.busy_since = None
