@@ -52,6 +52,12 @@ MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
              if c.strip())                     # chan_filter.awk port
 ADDRESS_ONLY = env_bool("BRAIN_ADDRESS_ONLY")
 API_KEY = env("OPENCODE_API_KEY", "")
+# Model ladder lives on the PVC like networks.json: /data/models.json defines
+# the order (benchmark-first), the brain hot-reloads it every poll loop —
+# model switches and ladder edits persist across pod restarts with no
+# redeploy. Structure: {"ladder": ["provider/model", ...], "model": "provider/model"}
+# ("model" optional: the ladder head when absent).
+MODELS_FILE = env("BRAIN_MODELS_FILE", "/data/models.json")
 # !stats: instant telemetry reply to TRUSTED users, no model turn. The brain
 # answers itself over the net's FIFO — latency, tokens, tps, model, quota
 # state — data straight from the opencode API's own per-message records.
@@ -392,10 +398,14 @@ class Brain:
         # Model ladder: free-tier quotas burn out mid-flight, so when the
         # server reports a quota/rate/disabled retry we walk down the
         # ladder per-request (prompt_async takes model each turn — no
-        # redeploy, no serve restart, the session stays warm).
+        # redeploy, no serve restart, the session stays warm). The source
+        # of truth is MODELS_FILE on the PVC (like networks.json); the env
+        # ladder is only the bootstrap default when the file is absent.
         ladder = os.environ.get("BRAIN_MODEL_LADDER", "")
-        self.model_ladder = [split_model(m) for m in ladder.split(",")
-                             if m.strip()]
+        self._env_ladder = [split_model(m) for m in ladder.split(",")
+                            if m.strip()]
+        self.model_ladder = list(self._env_ladder)
+        self._models_mtime = 0.0
         self._demoted_stack = []           # models climbed down from
         self._clean_turns = 0
         self._probe_sid = None             # side session for best-model probes
@@ -811,14 +821,61 @@ class Brain:
                  sess.sid == props.get("sessionID")
                  else str(props.get("sessionID", "")))
 
+    # -- models.json hot reload ----------------------------------------------------
+    def _persist_models(self):
+        """Write the ladder + current model to MODELS_FILE (best-effort): the
+        file is the durable state that reload_models() reads back."""
+        m = self.model or ("?", "?")
+        try:
+            with open(MODELS_FILE, "w") as f:
+                json.dump({"model": f"{m[0]}/{m[1]}",
+                           "ladder": [f"{p}/{n}" for p, n
+                                      in (self.model_ladder or [])]},
+                          f, indent=1)
+            self._models_mtime = os.path.getmtime(MODELS_FILE)
+        except OSError as e:
+            emit("MODELS_PERSIST_ERROR", repr(e)[:80])
+
+    def reload_models(self):
+        """Hot-reload /data/models.json when it changes on disk (networks.json
+        pattern): the file is the persistent source of truth for the ladder.
+        Any live demote/probe state resets to the file's order."""
+        try:
+            mt = os.path.getmtime(MODELS_FILE)
+        except OSError:
+            return
+        if mt == self._models_mtime:
+            return
+        self._models_mtime = mt
+        try:
+            with open(MODELS_FILE) as f:
+                data = json.load(f)
+            ladder = [split_model(m) for m in data.get("ladder", []) if m.strip()]
+            model = split_model(data["model"]) if data.get("model") else None
+        except (OSError, ValueError, KeyError) as e:
+            emit("MODELS_FILE_ERROR", MODELS_FILE, repr(e)[:80])
+            return
+        if not ladder:
+            return
+        self.model_ladder = ladder
+        self._demoted_stack = []
+        self._clean_turns = 0
+        if model and model != self.model:
+            self.model = model
+        m = self.model or ("?", "?")
+        emit("MODELS_RELOADED", MODELS_FILE,
+             f"model={m[0]}/{m[1]}",
+             f"ladder={len(ladder)}")
+
     # -- model ladder ---------------------------------------------------------------
     _QUOTA_HINTS = ("free usage exceeded", "rate limit", "quota",
                     "access is disabled", "subscription")
 
     def _demote_model(self, sess, retry_msg):
-        """On a quota/rate retry walk one rung down BRAIN_MODEL_LADDER and
-        swap self.model in place — the next turn rides the new model with
-        no redeploy and no serve restart."""
+        """On a quota/rate retry walk one rung down the ladder and swap
+        self.model in place — the next turn rides the new model with
+        no redeploy and no serve restart. The demoted model is persisted
+        to MODELS_FILE so the choice survives restarts."""
         low = retry_msg.lower()
         if not any(h in low for h in self._QUOTA_HINTS):
             return
@@ -832,6 +889,7 @@ class Brain:
                 self._clean_turns = 0          # promo clock restarts
                 emit("MODEL_DEMOTED", sess.title,
                      f"model={nxt[0]}/{nxt[1]}")
+                self._persist_models()
                 # The stuck turn is still riding the dead model's retry
                 # loop — kill it now so the next submit goes out on the
                 # new model immediately instead of wedging for WEDGED s.
@@ -951,6 +1009,7 @@ class Brain:
         threading.Thread(target=self.sse_loop, daemon=True).start()
         while not self.stop_flag:
             self.heartbeat()
+            self.reload_models()
             # hot reconfig: networks.json on /data may add networks
             for n in networks.load():
                 if n.name not in known:
