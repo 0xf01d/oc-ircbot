@@ -34,6 +34,7 @@ python3 -u tests/stub_opencode_serve.py --host 127.0.0.1 --port "$SPORT" \
 SERVE=$!
 
 BOT_EVENTS="$D/events.log" BOT_FIFO="$D/bot.send" IRC_NICK=ocbot \
+  NETWORKS_FILE="$D/no-networks.json" \
   BRAIN_SERVE_URL="http://127.0.0.1:$SPORT" BRAIN_WORKDIR="$D/workspace" \
   BRAIN_MEMORY_DIR="$D/workspace/memory" BRAIN_HEARTBEAT="$D/hb" \
   BRAIN_AGENT_STATUS="$D/agent.status" BRAIN_FROM_START=1 \
