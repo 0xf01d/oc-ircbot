@@ -1,0 +1,11 @@
+# bot.reserved — reserved channels/nicks (leak_guard.py).
+#
+# Anything said in a reserved channel is *context*, never to be paraphrased
+# back onto the open network. One glob per line (fnmatch, matched lowercase).
+# An empty file (comments only, as here) disables the gate: nothing reserved.
+#
+# Comment syntax: a bare '#' or '#' + space. A channel like '#brain-private'
+# (no space) is a rule, not a comment.
+#
+# Example rule:
+# #brain-private

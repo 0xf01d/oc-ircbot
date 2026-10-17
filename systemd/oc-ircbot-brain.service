@@ -1,0 +1,20 @@
+[Unit]
+Description=oc-ircbot brain (persistent OpenCode sessions)
+# One brain serves every bot instance: it tails each network's events file
+# and writes to each network's FIFO. Starting it before the bots is fine —
+# it waits for the files to appear.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+# OPENCODE_API_KEY / BRAIN_MODEL / BRAIN_WORKDIR / BRAIN_HEARTBEAT /
+# BRAIN_AGENT_STATUS / IRC_NETWORKS go here (see README.md "Configuration").
+EnvironmentFile=-%h/oc-ircbot/.env
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/brain.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

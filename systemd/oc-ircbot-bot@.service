@@ -1,0 +1,27 @@
+[Unit]
+Description=oc-ircbot IRC bridge on %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+# Base env (shared), then per-network overrides: .env.azzurra, .env.libera, ...
+# Each override file names its network's IRC_HOST / IRC_NICK / BOT_TRUST and —
+# unless the defaults are fine — its own BOT_EVENTS / BOT_FIFO / BOT_LOG, the
+# exact paths the brain derives from networks.json. Trust does not travel
+# between networks: every instance needs its own bot.trust file.
+EnvironmentFile=-%h/oc-ircbot/.env
+EnvironmentFile=-%h/oc-ircbot/.env.%i
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/bot.py
+# Clean part on stop: QUIT through the FIFO before SIGTERM. `timeout` guards
+# the write — if the bot is already gone, opening the FIFO would block.
+ExecStop=/usr/bin/timeout 5 /bin/sh -c 'echo "QUIT bye" >> "${BOT_FIFO:-bot.send}"'
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=30
+RestartSteps=5
+RestartMaxDelaySec=1800
+
+[Install]
+WantedBy=default.target
