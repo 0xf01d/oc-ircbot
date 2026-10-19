@@ -72,7 +72,8 @@ PROBE_SECS = float(env("BRAIN_PROBE_SECS", "300"))  # best-model probe cadence
 PENDING_BACKLOG = 128
 # A free-tier model can legitimately turn for minutes: these stay env-tunable
 # so a slow deploy can tune around guaranteed abort->wedge->reset loops.
-MAX_TURNS = int(env("BRAIN_MAX_TURNS", "150"))          # turn cap per session
+MAX_TURNS = int(env("BRAIN_MAX_TURNS", "100"))         # turn cap per session
+RESET_SECS = int(env("BRAIN_RESET_SECS", "900"))       # /clear cadence (15 min)
 TURN_TIMEOUT = float(env("BRAIN_TURN_TIMEOUT", "180"))  # wedged-turn abort
 DRY_RUN = env_bool("BRAIN_DRY_RUN")   # lets compose/k8s dry-run without
                                       # editing the container command
@@ -342,7 +343,8 @@ class Tailer:
 class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
-                 "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts")
+                 "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
+                 "born")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -350,6 +352,7 @@ class Session:
         self.system = system
         self.turns = 0
         self.busy_since = None
+        self.born = time.monotonic()       # for the periodic /clear cadence
         self.wedges = 0
         self.refusals = 0
         self.pending = []                  # (fed_monotonic, event)
@@ -1022,6 +1025,17 @@ class Brain:
                     self.feed(net_name, policy.parse_event(line))
             if self.sess is not None and self.due(self.sess):
                 self.submit(self.sess)
+            # Periodic /clear: a session that never idles (wedged turn) never
+            # reaches the turn-cap check in record_turn, so turns grow without
+            # bound across watchdog restarts (seen: 636). Clear on age too.
+            if (not self.dry_run and self.sess is not None
+                    and (self.sess.turns >= MAX_TURNS
+                         or (self.sess.born
+                             and time.monotonic() - self.sess.born >= RESET_SECS
+                             and self.sess.busy_since is None))):
+                self.reset_session(self.sess,
+                                   f"periodic (turns={self.sess.turns}, "
+                                   f"age>{RESET_SECS}s)")
             if not self.dry_run and self.sess is not None:
                 self._probe_best(self.sess)
             self.guard_tick()
