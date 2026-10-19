@@ -21,6 +21,21 @@ data:
   bot.startup: |
     # replayed after connect (no NickServ pass -> right after 001)
     JOIN #hermes
+  # hackint-only startup: networks.json overrides BOT_STARTUP for that network
+  bot.startup.hackint: |
+    # hackint: also the drugs HR channel
+    JOIN #hermes
+    JOIN #drugs
+  networks.json: |
+    {
+      "freebnc": {"IRC_HOST": "irc.freebnc.net", "IRC_PORT": "6697"},
+      "hackint": {"IRC_HOST": "irc.hackint.org", "IRC_PORT": "6697",
+                  "BOT_STARTUP": "/conf/bot.startup.hackint"},
+      "espernet": {"IRC_HOST": "irc.esper.net", "IRC_PORT": "6697"},
+      "azzurra": {"IRC_HOST": "irc.azzurra.chat", "IRC_PORT": "6697"},
+      "ircnet": {"IRC_HOST": "openirc.snt.utwente.nl", "IRC_PORT": "6667", "IRC_TLS": "0"},
+      "1459": {"IRC_HOST": "irc.1459.io", "IRC_PORT": "6697"}
+    }
   bot.reserved: |
     # empty on purpose: the bot sits only in #hermes today; leak_guard has
     # nothing to guard between channels. Uncomment to add private targets.
