@@ -1,0 +1,108 @@
+# oc-ircbot — the three-container stack.
+#
+#   bot  (bridge)  ->  brain (OpenCode serve)  <-  watchdog (heartbeat+serve)
+#
+# The shared `botdata` volume carries bot.log / bot.send / events.log /
+# brain.heartbeat / agent.status / workspace between the containers. Nothing
+# here is secret except OPENCODE_API_KEY, which is passed through from the
+# environment (documented in README.md); no key is committed.
+#
+# Single-network layout: one bot container (nets.py supervising bot.py) on
+# the implicit "irc" network (BOT_EVENTS / BOT_FIFO / BOT_LOG). For several
+# IRC networks at once set IRC_NETWORKS — nets.py spawns one bot per network
+# with its own files — see README.md, "Multi-network".
+
+services:
+  bot:
+    build:
+      context: .
+      target: bot
+    # init: tini as PID 1 — reaps zombies, forwards SIGTERM (clean QUIT).
+    init: true
+    image: oc-ircbot-bot
+    environment:
+      IRC_HOST: ${IRC_HOST:-irc.azzurra.chat}
+      IRC_PORT: ${IRC_PORT:-6697}
+      IRC_NICK: ${IRC_NICK:-vjt-claude}
+      IRC_IDENT: ${IRC_IDENT:-claude}
+      IRC_REAL: ${IRC_REAL:-ocbot}
+      IRC_BIND: ${IRC_BIND:-}
+      IRC_TLS: ${IRC_TLS:-1}
+      IRC_TLS_VERIFY: ${IRC_TLS_VERIFY:-1}
+      BOT_LOG: /data/bot.log
+      BOT_FIFO: /data/bot.send
+      BOT_EVENTS: /data/events.log
+      NICKSERV_PASS: ${NICKSERV_PASS:-}
+    volumes:
+      - botdata:/data
+    restart: unless-stopped
+
+  brain:
+    build:
+      context: .
+      target: brain
+    init: true
+    image: oc-ircbot-brain
+    environment:
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      # Implicit single network (the one the bot container above serves).
+      BOT_EVENTS: /data/events.log
+      BOT_FIFO: /data/bot.send
+      IRC_NICK: ${IRC_NICK:-vjt-claude}
+      BRAIN_ADMIN: ${BRAIN_ADMIN:-admin}
+      # Persistent serve + the one session live under /data.
+      BRAIN_WORKDIR: /data/workspace
+      BRAIN_MEMORY_DIR: /data/workspace/memory
+      BRAIN_HEARTBEAT: /data/brain.heartbeat
+      BRAIN_AGENT_STATUS: /data/agent.status
+      BRAIN_MODEL: ${BRAIN_MODEL:-opencode/deepseek-v4.1-flash-free}
+      BRAIN_SERVE_PORT: ${BRAIN_SERVE_PORT:-46099}
+      # `opencode serve` always binds 127.0.0.1 (hardcoded in brain.py — it is
+      # the agent's unauthenticated control plane). The watchdog reaches it by
+      # joining this container's network namespace (see below).
+      # Attach to an already-running serve instead of spawning one:
+      # BRAIN_SERVE_URL: http://host:46099
+      BRAIN_FROM_START: ${BRAIN_FROM_START:-0}
+      BRAIN_POLL: ${BRAIN_POLL:-1.0}
+      BRAIN_BATCH_WINDOW: ${BRAIN_BATCH_WINDOW:-3.0}
+      BRAIN_MAX_TURNS: ${BRAIN_MAX_TURNS:-150}
+      BRAIN_TURN_TIMEOUT: ${BRAIN_TURN_TIMEOUT:-180}
+      BRAIN_DRY_RUN: ${BRAIN_DRY_RUN:-0}
+      BRAIN_MUTE: ${BRAIN_MUTE:-}
+      BRAIN_ADDRESS_ONLY: ${BRAIN_ADDRESS_ONLY:-0}
+    volumes:
+      - botdata:/data
+    depends_on:
+      - bot
+    restart: unless-stopped
+
+  watchdog:
+    build:
+      context: .
+      target: watchdog
+    init: true
+    image: oc-ircbot-watchdog
+    # Share the brain's network namespace: serve is loopback-only, and this is
+    # how the watchdog reaches it without ever widening the bind.
+    network_mode: "service:brain"
+    environment:
+      BRAIN_HEARTBEAT: /data/brain.heartbeat
+      BRAIN_AGENT_STATUS: /data/agent.status
+      BRAIN_SERVE_URL: http://127.0.0.1:${BRAIN_SERVE_PORT:-46099}
+      WATCHDOG_POLL: ${WATCHDOG_POLL:-10}
+      WATCHDOG_STALL: ${WATCHDOG_STALL:-30}
+      WATCHDOG_MAX_STALLS: ${WATCHDOG_MAX_STALLS:-3}
+      WATCHDOG_WEDGED: ${WATCHDOG_WEDGED:-300}
+      WATCHDOG_SERVE_MAX_FAILS: ${WATCHDOG_SERVE_MAX_FAILS:-3}
+      WATCHDOG_EXIT_ON_STALL: ${WATCHDOG_EXIT_ON_STALL:-0}
+      # Lever of last resort; a sidecar cannot restart its own container in
+      # Kubernetes, so this shell command is the honest escalation.
+      WATCHDOG_RESTART_CMD: ${WATCHDOG_RESTART_CMD:-}
+    volumes:
+      - botdata:/data
+    depends_on:
+      - brain
+    restart: unless-stopped
+
+volumes:
+  botdata:

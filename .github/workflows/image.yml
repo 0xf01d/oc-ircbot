@@ -1,0 +1,61 @@
+# Build the three Dockerfile targets and push them to ghcr, so a cluster
+# can run the stack without building locally. Tags: the role tag (bot /
+# brain / watchdog, mutable) plus a sha-<sha> tag (immutable, for pinning).
+#
+# The live manifests in k8s/live/ consume the role tags with
+# imagePullPolicy: Always — a redeploy is "rerun this workflow, then
+# kubectl rollout restart". See k8s/live/README.md.
+
+name: image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, lane/oc-ircbot]
+    paths:
+      # image.yml itself is in the list so the workflow can (re)trigger from
+      # a non-default branch, where workflow_dispatch is not offered.
+      - '.github/workflows/image.yml'
+      - 'Dockerfile'
+      - '*.py'
+      - 'bot.say'
+      - 'bot.trust'
+      - 'bot.trust.ircnet'
+      - 'bot.reserved'
+      - 'bot.startup'
+      - 'opencode.json'
+      - 'tests/**'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  push:
+    name: build + push ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [bot, brain, watchdog]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ matrix.target }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max

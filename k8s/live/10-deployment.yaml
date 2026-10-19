@@ -1,0 +1,131 @@
+# oc-ircbot, live: the compose stack as one pod on irc.freebnc.net (#hermes).
+#
+#   brain (main: persistent OpenCode session, spawns `opencode serve`
+#          on 127.0.0.1:46099)  <-  watchdog (sidecar, same netns)
+#   bot (the IRC bridge; nets.py supervises bot.py against freebnc)
+#
+# Compose expressed `watchdog reaches the loopback-only serve` with
+# network_mode: service:brain; in Kubernetes the three containers of one pod
+# share the network namespace, so http://127.0.0.1:46099 just works. The
+# shared state (bot.send FIFO, events.log, bot.log, heartbeat, workspace)
+# is a pod-scoped emptyDir at /data, like compose's botdata volume.
+#
+# Code comes from the images (single multi-stage Dockerfile, three targets),
+# NOT from a ConfigMap: the brain image carries the Node OpenCode CLI.
+# bot.trust / bot.startup / bot.reserved ride the oc-ircbot-live ConfigMap
+# (00-config.yaml). Secrets are referenced, never committed: create
+# oc-ircbot-secrets out-of-band — see README.md.
+#
+# Recreate (not RollingUpdate): one IRC connection, one nick — two pods
+# racing for it would 433-flap.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-ircbot
+  namespace: hermes-generated-content
+  labels:
+    app: oc-ircbot
+    tier: bridge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oc-ircbot
+  template:
+    metadata:
+      labels:
+        app: oc-ircbot
+        tier: bridge
+    spec:
+      # nets.py SIGTERM path parts cleanly with a 10 s QUIT grace; leave
+      # the default 30 s so it never gets SIGKILL mid-part.
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: conf
+          configMap:
+            name: oc-ircbot-live
+            defaultMode: 0444
+        - name: data
+          emptyDir: {}
+      containers:
+        # --- main: the persistent-session brain ------------------------------
+        - name: brain
+          image: ghcr.io/0xf01d/oc-ircbot:brain
+          imagePullPolicy: Always
+          env:
+            - {name: IRC_NICK, value: ocbot}
+            - {name: BRAIN_ADMIN, value: katia}
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oc-ircbot-secrets
+                  key: OPENCODE_API_KEY
+                  optional: true
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - >-
+                  import os,sys,time;sys.exit(0 if
+                  time.time()-os.path.getmtime('/data/brain.heartbeat')<120
+                  else 1)
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 1Gi}
+
+        # --- the IRC bridge ---------------------------------------------------
+        - name: bot
+          image: ghcr.io/0xf01d/oc-ircbot:bot
+          imagePullPolicy: Always
+          env:
+            - {name: IRC_HOST, value: irc.freebnc.net}
+            - {name: IRC_PORT, value: "6697"}
+            - {name: IRC_TLS, value: "1"}
+            - {name: IRC_TLS_VERIFY, value: "1"}
+            - {name: IRC_NICK, value: ocbot}
+            - {name: IRC_IDENT, value: ocbot}
+            - {name: IRC_REAL, value: "ocbot"}
+            - {name: BOT_TRUST, value: /conf/bot.trust}
+            - {name: BOT_RESERVED, value: /conf/bot.reserved}
+            - {name: BOT_STARTUP, value: /conf/bot.startup}
+            - name: NICKSERV_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: oc-ircbot-secrets
+                  key: NICKSERV_PASS
+                  optional: true
+          volumeMounts:
+            - {name: conf, mountPath: /conf, readOnly: true}
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+
+        # --- the agent-aware sidecar (brain netns; serve is loopback-only) ---
+        - name: watchdog
+          image: ghcr.io/0xf01d/oc-ircbot:watchdog
+          imagePullPolicy: Always
+          env:
+            - {name: BRAIN_SERVE_URL, value: "http://127.0.0.1:46099"}
+            - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
+            - {name: WATCHDOG_POLL, value: "10"}
+            - {name: WATCHDOG_STALL, value: "30"}
+            - {name: WATCHDOG_MAX_STALLS, value: "3"}
+            - {name: WATCHDOG_WEDGED, value: "300"}
+            - {name: WATCHDOG_SERVE_MAX_FAILS, value: "3"}
+            # A sidecar cannot restart its own container here; the honest
+            # levers are the liveness probe (brain) and Recreate rollouts.
+            - {name: WATCHDOG_EXIT_ON_STALL, value: "0"}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
