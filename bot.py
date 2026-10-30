@@ -2,7 +2,8 @@
 """bot.py — minimal IRC bridge between an AI brain and IRC.
 
 A close port of vjt/claude-ircbot's bot.py: TLS IRC transport, trust model,
-and a FIFO command grammar (SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC). It
+and a FIFO command grammar (SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC
+RELOAD, plus hot-reloadable external verbs from handlers.py). It
 is brain-agnostic: selected events go to stdout and BOT_EVENTS for a sidecar
 brain (brain.py) to tail, and commands arrive over the FIFO.
 
@@ -21,6 +22,7 @@ import sys
 import threading
 import time
 
+import handlers
 from leak_guard import LeakGuard
 from util import env, env_bool, now
 
@@ -49,6 +51,10 @@ EVENTS_FILE = env("BOT_EVENTS", "/data/events.log")
 TRUST_FILE = env("BOT_TRUST", os.path.join(HERE, "bot.trust"))
 ENV_FILE = env("BOT_ENV", os.path.join(HERE, ".env"))
 STARTUP_FILE = env("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
+# Extra FIFO verbs, hot-reloadable: kubectl cp a new file onto the PVC and the
+# next command picks it up — no restart, the IRC connection is never touched
+# (see handlers.py, the loader and the shipped reference copy).
+HANDLERS_FILE = env("BOT_HANDLERS", "/data/handlers.py")
 # Shared by ALL instances on purpose (not per-network): see leak_guard.py.
 RESERVED_FILE = env("BOT_RESERVED", os.path.join(HERE, "bot.reserved"))
 RESERVED_STORE = env("BOT_RESERVED_STORE", os.path.join(HERE, "reserved_recent.tsv"))
@@ -825,6 +831,61 @@ def outbound_ok(verb, rest, origin=None):
     return True
 
 
+# The context handed to hot handlers (handlers.dispatch): every primitive a
+# handler may need, without ever importing bot.py (circular import). The
+# wrappers resolve at call time on this module, so a patch of bot.send_raw in
+# tests is what the handlers go through too.
+class HandlerCtx:
+    nick = NICK
+    host = HOST
+
+    @staticmethod
+    def send_raw(s, origin=None):
+        send_raw(s, origin)
+
+    @staticmethod
+    def split_say(target, text, origin=None):
+        split_say(target, text, origin)
+
+    @staticmethod
+    def emit(kind, *parts):
+        emit(kind, *parts)
+
+    @staticmethod
+    def log(direction, line, origin=None):
+        log(direction, line, origin)
+
+    @staticmethod
+    def trust_check(nick, host):
+        return trust_check(nick, host)
+
+    @staticmethod
+    def is_trust_listed(nick):
+        return is_trust_listed(nick)
+
+    @staticmethod
+    def env(key, default=""):
+        return env(key, default)
+
+    @staticmethod
+    def now(fmt):
+        return now(fmt)
+
+
+HANDLER_CTX = HandlerCtx()
+
+
+def load_handlers():
+    """Start-of-run load of the hot handlers. Absence is not an error
+    (HANDLERS_MISSING); a file that fails to import is reported inside
+    handlers.load() and left unloaded — startup never dies for it."""
+    if not os.path.exists(HANDLERS_FILE):
+        emit("HANDLERS_MISSING", HANDLERS_FILE)
+        return
+    if handlers.load(HANDLERS_FILE, emit) is not None:
+        emit("HANDLERS_LOADED", HANDLERS_FILE, f"verbs={len(handlers.verbs())}")
+
+
 def process_cmd(line):
     if " " in line:
         verb, rest = line.split(" ", 1)
@@ -877,14 +938,33 @@ def process_cmd(line):
         nick, name = parts[0], parts[1].strip()
         offer = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
         dcc_send(nick, name, origin, offer)
+    elif verb == "RELOAD":
+        # Explicit hot-reload path (the FIFO is trusted; the automatic path is
+        # the mtime gate in handlers.dispatch). A broken file is reported and
+        # the previous handlers keep working.
+        handlers.load(HANDLERS_FILE, emit)
+        n = len(handlers.verbs())
+        emit("HANDLERS_RELOADED", f"verbs={n}")
+        if origin:
+            send_raw(f"NOTICE {origin} :handlers reloaded, verbs={n}", origin)
     else:
+        # Not built-in: the hot handlers get first refusal, so a kubectl cp of
+        # handlers.py is enough to teach the bot a new verb. Anything still
+        # unclaimed is the usual loud unknown-verb, with the current hot verb
+        # list in the detail so the log says what exists.
+        handled, _ = handlers.dispatch(HANDLER_CTX, verb, rest, origin)
+        if handled:
+            return
+        hot = handlers.verbs()
         emit("CMD_ERROR", "unknown-verb", repr(verb),
-             "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC")
+             "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC RELOAD",
+             "hot: " + (" ".join(hot) if hot else "none"))
 
 
 def main():
     global sock
     load_trust()
+    load_handlers()
     ctx = ssl.create_default_context()
     if not TLS_VERIFY:
         # check_hostname must go first: CERT_NONE with hostname checking raises.
