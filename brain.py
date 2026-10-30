@@ -64,7 +64,10 @@ MODELS_FILE = env("BRAIN_MODELS_FILE", "/data/models.json")
 STATS_CMD = env("BRAIN_STATS_CMD", "!stats")
 
 OPENCODE_BIN = "opencode"
-BATCH_MAX = 5          # submit a batch once it grows this big
+BATCH_MAX = int(env("BRAIN_BATCH_MAX", "25"))  # submit a batch once it grows
+# this big: a busy channel settles into a handful of fat turns instead of a
+# stream of thin ones. BATCH_WINDOW below still caps how long the oldest
+# event may wait, so a quiet channel is never held hostage by the number.
 PROBE_SECS = float(env("BRAIN_PROBE_SECS", "300"))  # best-model probe cadence
 # Nothing is ever dropped for being late (vjt's model: the writer queues, the
 # agent catches up) — a large backlog is only announced, loudly, here and in
