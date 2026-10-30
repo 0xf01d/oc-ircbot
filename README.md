@@ -108,6 +108,53 @@ game bots of the original (`roll_counter.py`, `firma_counter.py`, stats,
 to speak IRC, not parts of the bridge — but this is exactly the seam they
 would plug into. A sidecar needs no changes to `bot.py` or `brain.py`, ever.
 
+## Hot-reloadable commands
+
+A new bot command does not require a restart (a restart drops the IRC
+connection and every open session). Verbs the built-in set does not claim
+are looked up in an **external Python file** — `BOT_HANDLERS`, default
+`/data/handlers.py`, shipped in the repo as `handlers.py` (loader + reference
+examples). `kubectl cp` a new copy onto the PVC and the **next command** uses
+it: no redeploy, no reconnect.
+
+```python
+# /data/handlers.py — one function per verb, named h_<verb> (case-insensitive)
+def h_upper(ctx, rest, origin):
+    # ctx: send_raw, split_say, emit, log, nick, host, trust_check,
+    #      is_trust_listed, env, now — no import of bot.py (circular)
+    # rest: everything after the verb, verbatim; origin: the :tag or None
+    if not origin or not ctx.is_trust_listed(origin):   # guard your relays
+        return None                                     # -> unknown-verb
+    return rest.upper()     # a returned string is PRIVMSG'd to the origin;
+                            # True = handled, None/False = not handled
+```
+
+```bash
+printf 'UPPER:admin say it loud\n' > /data/bot.send   # -> PRIVMSG admin :SAY IT LOUD
+```
+
+Reload rules:
+
+- **Automatic**: every dispatched command stats the file (one `stat`) and
+  reloads only when `st_mtime_ns` moved — drop a new file in and it just
+  works, without re-executing the module on every command.
+- **Explicit**: the `RELOAD` verb re-reads the file immediately and answers
+  `HANDLERS_RELOADED verbs=<n>` (plus a NOTICE to the `:origin`, if any).
+- **A broken file can never take the bot down**: a file that fails to import
+  is reported (`HANDLER_IMPORT_ERROR`) and ignored — the previously loaded
+  handlers keep working; a handler that raises is reported
+  (`HANDLER_ERROR <verb>`) and the bot falls through to its usual
+  `unknown-verb` error and carries on.
+
+The lifecycle is loud on the event stream: `HANDLERS_LOADED` /
+`HANDLERS_MISSING` at startup (absence is not an error),
+`HANDLERS_HOT_RELOAD` on the mtime path, `HANDLERS_RELOADED` on the verb.
+Unknown verbs list the current hot verbs in the error detail. Deploy:
+
+```bash
+kubectl cp handlers.py <pod>:/data/handlers.py:bot   # no restart, no reconnect
+```
+
 ## The reply policy
 
 The model's reply must be zero or more FIFO command lines, one per line.
@@ -235,6 +282,7 @@ Bot variables (unchanged from round 1 — the bridge is the same program):
 | `BOT_RESERVED` / `BOT_RESERVED_STORE` | `bot.reserved` / `reserved_recent.tsv` | leak gate (see `leak_guard.py`) |
 | `BOT_ENV` | `.env` | NickServ password file |
 | `BOT_STARTUP` | `bot.startup` | post-auth command replay |
+| `BOT_HANDLERS` | `/data/handlers.py` | hot-reloadable extra FIFO verbs (see *Hot-reloadable commands*) |
 | `NICKSERV_PASS` | *(empty)* | NickServ identify |
 
 Brain variables:
