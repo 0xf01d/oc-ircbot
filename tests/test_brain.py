@@ -384,6 +384,165 @@ def test_wedged_turn_aborts_then_resets(tmp_path):
         w.stop()
 
 
+# --- preemption: an addressed message drops the running turn ---------------------
+def _warm_world(tmp_path, **kw):
+    """A world whose session pre-exists on the server: ensure_session
+    re-attaches without the rehydrate turn, so the busy clock belongs to
+    the batches the test itself sends."""
+    w = Env(tmp_path, **kw)
+    w.serve.state.sessions["ses_warm"] = {"id": "ses_warm",
+                                          "title": "irc:global",
+                                          "messages": [], "busy": False}
+    (w.work / "sessions.json").write_text('{"session": "ses_warm"}')
+    return w
+
+
+def _wait_busy(sess, timeout=10):
+    deadline = time.monotonic() + timeout
+    while sess.busy_since is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sess.busy_since is not None, "the turn never started"
+
+
+def test_addressed_message_preempts_a_busy_turn(tmp_path, capsys):
+    w = _warm_world(tmp_path, turn_delay=1.0)    # a long background turn
+    w.start()
+    try:
+        w.open_fifo()
+        w.say("[12:00] MSG TRUSTED FROM=a HOST=a@h TO=#test BODY=hi bot")
+        sess = w.wait_session()
+        _wait_busy(sess)
+        w.say("[12:00] MSG TRUSTED FROM=boss HOST=b@h TO=#test "
+              "BODY=ocbot, drop that")
+        # The running turn is aborted and the addressed batch goes out now,
+        # not when the background turn would have finished.
+        deadline = time.monotonic() + 10
+        while (len(w.batch_prompts(sess.sid)) < 2
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        assert w.serve.state.aborted == {sess.sid}
+        assert " BRAIN PREEMPT " in capsys.readouterr().out
+        prompts = w.batch_prompts(sess.sid)
+        assert len(prompts) == 2
+        assert "ocbot, drop that" in prompts[1]["parts"][0]["text"]
+        # The preempting turn answers through the FIFO like any other (the
+        # aborted turn's idle — the stub sends none — must not swallow it).
+        assert w.fifo_lines(1) == ["SAY #test stub-ok"]
+    finally:
+        w.stop()
+
+
+def test_preempt_cooldown_suppresses_a_second_abort(tmp_path, capsys):
+    w = _warm_world(tmp_path, turn_delay=30.0)   # turns that never return
+    w.start()
+    try:
+        w.say("[12:00] MSG TRUSTED FROM=a HOST=a@h TO=#test BODY=hi bot")
+        sess = w.wait_session()
+        _wait_busy(sess)
+        w.say("[12:00] MSG TRUSTED FROM=boss HOST=b@h TO=#test "
+              "BODY=ocbot, first")
+        deadline = time.monotonic() + 10
+        while (len(w.batch_prompts(sess.sid)) < 2
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        out = capsys.readouterr().out
+        assert " BRAIN PREEMPT " in out
+        assert "PREEMPT_SKIP_COOLDOWN" not in out
+        # A second addressed message inside the cooldown window must not
+        # abort-loop the model: it queues for the running turn instead.
+        w.say("[12:00] MSG TRUSTED FROM=boss HOST=b@h TO=#test "
+              "BODY=ocbot, second")
+        deadline = time.monotonic() + 5
+        while len(sess.pending) < 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert "PREEMPT_SKIP_COOLDOWN" in capsys.readouterr().out
+        time.sleep(0.4)
+        assert sess.busy_since is not None       # the turn was left alone
+        assert w.serve.state.aborted == {sess.sid}
+        assert len(w.batch_prompts(sess.sid)) == 2
+    finally:
+        w.stop()
+
+
+def test_unaddressed_message_never_preempts(tmp_path, capsys):
+    # No addressed, no abort: normal queueing behind a busy turn is kept.
+    w = _warm_world(tmp_path, turn_delay=30.0)
+    w.start()
+    try:
+        w.say("[12:00] MSG TRUSTED FROM=a HOST=a@h TO=#test BODY=hello there")
+        sess = w.wait_session()
+        _wait_busy(sess)
+        w.say("[12:00] MSG TRUSTED FROM=b HOST=b@h TO=#test BODY=hello there")
+        time.sleep(0.5)
+        assert sess.sid not in w.serve.state.aborted
+        assert sess.busy_since is not None
+        assert len(sess.pending) == 1            # queued, never dropped
+        assert "PREEMPT" not in capsys.readouterr().out
+    finally:
+        w.stop()
+
+
+def test_preempt_can_be_disabled(tmp_path, capsys):
+    w = _warm_world(tmp_path, turn_delay=30.0)
+    w.start()
+    try:
+        with mock.patch.object(brain, "PREEMPT_ON_ADDRESS", False):
+            w.say("[12:00] MSG TRUSTED FROM=a HOST=a@h TO=#test BODY=hi bot")
+            sess = w.wait_session()
+            _wait_busy(sess)
+            w.say("[12:00] MSG TRUSTED FROM=boss HOST=b@h TO=#test "
+                  "BODY=ocbot, now")
+            time.sleep(0.5)
+            assert sess.sid not in w.serve.state.aborted
+            assert "PREEMPT" not in capsys.readouterr().out
+    finally:
+        w.stop()
+
+
+def test_guard_does_not_wedge_count_a_preempted_turn(tmp_path, capsys):
+    # busy_since is None the instant the preempt lands, so the guard's next
+    # tick sees an idle session: the abort we caused is never a wedge.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.dry_run = True                     # submit() prints instead of re-arming
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    sess.busy_since = time.monotonic() - (brain.TURN_TIMEOUT + 1)
+    b.feed("irc", policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY=ocbot, now"))
+    assert " BRAIN PREEMPT " in capsys.readouterr().out
+    assert b.api.abort.call_count == 1
+    assert sess.busy_since is None
+    assert sess.preempted_ts is not None
+    b.guard_tick()
+    assert b.total_wedges == 0
+    assert sess.wedges == 0
+    assert b.api.abort.call_count == 1   # the guard added no abort of its own
+
+
+def test_preempted_turns_idle_discards_partial_text(tmp_path):
+    # The aborted turn's partial output is never dispatched, never counted,
+    # and never redispatched by a later catch-up (last_count moves on).
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.messages.return_value = [
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "q"}]},
+        {"info": {"role": "assistant"},
+         "parts": [{"type": "text", "text": "SAY irc|#c half a thought"}]},
+    ]
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    sess.busy_since = time.monotonic()
+    sess.preempted_ts = time.monotonic()
+    with mock.patch.object(brain, "write_fifo") as wf:
+        b.on_idle(sess.sid)
+        wf.assert_not_called()
+    assert sess.busy_since is None
+    assert sess.preempted_ts is None
+    assert sess.turns == 0
+    assert sess.last_count == 2
+
+
 # --- permission gate -------------------------------------------------------------
 def test_permission_asked_is_rejected_and_announced(world):
     sess = world.brain.ensure_session()
@@ -620,13 +779,15 @@ def test_turn_knobs_and_dry_run_env_tunable(tmp_path):
     # A free-tier model can turn for minutes: MAX_TURNS / TURN_TIMEOUT must
     # stay env-tunable (hardcoding them made a slow turn an untouchable
     # abort->wedge->reset loop), and BRAIN_DRY_RUN lets compose/k8s dry-run
-    # without editing the container command.
-    code = "import brain; print(brain.MAX_TURNS, brain.TURN_TIMEOUT, brain.DRY_RUN)"
+    # without editing the container command. Same for the preempt knobs.
+    code = ("import brain; print(brain.MAX_TURNS, brain.TURN_TIMEOUT, "
+            "brain.DRY_RUN, brain.PREEMPT_ON_ADDRESS, brain.PREEMPT_COOLDOWN)")
     env = dict(os.environ, BRAIN_MAX_TURNS="7", BRAIN_TURN_TIMEOUT="240.5",
-               BRAIN_DRY_RUN="1", BRAIN_WORKDIR=str(tmp_path))
+               BRAIN_DRY_RUN="1", BRAIN_WORKDIR=str(tmp_path),
+               BRAIN_PREEMPT_ON_ADDRESS="0", BRAIN_PREEMPT_COOLDOWN="2.5")
     out = subprocess.run([sys.executable, "-c", code], env=env, check=True,
                          capture_output=True, text=True, timeout=30).stdout
-    assert out.split() == ["7", "240.5", "True"]
+    assert out.split() == ["7", "240.5", "True", "False", "2.5"]
 
 
 def test_serve_spawn_binds_loopback_only():

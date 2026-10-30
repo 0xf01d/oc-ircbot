@@ -46,6 +46,13 @@ its workspace, or attaches to a running one via `BRAIN_SERVE_URL`):
 - **Cancellation.** A turn stuck beyond `TURN_TIMEOUT` (180 s, env-tunable)
   is cancelled with `POST /session/{id}/abort`; the `session.status`
   SSE events (busy/retry) arm and update the wedge clock.
+- **Preemption.** A message that directly addresses the bot never queues
+  behind a running turn: it aborts that turn and the addressed batch is
+  submitted immediately — the operator outranks the agent's own background
+  work (`BRAIN_PREEMPT_ON_ADDRESS`, on by default; `BRAIN_PREEMPT_COOLDOWN`,
+  10 s, keeps a burst of addressed messages from abort-looping the model).
+  The aborted turn's partial output is never dispatched and never counts as
+  a wedge.
 
 **Measured latency** (real `opencode serve` v1.19.0, 2026-10-15): a warm
 session answers in **~1.0 s** (0.94–1.00 s across three turns); the first
@@ -247,6 +254,7 @@ Brain variables:
 | `registers.json` | *(none)* | per-channel register text, in `BRAIN_WORKDIR` |
 | `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` | `1.0` / `3.0` | batching |
 | `BRAIN_MAX_TURNS` / `BRAIN_TURN_TIMEOUT` | `150` / `180` | session turn cap / wedged-turn abort (env-tunable: a free-tier model can turn for minutes) |
+| `BRAIN_PREEMPT_ON_ADDRESS` / `BRAIN_PREEMPT_COOLDOWN` | `1` / `10` | an addressed message aborts the running turn and its batch is submitted now / minimum seconds between preempts |
 | `BRAIN_DRY_RUN` | `0` | print prompts instead of submitting (compose/k8s can dry-run without editing the command) |
 | `BRAIN_FROM_START` | `0` | read event logs from the top on start |
 

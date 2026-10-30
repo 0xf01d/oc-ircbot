@@ -75,6 +75,10 @@ PENDING_BACKLOG = 128
 MAX_TURNS = int(env("BRAIN_MAX_TURNS", "100"))         # turn cap per session
 RESET_SECS = int(env("BRAIN_RESET_SECS", "900"))       # /clear cadence (15 min)
 TURN_TIMEOUT = float(env("BRAIN_TURN_TIMEOUT", "180"))  # wedged-turn abort
+PREEMPT_ON_ADDRESS = env_bool("BRAIN_PREEMPT_ON_ADDRESS", True)  # an
+# addressed message aborts the running turn: the operator outranks the
+# agent's own background work.
+PREEMPT_COOLDOWN = float(env("BRAIN_PREEMPT_COOLDOWN", "10"))
 DRY_RUN = env_bool("BRAIN_DRY_RUN")   # lets compose/k8s dry-run without
                                       # editing the container command
 
@@ -344,7 +348,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "born")
+                 "preempted_ts", "born")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -362,6 +366,9 @@ class Session:
         self.tps = None                    # last turn's output tokens/sec
         self.model_id = None               # last turn's model
         self.prompt_ts = None              # monotonic when submit() fired
+        self.preempted_ts = None           # monotonic when a preempt aborted
+                                           # the running turn: the next idle
+                                           # belongs to that aborted turn
 
 
 def last_assistant_text(messages):
@@ -414,6 +421,7 @@ class Brain:
         self._probe_sid = None             # side session for best-model probes
         self._probe_model = None           # model the current probe rides
         self._probe_next = 0.0             # monotonic clock gate
+        self._last_preempt = float("-inf")  # monotonic of the last preempt
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
@@ -556,6 +564,43 @@ class Brain:
             # Visible, never dropped: a slow model must not strand events
             # silently (vjt never discards; neither do we).
             emit("PENDING_BACKLOG", sess.title, f"events={depth}")
+        if PREEMPT_ON_ADDRESS:
+            self._maybe_preempt(sess, ev, nick)
+
+    # -- preemption -------------------------------------------------------------------
+    def _maybe_preempt(self, sess, ev, nick):
+        """An addressed MSG aborts the running turn: the operator outranks
+        the agent's own background work — the bot drops what it had in
+        background and takes the message on the fly. The abort is armed
+        (preempted_ts) before the API call so an idle that races it still
+        reads as the aborted turn's; its partial output is never dispatched
+        and it never counts as a wedge. A cooldown keeps a burst of
+        addressed messages from abort-looping the model."""
+        if ev.get("kind") != "MSG" or not policy.is_addressed(ev, nick):
+            return
+        with self.lock:
+            busy = sess.busy_since is not None
+        if not busy:
+            return
+        now = time.monotonic()
+        if now - self._last_preempt < PREEMPT_COOLDOWN:
+            emit("PREEMPT_SKIP_COOLDOWN", sess.title, ev.get("from") or "?")
+            return
+        self._last_preempt = now
+        with self.lock:
+            sess.preempted_ts = now
+        try:
+            self.api.abort(sess.sid)
+        except OSError as e:
+            with self.lock:
+                sess.preempted_ts = None
+            emit("ABORT_ERROR", sess.title, repr(e))
+            return
+        with self.lock:
+            sess.busy_since = None
+        emit("PREEMPT", f"{ev.get('net', '?')}|{policy.reply_target(ev)}",
+             ev.get("from") or "?")
+        self.submit(sess)
 
     def due(self, sess):
         with self.lock:
@@ -591,6 +636,9 @@ class Brain:
         with self.lock:
             sess.busy_since = time.monotonic()
             sess.prompt_ts = sess.busy_since
+            # A freshly submitted turn is not the aborted one: its idle must
+            # be dispatched like any other.
+            sess.preempted_ts = None
         emit("PROMPT_SENT", sess.title, f"events={len(batch)}")
 
     # -- collect ----------------------------------------------------------------------
@@ -647,10 +695,20 @@ class Brain:
             emit("COLLECT_ERROR", sess.title, repr(e))
             return
         sess.last_count = len(msgs)
+        with self.lock:
+            preempted = sess.preempted_ts is not None
+            sess.preempted_ts = None
+            sess.busy_since = None
+        if preempted:
+            # This idle belongs to the turn a preempt aborted: its partial
+            # output is never dispatched or counted (last_count is already
+            # advanced, so a later catch-up cannot redispatch it either).
+            # The batch that caused the preempt flows instead.
+            if self.due(sess):
+                self.submit(sess)
+            return
         self._note_metrics(sess, msgs)
         text = last_assistant_text(msgs)
-        with self.lock:
-            sess.busy_since = None
         self.record_turn(sess, text)
         self._note_clean_turn(sess)
         self.dispatch(sess, text)
