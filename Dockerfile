@@ -22,7 +22,7 @@ RUN apt-get update \
 ENV TERM=tmux-256color
 
 FROM runtime-base AS bot
-COPY bot.py leak_guard.py util.py nets.py networks.py bot.say tmuxsup.py ./
+COPY bot.py handlers.py leak_guard.py util.py nets.py networks.py bot.say tmuxsup.py ./
 COPY bot.trust bot.trust.ircnet bot.reserved bot.startup ./
 ENV BOT_LOG=/data/bot.log \
     BOT_FIFO=/data/bot.send \
