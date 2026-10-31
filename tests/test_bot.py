@@ -138,3 +138,95 @@ def test_dm_blocked_only_for_unlisted():
         assert not bot.dm_blocked("NickServ")
     finally:
         bot.trust_rules = old
+
+
+# `311 <ournick> <nick> <user> <host> * :realname` — IRCnet's only WHOIS
+# reply (production: 80 x 311, 0 x 307/330).
+IRCNET_311 = (":openirc.snt.utwente.nl 311 mammt katia ~katia "
+              "katia.users.ircnet.com * :katia")
+
+
+def test_311_verifies_pending_nick_when_flag_on():
+    old = (bot.trust_rules, set(bot.verified), set(bot.whois_pending),
+           bot.TRUST_VIA_311)
+    try:
+        bot.trust_rules = [("katia", "*.users.ircnet.com")]
+        bot.verified = set()
+        bot.whois_pending = {"katia"}
+        bot.TRUST_VIA_311 = True
+        with mock.patch.object(bot, "log"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "emit") as em:
+            bot.handle_server_line(IRCNET_311)
+        assert "katia" in bot.verified
+        assert "katia" not in bot.whois_pending
+        assert any(c.args == ("VERIFIED", "katia", "311")
+                   for c in em.call_args_list)
+    finally:
+        (bot.trust_rules, bot.verified, bot.whois_pending,
+         bot.TRUST_VIA_311) = old
+
+
+def test_311_host_mismatch_denies():
+    old = (bot.trust_rules, set(bot.verified), set(bot.whois_pending),
+           bot.TRUST_VIA_311)
+    try:
+        bot.trust_rules = [("katia", "*.users.ircnet.com")]
+        bot.verified = set()
+        bot.whois_pending = {"katia"}
+        bot.TRUST_VIA_311 = True
+        with mock.patch.object(bot, "log"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "emit") as em:
+            bot.handle_server_line(
+                ":openirc.snt.utwente.nl 311 mammt katia ~katia "
+                "evil.example.com * :katia")
+        assert "katia" not in bot.verified
+        assert "katia" in bot.whois_pending    # 318 still owns the cleanup
+        assert any(c.args == ("TRUST_DENIED", "katia", "evil.example.com",
+                              "311-host-mismatch")
+                   for c in em.call_args_list)
+    finally:
+        (bot.trust_rules, bot.verified, bot.whois_pending,
+         bot.TRUST_VIA_311) = old
+
+
+def test_311_unsolicited_verifies_nothing():
+    old = (bot.trust_rules, set(bot.verified), set(bot.whois_pending),
+           bot.TRUST_VIA_311)
+    try:
+        bot.trust_rules = [("katia", "*.users.ircnet.com")]
+        bot.verified = set()
+        bot.whois_pending = set()      # we never WHOIS'd: not proof
+        bot.TRUST_VIA_311 = True
+        with mock.patch.object(bot, "log"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "emit") as em:
+            bot.handle_server_line(IRCNET_311)
+        assert "katia" not in bot.verified
+        assert not any(c.args[0] in ("VERIFIED", "TRUST_DENIED")
+                       for c in em.call_args_list)
+    finally:
+        (bot.trust_rules, bot.verified, bot.whois_pending,
+         bot.TRUST_VIA_311) = old
+
+
+def test_311_flag_off_verifies_nothing():
+    old = (bot.trust_rules, set(bot.verified), set(bot.whois_pending),
+           bot.TRUST_VIA_311)
+    try:
+        bot.trust_rules = [("katia", "*.users.ircnet.com")]
+        bot.verified = set()
+        bot.whois_pending = {"katia"}
+        bot.TRUST_VIA_311 = False      # the default: strict 307/330 only
+        with mock.patch.object(bot, "log"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "emit") as em:
+            bot.handle_server_line(IRCNET_311)
+        assert "katia" not in bot.verified
+        assert "katia" in bot.whois_pending
+        assert not any(c.args[0] in ("VERIFIED", "TRUST_DENIED")
+                       for c in em.call_args_list)
+    finally:
+        (bot.trust_rules, bot.verified, bot.whois_pending,
+         bot.TRUST_VIA_311) = old

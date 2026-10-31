@@ -43,6 +43,11 @@ BIND = env("IRC_BIND", "")
 # validate (vjt's order, 2026-08-25).
 TLS_VERIFY = env_bool("IRC_TLS_VERIFY", True)
 TLS = env_bool("IRC_TLS", True)          # plaintext escape hatch for smoke tests
+# IRCnet answers WHOIS with 311 only — no 307/330 ever — so a listed nick with
+# a matching host stays pending-whois forever there. BOT_TRUST_311 resolves a
+# pending WHOIS on the 311 host field matching the trust glob; off (default)
+# keeps the strict 307/330 verification on every other network.
+TRUST_VIA_311 = env_bool("BOT_TRUST_311", False)
 
 LOG = env("BOT_LOG", os.path.join(HERE, "bot.log"))
 FIFO = env("BOT_FIFO", os.path.join(HERE, "bot.send"))
@@ -624,6 +629,21 @@ def handle_server_line(line):
             whois_pending.discard(target)
             emit("VERIFIED", parts[1])
             dm_flush(parts[1], "330")
+        return
+    if cmd == "311":    # RPL_WHOISUSER (IRCnet sends neither 307 nor 330)
+        parts = rest.split()
+        if TRUST_VIA_311 and len(parts) >= 4:
+            target = parts[1].lower()
+            whois_host = parts[3]
+            if target in whois_pending:
+                if host_matches(target, whois_host):
+                    verified.add(target)
+                    whois_pending.discard(target)
+                    emit("VERIFIED", parts[1], "311")
+                    dm_flush(parts[1], "311")
+                else:
+                    emit("TRUST_DENIED", parts[1], whois_host,
+                         "311-host-mismatch")
         return
     if cmd == "318":
         # RPL_ENDOFWHOIS: pending and not verified => not registered.
