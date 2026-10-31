@@ -29,6 +29,7 @@ from functools import partial
 
 import memory_log
 import networks
+import plug
 import policy
 from util import emit as _emit
 from util import env, env_bool
@@ -62,6 +63,11 @@ MODELS_FILE = env("BRAIN_MODELS_FILE", "/data/models.json")
 # answers itself over the net's FIFO — latency, tokens, tps, model, quota
 # state — data straight from the opencode API's own per-message records.
 STATS_CMD = env("BRAIN_STATS_CMD", "!stats")
+# The brain's own plugin (plug.py): optional drop/rewrite/handle/outbound/
+# event hooks from one file on the PVC. Replaces the old self-patch of /app —
+# plugins live on the PVC; /app is read-only and never patched.
+PLUGIN_FILE = env("BRAIN_PLUGIN", "/data/brain_plugin.py")
+plugin = plug.Plugin(PLUGIN_FILE, emit)
 
 OPENCODE_BIN = "opencode"
 BATCH_MAX = int(env("BRAIN_BATCH_MAX", "25"))  # submit a batch once it grows
@@ -273,11 +279,43 @@ def split_model(model):
 
 
 # --- FIFO -------------------------------------------------------------------
-def write_fifo(lines, path, deadline=10.0):
+_CHAT_VERBS = ("SAY", "ACT", "NOTICE")
+
+
+def _outbound_hook(net_name, lines):
+    """The plugin's outbound gate, applied just before the FIFO write — the
+    ONE place every brain chat line passes. SAY/ACT/NOTICE only (QUIT, JOIN,
+    WHOIS and the bot's own RAW/DCC escape hatches are never rewritten): a
+    str return replaces the line's text, None blocks it (OUTBOUND_BLOCKED)."""
+    out = []
+    for ln in lines:
+        verb, _, rest = ln.partition(" ")
+        up = verb.upper()
+        if up not in _CHAT_VERBS or " " not in rest:
+            out.append(ln)
+            continue
+        target, _, text = rest.partition(" ")
+        res = plugin.call("outbound", net_name, up, target, text)
+        if res is plug.MISSING:
+            out.append(ln)
+        elif res is None:
+            emit("OUTBOUND_BLOCKED", net_name, up, target)
+        else:
+            out.append(f"{verb} {target} {res}")
+    return out
+
+
+def write_fifo(lines, path, deadline=10.0, net=None):
     """Write FIFO lines into the bot's named pipe. Non-blocking open + retry:
-    a bot that is down must not wedge the brain. Returns lines written."""
+    a bot that is down must not wedge the brain. Returns lines written.
+    `net` (a network label) switches on the plugin's outbound hook for that
+    batch; callers that know their net pass it, bare test callers don't."""
     if not lines:
         return 0
+    if net is not None:
+        lines = _outbound_hook(net, lines)
+        if not lines:
+            return 0
     payload = "".join(f"{ln}\n" for ln in lines).encode("utf-8")
     end = time.monotonic() + deadline
     while time.monotonic() < end:
@@ -296,6 +334,45 @@ def write_fifo(lines, path, deadline=10.0):
             os.close(fd)
     emit("FIFO_WRITE_TIMEOUT", path)
     return 0
+
+
+# --- plugin surface -----------------------------------------------------------
+class _HandleCtx:
+    """The namespace the `handle` hook gets, built fresh per event: FIFO
+    primitives bound to that event's net (the brain's own verb grammar,
+    verbatim — no bot.py import), the net's learned nick, and the BRAIN log.
+    With no known net the senders no-op: a plugin must never be able to
+    wedge the brain on a vanished network."""
+
+    __slots__ = ("net", "nick", "_fifo")
+
+    def __init__(self, net_name, nick, fifo):
+        self.net = net_name
+        self.nick = nick
+        self._fifo = fifo
+
+    def say(self, target, text):
+        if self._fifo:
+            write_fifo([f"SAY {target} {text}"], self._fifo, net=self.net)
+
+    def notice(self, target, text):
+        if self._fifo:
+            write_fifo([f"NOTICE {target} {text}"], self._fifo, net=self.net)
+
+    def send(self, raw):
+        if self._fifo:
+            write_fifo([raw], self._fifo, net=self.net)
+
+    @staticmethod
+    def emit(*parts):
+        emit(*parts)
+
+
+def plugin_event(name, **payload):
+    """Fire-and-forget lifecycle notification to the plugin's `event` hook.
+    Inline by design (a plugin is code, not a service — no threads): the
+    loader's try/except is the whole isolation story."""
+    plugin.call("event", name, payload)
 
 
 # --- tail -------------------------------------------------------------------
@@ -524,6 +601,7 @@ class Brain:
             leftover = sess.pending
         self.save_session_store()
         emit("SESSION_RESET", sess.title, reason, f"turns={sess.turns}")
+        plugin_event("reset", reason=reason, turns=sess.turns)
         self.mem.append_activity(
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
         self.registers = registers()      # registers live like the session
@@ -536,6 +614,16 @@ class Brain:
     def feed(self, net_name, ev):
         if ev is None:
             return
+        # Plugin hooks first, before every built-in gate: drop makes the
+        # event never have existed (even when addressed); rewrite replaces
+        # it wholesale — every later check runs on what the plugin left.
+        if plugin.call("drop", ev, net_name) is True:
+            return
+        rewritten = plugin.call("rewrite", ev, net_name)
+        if rewritten is not plug.MISSING:
+            if rewritten is None:
+                return
+            ev = rewritten
         if policy.is_muted(ev, MUTE):
             return
         sess = self.ensure_session()
@@ -551,14 +639,22 @@ class Brain:
         if not policy.wakes_model(ev, nick, ADDRESS_ONLY):
             return
         # !stats: trusted users get telemetry straight from the brain — no
-        # model turn, no batch, the answer rides the FIFO right now.
+        # model turn, no batch, the answer rides the FIFO right now. It stays
+        # ahead of the plugin's handle hook: the built-in wins. (No outer
+        # lock here: ensure_session takes self.lock itself — the old
+        # `with self.lock:` around it deadlocked the brain on every !stats.)
         body = (ev.get("body") or "").strip().lower()
         if (ev.get("kind") == "MSG" and body == STATS_CMD
                 and ev.get("trust") == "TRUSTED"):
-            with self.lock:
-                sess2 = self.ensure_session()
-                if sess2 is not None:
-                    self.stats_reply(sess2, ev)
+            sess2 = self.ensure_session()
+            if sess2 is not None:
+                self.stats_reply(sess2, ev)
+            return
+        # handle: the plugin may serve the event itself — say/notice/send
+        # over the FIFO, no model turn, nothing batched. False/absent falls
+        # through to the normal batch path.
+        ctx = self._plugin_ctx(net_name)
+        if plugin.call("handle", ev, net_name, ctx) is True:
             return
         with self.lock:
             sess.pending.append((time.monotonic(), ev))
@@ -569,6 +665,11 @@ class Brain:
             emit("PENDING_BACKLOG", sess.title, f"events={depth}")
         if PREEMPT_ON_ADDRESS:
             self._maybe_preempt(sess, ev, nick)
+
+    def _plugin_ctx(self, net_name):
+        net = self.net_by_name.get(net_name)
+        return _HandleCtx(net_name, self._net_nick(net_name),
+                          net.fifo if net else None)
 
     # -- preemption -------------------------------------------------------------------
     def _maybe_preempt(self, sess, ev, nick):
@@ -633,6 +734,7 @@ class Brain:
                                   model=self.model)
         except OSError as e:
             emit("PROMPT_ERROR", sess.title, repr(e))
+            plugin_event("error", reason=repr(e)[:200])
             with self.lock:
                 sess.pending = batch + sess.pending
             return
@@ -643,6 +745,7 @@ class Brain:
             # be dispatched like any other.
             sess.preempted_ts = None
         emit("PROMPT_SENT", sess.title, f"events={len(batch)}")
+        plugin_event("turn_start", turns=sess.turns)
 
     # -- collect ----------------------------------------------------------------------
     def _note_metrics(self, sess, msgs):
@@ -685,7 +788,8 @@ class Brain:
         if net is None:
             emit("STATS_ERROR", "unknown net", repr(net_name))
             return
-        write_fifo([f"NOTICE {target} [stats] {l}" for l in lines], net.fifo)
+        write_fifo([f"NOTICE {target} [stats] {l}" for l in lines], net.fifo,
+                   net=net_name)
         emit("STATS_SENT", net_name, target)
 
     def on_idle(self, sid):
@@ -699,6 +803,7 @@ class Brain:
             return
         sess.last_count = len(msgs)
         with self.lock:
+            started = sess.busy_since
             preempted = sess.preempted_ts is not None
             sess.preempted_ts = None
             sess.busy_since = None
@@ -715,6 +820,9 @@ class Brain:
         self.record_turn(sess, text)
         self._note_clean_turn(sess)
         self.dispatch(sess, text)
+        plugin_event("turn_end", turns=sess.turns,
+                     seconds=(round(time.monotonic() - started, 3)
+                              if started else None))
         # Monitor queueing: the next due batch goes out now.
         if self.due(sess):
             self.submit(sess)
@@ -772,7 +880,8 @@ class Brain:
                 continue
             by_net.setdefault(net_name, []).append(f"{verb} {arg}".rstrip())
         for net_name, lines in by_net.items():
-            n = write_fifo(lines, self.net_by_name[net_name].fifo)
+            n = write_fifo(lines, self.net_by_name[net_name].fifo,
+                           net=net_name)
             emit("SENT", n, sess.title, net_name, " ".join(lines)[:200])
 
     # -- agent guard (wedged turns) ---------------------------------------------------
@@ -817,7 +926,7 @@ class Brain:
         if sess is not None:
             line = (f"NOTICE {ADMIN} [gate] denied {what} ({patterns})")
             for net in self.nets:
-                write_fifo([line], net.fifo)
+                write_fifo([line], net.fifo, net=net.name)
 
     # -- SSE loop ------------------------------------------------------------------------
     def catch_up_missed_idles(self):
@@ -847,6 +956,7 @@ class Brain:
         while not self.stop_flag:
             try:
                 self.catch_up_missed_idles()
+                plugin_event("connect")
                 for ev in self.api.events():
                     self.on_event(ev)
                     backoff = 1.0
@@ -856,6 +966,7 @@ class Brain:
                 if self.stop_flag:
                     return
                 emit("SSE_ERROR", repr(e))
+                plugin_event("error", reason=repr(e)[:200])
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
@@ -876,6 +987,7 @@ class Brain:
                     sess.busy_since = sess.busy_since or time.monotonic()
         elif etype == "session.error":
             emit("SESSION_ERROR", str(props)[:200])
+            plugin_event("error", reason=str(props)[:200])
         elif etype == "permission.asked":
             self.gate(props)
         elif etype in ("session.next.compaction.ended", "session.compacted"):
@@ -1058,11 +1170,13 @@ class Brain:
              f"model={MODEL}", "dry-run" if self.dry_run else "live",
              f"mute={','.join(MUTE) or '-'}",
              "address-only" if ADDRESS_ONLY else "all-events")
+        plugin_event("start")
         self.mem = self.mem or setup_workdir()
         self.load_session_store()
         if not self.dry_run:
             self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
             emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
+            plugin_event("serve_up")
             self.api = Api(self.serve.url)
         else:
             self.serve = None
@@ -1115,6 +1229,7 @@ class Brain:
                     with self.lock:
                         self.sess = None
                     emit("SERVE_UP", fresh.url)
+                    plugin_event("serve_up")
             time.sleep(POLL)
         if self.serve:
             self.serve.stop()
