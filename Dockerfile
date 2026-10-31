@@ -22,7 +22,7 @@ RUN apt-get update \
 ENV TERM=tmux-256color
 
 FROM runtime-base AS bot
-COPY bot.py handlers.py irc_commands.py leak_guard.py util.py nets.py networks.py bot.say tmuxsup.py ./
+COPY bot.py handlers.py irc_commands.py leak_guard.py plug.py util.py nets.py networks.py webhook.py bot.say tmuxsup.py ./
 COPY bot.trust bot.trust.ircnet bot.reserved bot.startup ./
 ENV BOT_LOG=/data/bot.log \
     BOT_FIFO=/data/bot.send \
@@ -51,7 +51,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 # The OpenCode CLI (Node package). Pulls its own binary at install time.
 RUN npm install -g opencode-ai
-COPY brain.py policy.py networks.py memory_log.py util.py opencode.json tmuxsup.py ./
+COPY brain.py plug.py policy.py networks.py memory_log.py util.py opencode.json tmuxsup.py ./
 # tests/ ships the stub serve so the image is smoke-testable offline.
 COPY tests/ ./tests/
 ENV TERM=tmux-256color \

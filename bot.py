@@ -23,6 +23,8 @@ import threading
 import time
 
 import handlers
+import plug
+import webhook
 from leak_guard import LeakGuard
 from util import env, env_bool, now
 
@@ -60,6 +62,10 @@ STARTUP_FILE = env("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
 # next command picks it up — no restart, the IRC connection is never touched
 # (see handlers.py, the loader and the shipped reference copy).
 HANDLERS_FILE = env("BOT_HANDLERS", "/data/handlers.py")
+# The bot's own plugin file (plug.py): the outbound(target, text, verb) hook,
+# the bot-side twin of the brain's. Same deal: plugins live on the PVC; /app
+# is read-only and never patched. (The Plugin object is built after emit().)
+BOT_PLUGIN_FILE = env("BOT_PLUGIN", "/data/bot_plugin.py")
 # Shared by ALL instances on purpose (not per-network): see leak_guard.py.
 RESERVED_FILE = env("BOT_RESERVED", os.path.join(HERE, "bot.reserved"))
 RESERVED_STORE = env("BOT_RESERVED_STORE", os.path.join(HERE, "reserved_recent.tsv"))
@@ -157,6 +163,12 @@ def emit(kind, *parts):
             f.write(line + "\n")
     except OSError:
         pass
+
+
+# The bot's own plugin (plug.py): the outbound(target, text, verb) hook, the
+# bot-side twin of the brain's. Plugins live on the PVC; /app is read-only
+# and never patched.
+bot_plugin = plug.Plugin(BOT_PLUGIN_FILE, emit)
 
 
 def load_trust():
@@ -1005,6 +1017,16 @@ def process_cmd(line):
     verb = verb.upper()
     if not outbound_ok(verb, rest, origin):
         return
+    if verb in ("SAY", "ACT", "NOTICE") and " " in rest:
+        # The plugin's outbound hook sits exactly between the leak gate and
+        # the wire: a str return replaces the text, None blocks the line.
+        target, text = rest.split(" ", 1)
+        res = bot_plugin.call("outbound", target, text, verb)
+        if res is not plug.MISSING:
+            if res is None:
+                emit("BOT_PLUGIN_BLOCKED", verb, target)
+                return
+            rest = f"{target} {res}"
     if verb == "SAY":
         if " " not in rest:
             emit("CMD_ERROR", "SAY needs <target> <text>", repr(rest))
@@ -1097,6 +1119,7 @@ def main():
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
+    webhook.start(log=emit)   # inbound webhooks, when /data/webhooks.json says so
     reader_loop()
 
 
