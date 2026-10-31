@@ -1,3 +1,5 @@
+import importlib.util
+import os
 from unittest import mock
 
 import bot
@@ -277,3 +279,127 @@ def test_keepalive_tick_disabled_at_zero():
         sr.assert_not_called()
     finally:
         bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive = old
+
+
+# --- persistent IRC command hook (_irc_command_dispatch) ---------------------
+
+FAKE_CMD = (
+    "GOT = None\n"
+    "def handle(target, nick, body, trusted, send_raw, emit, split_say):\n"
+    "    global GOT\n"
+    "    GOT = (target, nick, body, trusted, send_raw, emit, split_say)\n"
+    "    return %r\n"
+)
+
+
+def _write_fake_cmd(path, token):
+    # handle() records its positional args and returns `token`, so a test can
+    # pin both the call shape and the pass-through in one file.
+    path.write_text(FAKE_CMD % token)
+
+
+def _install_fake_cmd(tmp_path, token="v1"):
+    f = tmp_path / "irc_commands.py"
+    _write_fake_cmd(f, token)
+    bot.IRC_COMMANDS_FILE = str(f)
+    bot._irc_mod = None
+    bot._irc_mtime = None
+    bot._irc_missing_seen = False
+    return f
+
+
+def test_irc_dispatch_passes_args_positionally_and_returns(tmp_path):
+    old = (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+           bot._irc_missing_seen)
+    try:
+        f = _install_fake_cmd(tmp_path, "v1")
+        with mock.patch.object(bot, "send_raw") as sr, \
+                mock.patch.object(bot, "emit") as em, \
+                mock.patch.object(bot, "split_say") as ss:
+            rv = bot._irc_command_dispatch("#c", "katia", "!tom", True)
+        assert rv == "v1"
+        assert bot._irc_mod.GOT == ("#c", "katia", "!tom", True, sr, em, ss)
+        assert any(c.args == ("IRC_COMMANDS_LOADED", str(f))
+                   for c in em.call_args_list)
+    finally:
+        (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+         bot._irc_missing_seen) = old
+
+
+def test_irc_dispatch_reloads_when_mtime_changes(tmp_path):
+    old = (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+           bot._irc_missing_seen)
+    try:
+        f = _install_fake_cmd(tmp_path, "v1")
+        with mock.patch.object(bot, "emit"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "split_say"):
+            assert bot._irc_command_dispatch("#c", "n", "!x", False) == "v1"
+        st = os.stat(f)
+        _write_fake_cmd(f, "v2")
+        # Two writes can land inside one filesystem timestamp tick; pin the
+        # new mtime so the reload gate cannot flake.
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 60_000_000_000))
+        with mock.patch.object(bot, "emit"), \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "split_say"):
+            assert bot._irc_command_dispatch("#c", "n", "!x", False) == "v2"
+    finally:
+        (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+         bot._irc_missing_seen) = old
+
+
+def test_irc_dispatch_import_error_is_loud_but_not_fatal(tmp_path):
+    old = (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+           bot._irc_missing_seen)
+    try:
+        f = tmp_path / "irc_commands.py"
+        f.write_text("raise RuntimeError('boom')\n")
+        bot.IRC_COMMANDS_FILE = str(f)
+        bot._irc_mod = None
+        bot._irc_mtime = None
+        bot._irc_missing_seen = False
+        with mock.patch.object(bot, "emit") as em, \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "split_say"):
+            rv = bot._irc_command_dispatch("#c", "n", "!x", False)
+        assert rv is None
+        assert any(c.args[0] == "IRC_CMD_IMPORT_ERROR"
+                   for c in em.call_args_list)
+    finally:
+        (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+         bot._irc_missing_seen) = old
+
+
+def test_irc_dispatch_missing_file_emits_once(tmp_path):
+    old = (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+           bot._irc_missing_seen)
+    try:
+        absent = tmp_path / "absent.py"
+        bot.IRC_COMMANDS_FILE = str(absent)
+        bot._irc_mod = None
+        bot._irc_mtime = None
+        bot._irc_missing_seen = False
+        with mock.patch.object(bot, "emit") as em, \
+                mock.patch.object(bot, "send_raw"), \
+                mock.patch.object(bot, "split_say"):
+            for _ in range(3):
+                bot._irc_command_dispatch("#c", "n", "!x", False)
+        assert [c.args for c in em.call_args_list
+                if c.args[0] == "IRC_COMMANDS_MISSING"] == \
+            [("IRC_COMMANDS_MISSING", str(absent))]
+    finally:
+        (bot.IRC_COMMANDS_FILE, bot._irc_mod, bot._irc_mtime,
+         bot._irc_missing_seen) = old
+
+
+def test_shipped_irc_commands_imports_cleanly():
+    # The image fallback copy must always be importable: a syntax error there
+    # would only ever surface in production with /data unmounted.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "ocbot_irc_commands_shipped_test",
+        os.path.join(root, "irc_commands.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert callable(mod.handle)

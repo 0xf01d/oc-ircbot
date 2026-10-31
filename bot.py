@@ -738,6 +738,11 @@ def handle_server_line(line):
         emit("MSG", trust, f"FROM={nick}", f"HOST={host}", f"TO={target}", f"BODY={body}")
         if is_trust_listed(nick) and not trusted:
             emit("TRUST_DENIED", nick, host, reason)
+        if target.startswith("#") and body.startswith("!"):
+            try:
+                _irc_command_dispatch(target, nick, body, trusted)
+            except Exception as e:
+                emit("IRC_CMD_ERROR", repr(e))
         if target.startswith("#") and nick.lower() != NICK.lower():
             _arm_idle(target)
         return
@@ -939,6 +944,49 @@ def load_handlers():
         return
     if handlers.load(HANDLERS_FILE, emit) is not None:
         emit("HANDLERS_LOADED", HANDLERS_FILE, f"verbs={len(handlers.verbs())}")
+
+
+# --- persistent IRC commands (!ab2filter et al.) -----------------------------
+# The command bodies live in /data/irc_commands.py on the PVC, so they survive
+# bot restarts; this hook is the only part that lives in the image. Hot reload
+# is mtime-gated like handlers.py.
+IRC_COMMANDS_FILE = env("BOT_IRC_COMMANDS", "/data/irc_commands.py")
+_irc_mod = None
+_irc_mtime = None
+_irc_lock = threading.Lock()
+_irc_missing_seen = False
+
+
+def _irc_command_dispatch(target, nick, body, trusted):
+    global _irc_mod, _irc_mtime, _irc_missing_seen
+    try:
+        mtime = os.stat(IRC_COMMANDS_FILE).st_mtime_ns
+    except OSError:
+        # A missing file used to be silent, which made a dead hook look like a
+        # healthy bot; say it once, then stay quiet (the PVC mounts later than
+        # the first message in the worst case).
+        if not _irc_missing_seen:
+            _irc_missing_seen = True
+            emit("IRC_COMMANDS_MISSING", IRC_COMMANDS_FILE)
+        return
+    with _irc_lock:
+        if _irc_mod is None or mtime != _irc_mtime:
+            import importlib.util
+            name = "ocbot_irc_commands_%d" % int(time.time() * 1000)
+            spec = importlib.util.spec_from_file_location(name, IRC_COMMANDS_FILE)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as e:
+                sys.modules.pop(name, None)
+                emit("IRC_CMD_IMPORT_ERROR", repr(e))
+                return
+            _irc_mod = mod
+            _irc_mtime = mtime
+            emit("IRC_COMMANDS_LOADED", IRC_COMMANDS_FILE)
+        mod = _irc_mod
+    return mod.handle(target, nick, body, trusted, send_raw, emit, split_say)
 
 
 def process_cmd(line):
