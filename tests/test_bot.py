@@ -230,3 +230,50 @@ def test_311_flag_off_verifies_nothing():
     finally:
         (bot.trust_rules, bot.verified, bot.whois_pending,
          bot.TRUST_VIA_311) = old
+
+
+def test_keepalive_tick_pings_after_silence():
+    old = (bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive)
+    try:
+        bot.KEEPALIVE_SECS = 30.0
+        bot.last_recv = 0.0            # silent since forever
+        bot.last_keepalive = 0.0
+        with mock.patch.object(bot, "send_raw") as sr, \
+                mock.patch.object(bot, "emit") as em, \
+                mock.patch.object(bot.time, "monotonic", return_value=100.0):
+            bot.keepalive_tick()
+        sr.assert_called_once_with("PING :keepalive")
+        assert any(c.args[0] == "KEEPALIVE_SENT" for c in em.call_args_list)
+        assert bot.last_keepalive == 100.0
+    finally:
+        bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive = old
+
+
+def test_keepalive_tick_quiet_on_fresh_link():
+    old = (bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive)
+    try:
+        bot.KEEPALIVE_SECS = 30.0
+        bot.last_recv = 100.0          # now - last_recv = 0: nothing due
+        bot.last_keepalive = 0.0
+        with mock.patch.object(bot, "send_raw") as sr, \
+                mock.patch.object(bot, "emit"), \
+                mock.patch.object(bot.time, "monotonic", return_value=100.0):
+            bot.keepalive_tick()
+        sr.assert_not_called()
+    finally:
+        bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive = old
+
+
+def test_keepalive_tick_disabled_at_zero():
+    old = (bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive)
+    try:
+        bot.KEEPALIVE_SECS = 0.0       # BOT_KEEPALIVE=0
+        bot.last_recv = 0.0            # ancient — would fire if enabled
+        bot.last_keepalive = 0.0
+        with mock.patch.object(bot, "send_raw") as sr, \
+                mock.patch.object(bot, "emit"), \
+                mock.patch.object(bot.time, "monotonic", return_value=1000.0):
+            bot.keepalive_tick()
+        sr.assert_not_called()
+    finally:
+        bot.KEEPALIVE_SECS, bot.last_recv, bot.last_keepalive = old

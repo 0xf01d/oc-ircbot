@@ -773,8 +773,42 @@ def handle_server_line(line):
 RECV_RETRY_SLEEP = 0.05
 RECV_RETRY_MAX = 200            # ~10s of solid EAGAIN, then die for real
 
+# Client keepalive: after the initial burst a quiet link (GeekShed, an idle
+# bouncer) can carry no bytes for minutes and the 420s recv timeout fires on
+# a perfectly healthy socket. Past KEEPALIVE_SECS of silence, send one PING;
+# the PONG (any inbound byte) resets last_recv. 0 disables. The 420 socket
+# timeout stays: the keepalive keeps it from firing on a live link and it
+# still kills a genuinely dead one.
+KEEPALIVE_SECS = float(env("BOT_KEEPALIVE", "120"))
+last_recv = time.monotonic()    # last inbound byte; the reader owns it
+last_keepalive = 0.0
+
+
+def keepalive_tick():
+    """One PING per KEEPALIVE_SECS of silence, never more than one per
+    interval: the wake-up cadence is KEEPALIVE_SECS/3, so a link that stays
+    silent must not produce three PINGs and three events per window."""
+    global last_keepalive
+    if KEEPALIVE_SECS <= 0:
+        return
+    nowm = time.monotonic()
+    if nowm - last_recv < KEEPALIVE_SECS:
+        return
+    if nowm - last_keepalive < KEEPALIVE_SECS:
+        return
+    last_keepalive = nowm
+    send_raw("PING :keepalive")
+    emit("KEEPALIVE_SENT")
+
+
+def keepalive_loop():
+    while True:
+        time.sleep(max(KEEPALIVE_SECS / 3.0, 5.0))
+        keepalive_tick()
+
 
 def reader_loop():
+    global last_recv
     buf = b""
     retries = 0
     while True:
@@ -796,6 +830,7 @@ def reader_loop():
         if not data:
             emit("DISCONNECTED")
             return
+        last_recv = time.monotonic()
         buf += data
         while b"\n" in buf:
             raw, buf = buf.split(b"\n", 1)
@@ -1012,6 +1047,7 @@ def main():
     send_raw(f"USER {IDENT} 0 * :{REAL}")
 
     threading.Thread(target=writer_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
     reader_loop()
 
