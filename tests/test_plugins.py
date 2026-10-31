@@ -19,8 +19,10 @@ import policy
 
 
 def _bump(path):
-    """Force a new mtime: two writes can land inside one mtime_ns tick."""
-    t = time.time_ns() + 1_000_000
+    """Force a new mtime, relative to the file's own: one second into the
+    PAST, so it stays distinct under any timestamp granularity (a future
+    value can truncate onto the current second on some filesystems)."""
+    t = os.stat(path).st_mtime_ns - 1_000_000_000
     os.utime(path, ns=(t, t))
 
 

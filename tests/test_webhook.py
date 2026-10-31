@@ -166,8 +166,9 @@ def test_config_hot_reloads_on_mtime(server, tmp_path):
                               "trust": "TRUSTED"}
     with open(server["cfg"], "w") as f:
         json.dump(cfg, f)
-    t = time.time_ns() + 1_000_000
-    os.utime(server["cfg"], ns=(t, t))       # force a fresh mtime
+    t = os.stat(server["cfg"]).st_mtime_ns - 1_000_000_000
+    os.utime(server["cfg"], ns=(t, t))       # 1s into the past: distinct
+                                             # under any timestamp granularity
     code, _ = _post(server["base"] + "/hook/second",
                     json.dumps({"text": "from the new hook"}).encode(),
                     token="t2")
