@@ -187,6 +187,26 @@ def test_build_system_without_registers():
     assert "Channel registers" not in policy.build_system([("n", "bot")])
 
 
+# --- disclosure block (cross-channel and internal leakage) --------------------
+def test_build_system_disclosure_block_once_before_persona():
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert s.count("Disclosure (absolute):") == 1
+    assert s.index("Disclosure (absolute):") < s.index("Persona (absolute")
+
+
+def test_build_system_disclosure_names_the_leak_classes():
+    # The stable contract substrings: sealed channels, private material.
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert "sealed compartment" in s
+    assert "do not discuss other channels" in s
+    assert "private message" in s and "private material" in s
+
+
+def test_build_system_is_deterministic_for_same_arguments():
+    args = ([("azzurra", "a"), ("libera", "b")], {"#olografix": "reg"}, "x")
+    assert policy.build_system(*args) == policy.build_system(*args)
+
+
 def test_fmt_event_vjt_prefix_and_host():
     # The vjt shape: [HH:MM] net|target <nick>: text — and HOST= never
     # stripped (the anti-spoof rule: the Monitor must never be host-blind).
