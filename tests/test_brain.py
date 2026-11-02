@@ -365,6 +365,96 @@ def test_turn_cap_resets_the_session(tmp_path):
         w.stop()
 
 
+def test_turn_cap_reset_ends_on_a_fresh_zero_turn_session(tmp_path):
+    # The live incident (issue #5): reset_session kept self.stored_sid
+    # pointing at the discarded session, ensure_session re-attached it
+    # (still on the server, still over cap) and the cap check fired again
+    # — ~750 resets in two minutes. A turn-cap reset must end on a
+    # genuinely fresh session at turns == 0, with the new sid persisted,
+    # and no second reset may follow.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.list_sessions.return_value = [{"id": "ses_old"}]  # still on server
+    b.api.create_session.return_value = {"id": "ses_new"}
+    sess = brain.Session("ses_old", "irc:global", "sys")
+    sess.turns = brain.MAX_TURNS
+    b.sess = sess
+    with mock.patch.object(brain, "WORKDIR", str(tmp_path)):
+        b.stored_sid = "ses_old"          # the discarded sid, still in memory
+        b.record_turn(sess, "no refusal here")     # turns >= MAX -> reset
+        assert b.sess.sid == "ses_new"    # fresh, not a re-attach of ses_old
+        assert b.sess.turns == 0
+        assert b.stored_sid == "ses_new"  # memory mirrors the persisted sid
+        assert json.load(open(str(tmp_path / "sessions.json"))) == \
+            {"session": "ses_new"}
+        # The cap check cannot re-arm on the fresh session: one reset, done.
+        b.record_turn(b.sess, "no refusal here")
+        assert b.api.create_session.call_count == 1
+        assert b.sess.sid == "ses_new"
+        assert b.sess.turns == 1
+
+
+def test_reset_loop_guard_retires_a_still_over_cap_session(tmp_path, capsys):
+    # Defence in depth: a reset that produces a session STILL over cap
+    # (a broken server count coming back through re-attach) must not
+    # spin — RESET_LOOP_GUARD logs once and retires that session object;
+    # every later poll re-sees it as a no-op instead of a reset.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    overcap = brain.Session("ses_still", "irc:global", "sys")
+    overcap.turns = brain.MAX_TURNS
+    sess = brain.Session("ses_old", "irc:global", "sys")
+    sess.turns = brain.MAX_TURNS
+    b.sess = sess
+
+    def broken_ensure():
+        with b.lock:
+            b.sess = overcap
+        return overcap
+
+    with mock.patch.object(brain, "WORKDIR", str(tmp_path)), \
+            mock.patch.object(b, "ensure_session", broken_ensure):
+        b.reset_session(sess, "turn-cap")
+        assert "RESET_LOOP_GUARD" in capsys.readouterr().out
+        assert b.sess is overcap
+        assert overcap.reset_guard
+        b.reset_session(overcap, "turn-cap")
+        b.reset_session(overcap, "wedged-twice")
+    assert "RESET_LOOP_GUARD" not in capsys.readouterr().out   # logged once
+    assert b.api.create_session.call_count == 0
+
+
+def test_idle_after_a_cap_reset_never_submits_to_the_dead_sid(tmp_path):
+    # The turn that hits the cap still dispatches its answer, but the
+    # leftover queue now belongs to the fresh session: the abandoned
+    # session object is never driven again.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.list_sessions.return_value = []
+    b.api.create_session.return_value = {"id": "ses_new"}
+    b.api.messages.return_value = [
+        {"info": {"role": "assistant", "time": {"created": 1, "completed": 2},
+                  "tokens": {"output": 5}, "modelID": "m"},
+         "parts": [{"type": "text", "text": "SAY irc|#c done"}]},
+    ]
+    sess = brain.Session("ses_old", "irc:global", "sys")
+    sess.turns = brain.MAX_TURNS
+    sess.busy_since = time.monotonic()
+    sess.preempted_ts = None
+    ev = policy.parse_event("[12:00] MSG TRUSTED FROM=a HOST=h TO=#test "
+                            "BODY=queued during the turn")
+    sess.pending = [(time.monotonic(), ev)]
+    b.sess = sess
+    with mock.patch.object(brain, "WORKDIR", str(tmp_path)), \
+            mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.on_idle(sess.sid)
+        assert wf.called                     # the final answer still goes out
+    sids = [c.args[0] for c in b.api.prompt_async.call_args_list]
+    assert "ses_old" not in sids             # no batch to the dead sid
+    assert b.sess.sid == "ses_new"
+    assert [e for _t, e in b.sess.pending] == [ev]   # the queue moved over
+
+
 def test_wedged_turn_aborts_then_resets(tmp_path):
     w = Env(tmp_path, turn_delay=30.0)   # a turn that never returns
     w.start()
