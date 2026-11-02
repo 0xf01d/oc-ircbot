@@ -428,7 +428,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "preempted_ts", "born")
+                 "preempted_ts", "born", "reset_guard")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -449,6 +449,7 @@ class Session:
         self.preempted_ts = None           # monotonic when a preempt aborted
                                            # the running turn: the next idle
                                            # belongs to that aborted turn
+        self.reset_guard = False           # RESET_LOOP_GUARD: never reset again
 
 
 def last_assistant_text(messages):
@@ -570,6 +571,7 @@ class Brain:
         sess = Session(sid, title, system)
         with self.lock:
             self.sess = sess
+        self.stored_sid = sid             # memory mirrors the persisted sid
         self.save_session_store()
         emit("SESSION_NEW", title, sid)
         self.rehydrate(sess)
@@ -590,7 +592,16 @@ class Brain:
 
     def reset_session(self, sess, reason):
         """The `/clear`: abandon the session, start a new one, rehydrate from
-        disk. Aborts first so we never reset mid-turn."""
+        disk. Aborts first so we never reset mid-turn. stored_sid is dropped
+        before ensure_session: the discarded session still exists on the
+        server, so a live stored_sid made the "fresh" session a re-attach
+        of the very session being reset — turns >= MAX_TURNS again, reset
+        again, ~750 spins in two minutes (the live incident). A fresh
+        session that arrives still over cap means a broken server count:
+        RESET_LOOP_GUARD retires that session object instead of spinning —
+        one reset per session, never per poll."""
+        if sess.reset_guard:
+            return
         try:
             self.api.abort(sess.sid)
         except OSError:
@@ -599,6 +610,8 @@ class Brain:
             if self.sess is sess:
                 self.sess = None
             leftover = sess.pending
+            sess.pending = []
+        self.stored_sid = None
         self.save_session_store()
         emit("SESSION_RESET", sess.title, reason, f"turns={sess.turns}")
         plugin_event("reset", reason=reason, turns=sess.turns)
@@ -606,6 +619,10 @@ class Brain:
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
         self.registers = registers()      # registers live like the session
         fresh = self.ensure_session()
+        if fresh is not None and fresh.turns >= MAX_TURNS:
+            emit("RESET_LOOP_GUARD", fresh.title, fresh.sid,
+                 f"turns={fresh.turns}")
+            fresh.reset_guard = True
         if fresh is not None and leftover:
             with self.lock:
                 fresh.pending = leftover + fresh.pending
@@ -818,13 +835,15 @@ class Brain:
         self._note_metrics(sess, msgs)
         text = last_assistant_text(msgs)
         self.record_turn(sess, text)
+        still_live = self.sess is sess    # record_turn may have reset it
         self._note_clean_turn(sess)
         self.dispatch(sess, text)
         plugin_event("turn_end", turns=sess.turns,
                      seconds=(round(time.monotonic() - started, 3)
                               if started else None))
-        # Monitor queueing: the next due batch goes out now.
-        if self.due(sess):
+        # Monitor queueing: the next due batch goes out now — on the live
+        # session only; a reset moved the queue to the fresh one.
+        if still_live and self.due(sess):
             self.submit(sess)
 
     def record_turn(self, sess, text):
