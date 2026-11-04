@@ -11,6 +11,7 @@ external sidecars stamp their name into bot.log and the reply stream without
 being parseable as a verb themselves. The tag is the vjt contract — dropping
 it turned every pre-existing sidecar's line into CMD_ERROR.
 """
+import collections
 import fnmatch
 import os
 import random
@@ -88,12 +89,186 @@ trust_rules = []        # list of (nick_lower, host_glob)
 verified = set()        # lowercase nicks confirmed via 307/330
 whois_pending = set()   # lowercase nicks we WHOIS'd, awaiting 307/318
 
+# IRCv3 account discovery: with these caps a nick's NickServ account arrives
+# on JOIN (extended-join), on the names reply (userhost-in-names) and on
+# every message (account-tag, account-notify), so trust_check resolves a
+# listed nick with zero WHOIS. Issue #7: 56 WHOIS in under a minute got
+# ocbot killed with Excess Flood.
+CAP_REQ = ("extended-join", "userhost-in-names", "account-tag",
+           "account-notify", "multi-prefix", "message-tags", "server-time")
+caps_ack = set()        # lowercase caps the server ACKed; empty = WHOIS path
+accounts = {}           # lowercase nick -> NickServ account
+known_hosts = {}        # lowercase nick -> host, from 353 userhost-in-names
+
 # IRC line limit is 512 incl CRLF. Body safe ~400.
 MAX_BODY = 400
 
 sock = None
-send_lock = threading.Lock()
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
+
+# Outbound pacing (issue #7: hackint killed ocbot with Excess Flood after 56
+# WHOIS at 3-4/s). send_raw ENQUEUES and returns — it never sleeps, never
+# touches the socket — so the reader thread (handle_server_line) and the FIFO
+# thread can never be stalled by the bucket. One sender thread owns the write
+# side and drains two FIFOs: a priority lane for RATE_BYPASS verbs (PONG/QUIT
+# and the CAP/PASS/NICK/USER registration burst — a delayed PONG breaks
+# keepalive, so a PONG goes out in milliseconds even behind a full backlog;
+# never dropped, never paced), then a bounded normal lane paced by the token
+# bucket (BOT_SEND_RATE msgs/s sustained, BOT_SEND_BURST instantaneous,
+# RATE_WAIT events while it is dry). When the normal lane is full the OLDEST
+# chat line (PRIVMSG/NOTICE — not protocol-critical) is dropped and counted as
+# `QUEUE_DROP <total>`; JOIN/PART/WHOIS/MODE are never dropped (for them the
+# lane may exceed the bound rather than lose a line). Ordering: each lane is
+# FIFO, so lines enqueued by one thread go out in order; across threads only
+# the enqueue order into the same lane is kept, which is enough — a sender
+# never reorders within a lane.
+SEND_RATE = float(env("BOT_SEND_RATE", "2")) or 2.0
+SEND_BURST = float(env("BOT_SEND_BURST", "4")) or 4.0
+SEND_QUEUE = int(env("BOT_SEND_QUEUE", "256"))
+RATE_BYPASS = frozenset(("PONG", "QUIT", "CAP", "PASS", "NICK", "USER"))
+_DROP_OK = frozenset(("PRIVMSG", "NOTICE"))      # chat lines: droppable
+_rate_lock = threading.Lock()
+_rate_tokens = SEND_BURST
+_rate_ts = time.monotonic()
+_q_cond = threading.Condition()                  # guards both lanes + stop
+_q_pri = collections.deque()                     # (line, origin), bypass verbs
+_q_norm = collections.deque()                    # (line, origin), paced
+_q_dropped = 0                                   # cumulative QUEUE_DROP count
+_send_stop = None        # monotonic deadline: sender gives up on _q_norm past it
+SENDER_DRAIN_SECS = 2.0  # shutdown: bounded drain of the normal lane
+sender_thread = None
+
+
+def _rate_try():
+    """Take a bucket token if one is available; False if the bucket is dry.
+    Only the sender thread calls this, so the wait it implies never blocks
+    the reader or the FIFO thread."""
+    global _rate_tokens, _rate_ts
+    with _rate_lock:
+        nowm = time.monotonic()
+        _rate_tokens = min(SEND_BURST,
+                           _rate_tokens + (nowm - _rate_ts) * SEND_RATE)
+        _rate_ts = nowm
+        if _rate_tokens >= 1.0:
+            _rate_tokens -= 1.0
+            return True
+        return False
+
+
+def _rate_deficit():
+    """Seconds until the next token; display only (RATE_WAIT events)."""
+    with _rate_lock:
+        return (1.0 - _rate_tokens) / SEND_RATE
+
+
+def _verb_of(line):
+    return line.split(None, 1)[0].upper() if line.strip() else ""
+
+
+def send_raw(s, origin=None):
+    """Enqueue for the sender thread and return. Blocking here once froze the
+    reader thread long enough to hit the ping timeout on a busy channel."""
+    global _q_dropped
+    verb = _verb_of(s)
+    dropped = None
+    with _q_cond:
+        if verb in RATE_BYPASS:
+            _q_pri.append((s, origin))
+        else:
+            if len(_q_norm) >= SEND_QUEUE:
+                for i, (line, _) in enumerate(_q_norm):
+                    if _verb_of(line) in _DROP_OK:
+                        del _q_norm[i]
+                        _q_dropped += 1
+                        dropped = _q_dropped
+                        break
+                # else: no chat line to sacrifice — keep the protocol line,
+                # the lane exceeds the bound instead of losing it.
+            _q_norm.append((s, origin))
+        _q_cond.notify()
+    if dropped is not None:
+        emit("QUEUE_DROP", dropped)
+
+
+def _send_one(item):
+    line, origin = item
+    # No token here: priority items are never paced, and a paced item only
+    # reaches this point after _rate_try handed its token to the caller.
+    log(">", line, origin)
+    try:
+        sock.sendall((line + "\r\n").encode("utf-8", errors="replace"))
+    except Exception as e:
+        emit("ERROR", "send-fail", repr(e))
+
+
+_RATE_SLICE = 0.02   # token-wait slice: bounds PONG latency behind a backlog
+
+
+def sender_loop():
+    """Owns the socket write side. Priority lane first, then the paced normal
+    lane; each is FIFO, so a caller's lines go out in order. A paced line
+    waits for its token in short slices, re-checking the priority lane
+    between slices, so a PONG landing mid-wait goes out in milliseconds even
+    with a full backlog. _send_stop is a give-up deadline: the priority lane
+    is always flushed in full (a QUIT is never lost), the normal lane only
+    until the deadline, then the sender exits."""
+    held = None      # paced line parked while priority lines jump ahead
+    while True:
+        item, paced = None, False
+        with _q_cond:
+            if _q_pri:
+                item = _q_pri.popleft()      # priority always wins, even over
+            elif held is not None:           # a parked line mid-token-wait
+                item, paced = held, True
+                held = None
+            elif _q_norm:
+                item, paced = _q_norm.popleft(), True
+            elif _send_stop is not None and time.monotonic() >= _send_stop:
+                return
+            else:
+                _q_cond.wait(0.2)
+                continue
+        if not paced:
+            _send_one(item)
+            continue
+        announced = False
+        while True:
+            with _q_cond:
+                if _q_pri:
+                    held = item      # park it, serve the priority line first
+                    break
+                if _send_stop is not None and time.monotonic() >= _send_stop:
+                    return           # shutdown give-up: the parked line is lost
+            if _rate_try():
+                _send_one(item)
+                break
+            if not announced:
+                emit("RATE_WAIT", f"{_rate_deficit():.2f}")
+                announced = True
+            time.sleep(_RATE_SLICE)
+
+
+def start_sender():
+    global sender_thread
+    sender_thread = threading.Thread(
+        target=sender_loop, name="sender", daemon=True)
+    sender_thread.start()
+
+
+def shutdown_outbound():
+    """On the way out: flush the priority lane fully (QUIT reaches the wire),
+    give the normal lane a short bounded drain, then give up and close."""
+    global _send_stop
+    with _q_cond:
+        if _send_stop is None:
+            _send_stop = time.monotonic() + SENDER_DRAIN_SECS
+        _q_cond.notify_all()
+    if sender_thread is not None:
+        sender_thread.join(SENDER_DRAIN_SECS + 5)
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
 # `IDLE <chan>` once, disarm, and re-arm on the next human message. Our own
@@ -138,8 +313,11 @@ def idle_ticker_loop():
 def emit(kind, *parts):
     # [HH:MM] anchor (no seconds, by request) — start-monitor.sh's grep and
     # policy._EVENT both tolerate it. The EVENTS_FILE append is best-effort: a
-    # sidecar container tails it instead of our stdout.
+    # sidecar container tails it instead of our stdout. Both file writers
+    # (this one and log()) mask through _mask_secrets, so a future caller
+    # cannot put a secret on disk by choosing the other sink.
     line = f"[{now('%H:%M')}] " + kind + " " + " ".join(str(p) for p in parts)
+    line = _mask_secrets(line)
     print(line, flush=True)
     try:
         with open(EVENTS_FILE, "a") as f:
@@ -264,6 +442,7 @@ def dm_flush(nick, reason):
 
 def trust_reset(nick, reason):
     n = nick.lower()
+    accounts.pop(n, None)
     dm_flush(nick, f"reset:{reason}")
     if n in verified or n in whois_pending:
         verified.discard(n)
@@ -271,10 +450,44 @@ def trust_reset(nick, reason):
         emit("TRUST_RESET", nick, reason)
 
 
+def note_account(nick, account):
+    """extended-join / account-notify / account-tag / WHOIS 330 delivered a
+    nick's NickServ account. A real account proves services registration, so
+    the same `verified` set trust_check reads is satisfied without a WHOIS."""
+    if not nick or not account or account == "*":
+        return
+    n = nick.lower()
+    accounts[n] = account
+    whois_pending.discard(n)
+    if n not in verified:
+        verified.add(n)
+        if is_trust_listed(n):
+            emit("VERIFIED", nick, f"ACCOUNT={account}")
+            dm_flush(nick, "account")
+
+
+# Services auth lines: the secret must be masked even when the env value and
+# the wire value disagree (stale .env, a rotated password sent through FIFO
+# RAW), which is exactly how cleartext reached the wire log despite the
+# value-replace above. IDENTIFY accepts [nick] password, GHOST is
+# `GHOST <nick> <pass>` — masking the LAST argument covers both. Unanchored:
+# event lines carry a [HH:MM] prefix before the send.
+_SERVICES_SEND_RE = re.compile(
+    r"(PRIVMSG\s+(?:NickServ|NS)\s+:\s*)(\S+)(\s+([^\r\n]*))?\s*$")
+_SERVICES_SECRET_VERBS = {"identify", "register", "recover", "release",
+                          "ghost", "group", "set"}
+
+
 def _mask_secrets(line):
-    if NICKSERV_PASS and NICKSERV_PASS in line:
-        return line.replace(NICKSERV_PASS, "********")
-    return line
+    masked = line
+    if NICKSERV_PASS:
+        masked = masked.replace(NICKSERV_PASS, "********")
+    m = _SERVICES_SEND_RE.search(masked)
+    if m and m.group(2).lower() in _SERVICES_SECRET_VERBS and m.group(4):
+        toks = m.group(4).split()
+        toks[-1] = "********"
+        masked = f"{m.group(1)}{m.group(2)} {' '.join(toks)}"
+    return masked
 
 
 # Origin tags are stamped into bot.log and read back by parsers, so keep them
@@ -289,15 +502,6 @@ def log(direction, line, origin=None):
             f.write(f"{now('%H:%M:%S')} {direction} {tag}{_mask_secrets(line)}\n")
     except Exception:
         pass
-
-
-def send_raw(s, origin=None):
-    log(">", s, origin)
-    with send_lock:
-        try:
-            sock.sendall((s + "\r\n").encode("utf-8", errors="replace"))
-        except Exception as e:
-            emit("ERROR", "send-fail", repr(e))
 
 
 def split_say(target, text, origin=None):
@@ -546,6 +750,14 @@ def _reclaim_after_ghost():
 def handle_server_line(line):
     global registered, ghost_needed, tmp_nick
     log("<", line)
+    # IRCv3 message-tags: @tag=value;... precedes the prefix. The `account`
+    # tag carries the sender's NickServ account on every message.
+    tags = {}
+    if line.startswith("@"):
+        tag_str, _, line = line.partition(" ")
+        for t in tag_str[1:].split(";"):
+            k, _, v = t.partition("=")
+            tags[k] = v
     if line.startswith("PING "):
         send_raw("PONG " + line[5:])
         return
@@ -559,6 +771,8 @@ def handle_server_line(line):
     # against the trust host glob, in the stream itself.
     host = prefix.split("@", 1)[1] if prefix and "@" in prefix else ""
     rest = rest or ""
+    if tags.get("account") not in (None, "", "*"):
+        note_account(nick, tags["account"])
     if cmd in ("PRIVMSG", "NOTICE", "TOPIC") and " :" in rest:
         tgt, _, body = rest.partition(" :")
         leak_guard.record(tgt.strip(), body)
@@ -566,6 +780,11 @@ def handle_server_line(line):
     if cmd == "001":
         registered = True
         emit("CONNECTED", NICK)
+        # Registration is complete, so negotiation is ours to finish: one REQ
+        # for the whole set, END right away (the ircd processes in order and
+        # ACKs/NAKs on the way). A NAK only degrades to the WHOIS path.
+        send_raw("CAP REQ :" + " ".join(CAP_REQ))
+        send_raw("CAP END")
         for tn, _ in trust_rules:
             whois_pending.add(tn)
             send_raw(f"WHOIS {tn}")
@@ -600,6 +819,19 @@ def handle_server_line(line):
         reason = parts[1] if len(parts) > 1 else "No such nick/channel"
         emit("IRC_ERROR", "401", tgt, reason)
         return
+    if cmd == "CAP":
+        head, _, caps_str = rest.partition(" :")
+        toks = head.split()
+        sub = toks[1].upper() if len(toks) > 1 else ""
+        caps = caps_str.split()
+        if sub == "ACK":
+            caps_ack.update(c.lower() for c in caps)
+            emit("CAP_ACK", " ".join(caps))
+        elif sub == "NAK":
+            # No abort: whatever was ACKed stays, the rest degrades to the
+            # WHOIS fallback path.
+            emit("CAP_NAK", " ".join(caps))
+        return
     if cmd == "307":    # RPL_WHOISREGNICK (Azzurra/bahamut)
         parts = rest.split()
         if len(parts) >= 2:
@@ -616,6 +848,8 @@ def handle_server_line(line):
             target = parts[1].lower()
             verified.add(target)
             whois_pending.discard(target)
+            if len(parts) >= 3:
+                accounts[target] = parts[2]
             emit("VERIFIED", parts[1])
             dm_flush(parts[1], "330")
         return
@@ -629,6 +863,24 @@ def handle_server_line(line):
                 if target not in verified:
                     emit("NOT_REGISTERED", parts[1])
             dm_flush(parts[1], "318")   # nothing stays parked past ENDOFWHOIS
+        return
+    if cmd == "353":
+        # RPL_NAMREPLY. With userhost-in-names each entry is nick!user@host
+        # (prefix chars first), so channel membership gives us the host for
+        # the trust glob with zero WHOIS; bare entries (cap not ACKed) are
+        # skipped by the "!" test.
+        body = rest.split(" :", 1)
+        head = body[0].split()
+        chan = head[2] if len(head) > 2 else (head[-1] if head else "")
+        entries = body[1].split() if len(body) > 1 else []
+        userhosts = 0
+        for entry in entries:
+            bare = entry.lstrip("~&@%+")
+            name, _, hostpart = bare.partition("!")
+            if hostpart and "@" in hostpart:
+                known_hosts[name.lower()] = hostpart.partition("@")[2]
+                userhosts += 1
+        emit("NAMES", chan, f"N={len(entries)}", f"USERHOSTS={userhosts}")
         return
     if cmd == "NOTICE":
         parts = rest.split(" :", 1)
@@ -715,8 +967,29 @@ def handle_server_line(line):
         if target.startswith("#") and nick.lower() != NICK.lower():
             _arm_idle(target)
         return
+    if cmd == "ACCOUNT":
+        # account-notify: the live account (or logout) for a nick, no WHOIS.
+        acct = rest.strip()
+        if acct == "*":
+            trust_reset(nick, "account-logout")
+        else:
+            note_account(nick, acct)
+        emit("ACCOUNT", nick, f"HOST={host}", acct)
+        return
     if cmd == "JOIN":
-        emit("JOIN", nick, f"HOST={host}", rest.lstrip(":"))
+        head = rest.split(" :", 1)[0]
+        toks = head.split()
+        chan = toks[0].lstrip(":") if toks else ""
+        if "extended-join" in caps_ack and len(toks) > 1:
+            # extended-join: JOIN <chan> <account> :<realname>; `*` = logged
+            # out, so any account knowledge for the nick is stale.
+            if toks[1] == "*":
+                trust_reset(nick, "account-logout")
+            else:
+                note_account(nick, toks[1])
+            emit("JOIN", nick, f"HOST={host}", chan, f"ACCOUNT={toks[1]}")
+        else:
+            emit("JOIN", nick, f"HOST={host}", rest.lstrip(":"))
         return
     if cmd == "PART":
         emit("PART", nick, f"HOST={host}", rest)
@@ -729,7 +1002,10 @@ def handle_server_line(line):
     if cmd == "NICK":
         new_nick = rest.lstrip(":")
         emit("NICK_CHANGE", nick, f"HOST={host}", new_nick)
+        moved_account = accounts.pop(nick.lower(), None)
         trust_reset(nick, "nick-change")
+        if moved_account:
+            note_account(new_nick, moved_account)
         if ghost_needed and new_nick.lower() == NICK.lower():
             ghost_needed = False
             if NICKSERV_PASS:
@@ -882,6 +1158,14 @@ def process_cmd(line):
              "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC")
 
 
+def send_registration():
+    # CAP LS 302 before NICK/USER so the server answers with its v3.2 cap
+    # list; the REQ (and END) go out after 001, in handle_server_line.
+    send_raw("CAP LS 302")
+    send_raw(f"NICK {NICK}")
+    send_raw(f"USER {IDENT} 0 * :{REAL}")
+
+
 def main():
     global sock
     load_trust()
@@ -908,12 +1192,15 @@ def main():
         sock = raw
         sock.settimeout(420)
         emit("TCP_OK", HOST, PORT, "plaintext")
-    send_raw(f"NICK {NICK}")
-    send_raw(f"USER {IDENT} 0 * :{REAL}")
+    start_sender()          # must run before send_registration: the burst
+    send_registration()     # rides the priority lane through the sender
 
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
-    reader_loop()
+    try:
+        reader_loop()
+    finally:
+        shutdown_outbound()
 
 
 if __name__ == "__main__":
