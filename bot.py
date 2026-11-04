@@ -11,6 +11,7 @@ external sidecars stamp their name into bot.log and the reply stream without
 being parseable as a verb themselves. The tag is the vjt contract — dropping
 it turned every pre-existing sidecar's line into CMD_ERROR.
 """
+import collections
 import fnmatch
 import os
 import random
@@ -103,19 +104,171 @@ known_hosts = {}        # lowercase nick -> host, from 353 userhost-in-names
 MAX_BODY = 400
 
 sock = None
-send_lock = threading.Lock()
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
 
 # Outbound pacing (issue #7: hackint killed ocbot with Excess Flood after 56
-# WHOIS at 3-4/s): token bucket, BOT_SEND_RATE msgs/s sustained, BOT_SEND_BURST
-# instantaneous. Latency-critical verbs bypass it — a delayed PONG breaks
-# keepalive and the registration burst must never stall.
+# WHOIS at 3-4/s). send_raw ENQUEUES and returns — it never sleeps, never
+# touches the socket — so the reader thread (handle_server_line) and the FIFO
+# thread can never be stalled by the bucket. One sender thread owns the write
+# side and drains two FIFOs: a priority lane for RATE_BYPASS verbs (PONG/QUIT
+# and the CAP/PASS/NICK/USER registration burst — a delayed PONG breaks
+# keepalive, so a PONG goes out in milliseconds even behind a full backlog;
+# never dropped, never paced), then a bounded normal lane paced by the token
+# bucket (BOT_SEND_RATE msgs/s sustained, BOT_SEND_BURST instantaneous,
+# RATE_WAIT events while it is dry). When the normal lane is full the OLDEST
+# chat line (PRIVMSG/NOTICE — not protocol-critical) is dropped and counted as
+# `QUEUE_DROP <total>`; JOIN/PART/WHOIS/MODE are never dropped (for them the
+# lane may exceed the bound rather than lose a line). Ordering: each lane is
+# FIFO, so lines enqueued by one thread go out in order; across threads only
+# the enqueue order into the same lane is kept, which is enough — a sender
+# never reorders within a lane.
 SEND_RATE = float(env("BOT_SEND_RATE", "2")) or 2.0
 SEND_BURST = float(env("BOT_SEND_BURST", "4")) or 4.0
+SEND_QUEUE = int(env("BOT_SEND_QUEUE", "256"))
 RATE_BYPASS = frozenset(("PONG", "QUIT", "CAP", "PASS", "NICK", "USER"))
+_DROP_OK = frozenset(("PRIVMSG", "NOTICE"))      # chat lines: droppable
 _rate_lock = threading.Lock()
 _rate_tokens = SEND_BURST
 _rate_ts = time.monotonic()
+_q_cond = threading.Condition()                  # guards both lanes + stop
+_q_pri = collections.deque()                     # (line, origin), bypass verbs
+_q_norm = collections.deque()                    # (line, origin), paced
+_q_dropped = 0                                   # cumulative QUEUE_DROP count
+_send_stop = None        # monotonic deadline: sender gives up on _q_norm past it
+SENDER_DRAIN_SECS = 2.0  # shutdown: bounded drain of the normal lane
+sender_thread = None
+
+
+def _rate_try():
+    """Take a bucket token if one is available; False if the bucket is dry.
+    Only the sender thread calls this, so the wait it implies never blocks
+    the reader or the FIFO thread."""
+    global _rate_tokens, _rate_ts
+    with _rate_lock:
+        nowm = time.monotonic()
+        _rate_tokens = min(SEND_BURST,
+                           _rate_tokens + (nowm - _rate_ts) * SEND_RATE)
+        _rate_ts = nowm
+        if _rate_tokens >= 1.0:
+            _rate_tokens -= 1.0
+            return True
+        return False
+
+
+def _rate_deficit():
+    """Seconds until the next token; display only (RATE_WAIT events)."""
+    with _rate_lock:
+        return (1.0 - _rate_tokens) / SEND_RATE
+
+
+def _verb_of(line):
+    return line.split(None, 1)[0].upper() if line.strip() else ""
+
+
+def send_raw(s, origin=None):
+    """Enqueue for the sender thread and return. Blocking here once froze the
+    reader thread long enough to hit the ping timeout on a busy channel."""
+    global _q_dropped
+    verb = _verb_of(s)
+    dropped = None
+    with _q_cond:
+        if verb in RATE_BYPASS:
+            _q_pri.append((s, origin))
+        else:
+            if len(_q_norm) >= SEND_QUEUE:
+                for i, (line, _) in enumerate(_q_norm):
+                    if _verb_of(line) in _DROP_OK:
+                        del _q_norm[i]
+                        _q_dropped += 1
+                        dropped = _q_dropped
+                        break
+                # else: no chat line to sacrifice — keep the protocol line,
+                # the lane exceeds the bound instead of losing it.
+            _q_norm.append((s, origin))
+        _q_cond.notify()
+    if dropped is not None:
+        emit("QUEUE_DROP", dropped)
+
+
+def _send_one(item):
+    line, origin = item
+    # No token here: priority items are never paced, and a paced item only
+    # reaches this point after _rate_try handed its token to the caller.
+    log(">", line, origin)
+    try:
+        sock.sendall((line + "\r\n").encode("utf-8", errors="replace"))
+    except Exception as e:
+        emit("ERROR", "send-fail", repr(e))
+
+
+_RATE_SLICE = 0.02   # token-wait slice: bounds PONG latency behind a backlog
+
+
+def sender_loop():
+    """Owns the socket write side. Priority lane first, then the paced normal
+    lane; each is FIFO, so a caller's lines go out in order. A paced line
+    waits for its token in short slices, re-checking the priority lane
+    between slices, so a PONG landing mid-wait goes out in milliseconds even
+    with a full backlog. _send_stop is a give-up deadline: the priority lane
+    is always flushed in full (a QUIT is never lost), the normal lane only
+    until the deadline, then the sender exits."""
+    held = None      # paced line parked while priority lines jump ahead
+    while True:
+        item, paced = None, False
+        with _q_cond:
+            if _q_pri:
+                item = _q_pri.popleft()      # priority always wins, even over
+            elif held is not None:           # a parked line mid-token-wait
+                item, paced = held, True
+                held = None
+            elif _q_norm:
+                item, paced = _q_norm.popleft(), True
+            elif _send_stop is not None and time.monotonic() >= _send_stop:
+                return
+            else:
+                _q_cond.wait(0.2)
+                continue
+        if not paced:
+            _send_one(item)
+            continue
+        announced = False
+        while True:
+            with _q_cond:
+                if _q_pri:
+                    held = item      # park it, serve the priority line first
+                    break
+                if _send_stop is not None and time.monotonic() >= _send_stop:
+                    return           # shutdown give-up: the parked line is lost
+            if _rate_try():
+                _send_one(item)
+                break
+            if not announced:
+                emit("RATE_WAIT", f"{_rate_deficit():.2f}")
+                announced = True
+            time.sleep(_RATE_SLICE)
+
+
+def start_sender():
+    global sender_thread
+    sender_thread = threading.Thread(
+        target=sender_loop, name="sender", daemon=True)
+    sender_thread.start()
+
+
+def shutdown_outbound():
+    """On the way out: flush the priority lane fully (QUIT reaches the wire),
+    give the normal lane a short bounded drain, then give up and close."""
+    global _send_stop
+    with _q_cond:
+        if _send_stop is None:
+            _send_stop = time.monotonic() + SENDER_DRAIN_SECS
+        _q_cond.notify_all()
+    if sender_thread is not None:
+        sender_thread.join(SENDER_DRAIN_SECS + 5)
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
 # `IDLE <chan>` once, disarm, and re-arm on the next human message. Our own
@@ -349,37 +502,6 @@ def log(direction, line, origin=None):
             f.write(f"{now('%H:%M:%S')} {direction} {tag}{_mask_secrets(line)}\n")
     except Exception:
         pass
-
-
-def _rate_acquire(verb):
-    """One token per outbound line; block (never drop a protocol line) until
-    the bucket refills. The bucket lock is taken before send_lock and never
-    held while sleeping; RATE_WAIT keeps the pacing visible in the events."""
-    global _rate_tokens, _rate_ts
-    if verb in RATE_BYPASS:
-        return
-    while True:
-        with _rate_lock:
-            nowm = time.monotonic()
-            _rate_tokens = min(SEND_BURST,
-                               _rate_tokens + (nowm - _rate_ts) * SEND_RATE)
-            _rate_ts = nowm
-            if _rate_tokens >= 1.0:
-                _rate_tokens -= 1.0
-                return
-            wait = (1.0 - _rate_tokens) / SEND_RATE
-        emit("RATE_WAIT", f"{wait:.2f}")
-        time.sleep(wait + 0.005)
-
-
-def send_raw(s, origin=None):
-    _rate_acquire(s.split(None, 1)[0].upper() if s.strip() else "")
-    log(">", s, origin)
-    with send_lock:
-        try:
-            sock.sendall((s + "\r\n").encode("utf-8", errors="replace"))
-        except Exception as e:
-            emit("ERROR", "send-fail", repr(e))
 
 
 def split_say(target, text, origin=None):
@@ -1070,11 +1192,15 @@ def main():
         sock = raw
         sock.settimeout(420)
         emit("TCP_OK", HOST, PORT, "plaintext")
-    send_registration()
+    start_sender()          # must run before send_registration: the burst
+    send_registration()     # rides the priority lane through the sender
 
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
-    reader_loop()
+    try:
+        reader_loop()
+    finally:
+        shutdown_outbound()
 
 
 if __name__ == "__main__":

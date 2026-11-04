@@ -212,6 +212,21 @@ and the mock exits 0 the moment it records it. Only the model is stubbed.
 
 ## Configuration
 
+**Outbound pacing** (issue #7: hackint killed ocbot with `Excess Flood` after
+56 fast WHOIS): `send_raw` only **enqueues** — it never sleeps and never
+touches the socket, so the reader thread keeps draining the server even while
+the outbound queue is backed up. A single sender thread owns the write side
+and drains two lanes through the token bucket (`BOT_SEND_RATE` /
+`BOT_SEND_BURST`): a **priority lane** for `PONG`/`QUIT` and the CAP/PASS/NICK/USER
+registration burst — never dropped, never paced, a `PONG` goes out in
+milliseconds even behind a full backlog — and a **bounded paced lane**
+(`BOT_SEND_QUEUE`) for everything else. The honest consequence: under load,
+chat output is delayed (and, past the bound, the oldest `PRIVMSG`/`NOTICE` is
+dropped with a `QUEUE_DROP` count), while protocol verbs (`JOIN`/`PART`/
+`WHOIS`/`MODE` are never dropped) and keepalive are not. On shutdown the
+priority lane is always flushed, so the `QUIT` reaches the wire; the paced
+lane gets a short bounded drain, then is given up on.
+
 Bot variables (unchanged from round 1 — the bridge is the same program):
 
 | Variable | Default | What |
@@ -229,8 +244,9 @@ Bot variables (unchanged from round 1 — the bridge is the same program):
 | `BOT_ENV` | `.env` | NickServ password file |
 | `BOT_STARTUP` | `bot.startup` | post-auth command replay |
 | `NICKSERV_PASS` | *(empty)* | NickServ identify |
-| `BOT_SEND_RATE` | `2` | outbound pacing, msgs/s sustained (token bucket; `RATE_WAIT` events when it is dry — issue #7's Excess Flood) |
-| `BOT_SEND_BURST` | `4` | outbound pacing, instantaneous burst; `PONG`/`QUIT` and the CAP/PASS/NICK/USER registration burst bypass the bucket |
+| `BOT_SEND_RATE` | `2` | outbound pacing, msgs/s sustained (token bucket drained by the sender thread; `RATE_WAIT` events when it is dry — issue #7's Excess Flood) |
+| `BOT_SEND_BURST` | `4` | outbound pacing, instantaneous burst |
+| `BOT_SEND_QUEUE` | `256` | bound on the paced outbound lane; when full the OLDEST chat line (`PRIVMSG`/`NOTICE`) is dropped and counted as `QUEUE_DROP <total>`, never a `JOIN`/`PART`/`WHOIS`/`MODE` |
 
 Brain variables:
 
