@@ -88,12 +88,34 @@ trust_rules = []        # list of (nick_lower, host_glob)
 verified = set()        # lowercase nicks confirmed via 307/330
 whois_pending = set()   # lowercase nicks we WHOIS'd, awaiting 307/318
 
+# IRCv3 account discovery: with these caps a nick's NickServ account arrives
+# on JOIN (extended-join), on the names reply (userhost-in-names) and on
+# every message (account-tag, account-notify), so trust_check resolves a
+# listed nick with zero WHOIS. Issue #7: 56 WHOIS in under a minute got
+# ocbot killed with Excess Flood.
+CAP_REQ = ("extended-join", "userhost-in-names", "account-tag",
+           "account-notify", "multi-prefix", "message-tags", "server-time")
+caps_ack = set()        # lowercase caps the server ACKed; empty = WHOIS path
+accounts = {}           # lowercase nick -> NickServ account
+known_hosts = {}        # lowercase nick -> host, from 353 userhost-in-names
+
 # IRC line limit is 512 incl CRLF. Body safe ~400.
 MAX_BODY = 400
 
 sock = None
 send_lock = threading.Lock()
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
+
+# Outbound pacing (issue #7: hackint killed ocbot with Excess Flood after 56
+# WHOIS at 3-4/s): token bucket, BOT_SEND_RATE msgs/s sustained, BOT_SEND_BURST
+# instantaneous. Latency-critical verbs bypass it — a delayed PONG breaks
+# keepalive and the registration burst must never stall.
+SEND_RATE = float(env("BOT_SEND_RATE", "2")) or 2.0
+SEND_BURST = float(env("BOT_SEND_BURST", "4")) or 4.0
+RATE_BYPASS = frozenset(("PONG", "QUIT", "CAP", "PASS", "NICK", "USER"))
+_rate_lock = threading.Lock()
+_rate_tokens = SEND_BURST
+_rate_ts = time.monotonic()
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
 # `IDLE <chan>` once, disarm, and re-arm on the next human message. Our own
@@ -138,8 +160,11 @@ def idle_ticker_loop():
 def emit(kind, *parts):
     # [HH:MM] anchor (no seconds, by request) — start-monitor.sh's grep and
     # policy._EVENT both tolerate it. The EVENTS_FILE append is best-effort: a
-    # sidecar container tails it instead of our stdout.
+    # sidecar container tails it instead of our stdout. Both file writers
+    # (this one and log()) mask through _mask_secrets, so a future caller
+    # cannot put a secret on disk by choosing the other sink.
     line = f"[{now('%H:%M')}] " + kind + " " + " ".join(str(p) for p in parts)
+    line = _mask_secrets(line)
     print(line, flush=True)
     try:
         with open(EVENTS_FILE, "a") as f:
@@ -264,6 +289,7 @@ def dm_flush(nick, reason):
 
 def trust_reset(nick, reason):
     n = nick.lower()
+    accounts.pop(n, None)
     dm_flush(nick, f"reset:{reason}")
     if n in verified or n in whois_pending:
         verified.discard(n)
@@ -271,10 +297,44 @@ def trust_reset(nick, reason):
         emit("TRUST_RESET", nick, reason)
 
 
+def note_account(nick, account):
+    """extended-join / account-notify / account-tag / WHOIS 330 delivered a
+    nick's NickServ account. A real account proves services registration, so
+    the same `verified` set trust_check reads is satisfied without a WHOIS."""
+    if not nick or not account or account == "*":
+        return
+    n = nick.lower()
+    accounts[n] = account
+    whois_pending.discard(n)
+    if n not in verified:
+        verified.add(n)
+        if is_trust_listed(n):
+            emit("VERIFIED", nick, f"ACCOUNT={account}")
+            dm_flush(nick, "account")
+
+
+# Services auth lines: the secret must be masked even when the env value and
+# the wire value disagree (stale .env, a rotated password sent through FIFO
+# RAW), which is exactly how cleartext reached the wire log despite the
+# value-replace above. IDENTIFY accepts [nick] password, GHOST is
+# `GHOST <nick> <pass>` — masking the LAST argument covers both. Unanchored:
+# event lines carry a [HH:MM] prefix before the send.
+_SERVICES_SEND_RE = re.compile(
+    r"(PRIVMSG\s+(?:NickServ|NS)\s+:\s*)(\S+)(\s+([^\r\n]*))?\s*$")
+_SERVICES_SECRET_VERBS = {"identify", "register", "recover", "release",
+                          "ghost", "group", "set"}
+
+
 def _mask_secrets(line):
-    if NICKSERV_PASS and NICKSERV_PASS in line:
-        return line.replace(NICKSERV_PASS, "********")
-    return line
+    masked = line
+    if NICKSERV_PASS:
+        masked = masked.replace(NICKSERV_PASS, "********")
+    m = _SERVICES_SEND_RE.search(masked)
+    if m and m.group(2).lower() in _SERVICES_SECRET_VERBS and m.group(4):
+        toks = m.group(4).split()
+        toks[-1] = "********"
+        masked = f"{m.group(1)}{m.group(2)} {' '.join(toks)}"
+    return masked
 
 
 # Origin tags are stamped into bot.log and read back by parsers, so keep them
@@ -291,7 +351,29 @@ def log(direction, line, origin=None):
         pass
 
 
+def _rate_acquire(verb):
+    """One token per outbound line; block (never drop a protocol line) until
+    the bucket refills. The bucket lock is taken before send_lock and never
+    held while sleeping; RATE_WAIT keeps the pacing visible in the events."""
+    global _rate_tokens, _rate_ts
+    if verb in RATE_BYPASS:
+        return
+    while True:
+        with _rate_lock:
+            nowm = time.monotonic()
+            _rate_tokens = min(SEND_BURST,
+                               _rate_tokens + (nowm - _rate_ts) * SEND_RATE)
+            _rate_ts = nowm
+            if _rate_tokens >= 1.0:
+                _rate_tokens -= 1.0
+                return
+            wait = (1.0 - _rate_tokens) / SEND_RATE
+        emit("RATE_WAIT", f"{wait:.2f}")
+        time.sleep(wait + 0.005)
+
+
 def send_raw(s, origin=None):
+    _rate_acquire(s.split(None, 1)[0].upper() if s.strip() else "")
     log(">", s, origin)
     with send_lock:
         try:
@@ -546,6 +628,14 @@ def _reclaim_after_ghost():
 def handle_server_line(line):
     global registered, ghost_needed, tmp_nick
     log("<", line)
+    # IRCv3 message-tags: @tag=value;... precedes the prefix. The `account`
+    # tag carries the sender's NickServ account on every message.
+    tags = {}
+    if line.startswith("@"):
+        tag_str, _, line = line.partition(" ")
+        for t in tag_str[1:].split(";"):
+            k, _, v = t.partition("=")
+            tags[k] = v
     if line.startswith("PING "):
         send_raw("PONG " + line[5:])
         return
@@ -559,6 +649,8 @@ def handle_server_line(line):
     # against the trust host glob, in the stream itself.
     host = prefix.split("@", 1)[1] if prefix and "@" in prefix else ""
     rest = rest or ""
+    if tags.get("account") not in (None, "", "*"):
+        note_account(nick, tags["account"])
     if cmd in ("PRIVMSG", "NOTICE", "TOPIC") and " :" in rest:
         tgt, _, body = rest.partition(" :")
         leak_guard.record(tgt.strip(), body)
@@ -566,6 +658,11 @@ def handle_server_line(line):
     if cmd == "001":
         registered = True
         emit("CONNECTED", NICK)
+        # Registration is complete, so negotiation is ours to finish: one REQ
+        # for the whole set, END right away (the ircd processes in order and
+        # ACKs/NAKs on the way). A NAK only degrades to the WHOIS path.
+        send_raw("CAP REQ :" + " ".join(CAP_REQ))
+        send_raw("CAP END")
         for tn, _ in trust_rules:
             whois_pending.add(tn)
             send_raw(f"WHOIS {tn}")
@@ -600,6 +697,19 @@ def handle_server_line(line):
         reason = parts[1] if len(parts) > 1 else "No such nick/channel"
         emit("IRC_ERROR", "401", tgt, reason)
         return
+    if cmd == "CAP":
+        head, _, caps_str = rest.partition(" :")
+        toks = head.split()
+        sub = toks[1].upper() if len(toks) > 1 else ""
+        caps = caps_str.split()
+        if sub == "ACK":
+            caps_ack.update(c.lower() for c in caps)
+            emit("CAP_ACK", " ".join(caps))
+        elif sub == "NAK":
+            # No abort: whatever was ACKed stays, the rest degrades to the
+            # WHOIS fallback path.
+            emit("CAP_NAK", " ".join(caps))
+        return
     if cmd == "307":    # RPL_WHOISREGNICK (Azzurra/bahamut)
         parts = rest.split()
         if len(parts) >= 2:
@@ -616,6 +726,8 @@ def handle_server_line(line):
             target = parts[1].lower()
             verified.add(target)
             whois_pending.discard(target)
+            if len(parts) >= 3:
+                accounts[target] = parts[2]
             emit("VERIFIED", parts[1])
             dm_flush(parts[1], "330")
         return
@@ -629,6 +741,24 @@ def handle_server_line(line):
                 if target not in verified:
                     emit("NOT_REGISTERED", parts[1])
             dm_flush(parts[1], "318")   # nothing stays parked past ENDOFWHOIS
+        return
+    if cmd == "353":
+        # RPL_NAMREPLY. With userhost-in-names each entry is nick!user@host
+        # (prefix chars first), so channel membership gives us the host for
+        # the trust glob with zero WHOIS; bare entries (cap not ACKed) are
+        # skipped by the "!" test.
+        body = rest.split(" :", 1)
+        head = body[0].split()
+        chan = head[2] if len(head) > 2 else (head[-1] if head else "")
+        entries = body[1].split() if len(body) > 1 else []
+        userhosts = 0
+        for entry in entries:
+            bare = entry.lstrip("~&@%+")
+            name, _, hostpart = bare.partition("!")
+            if hostpart and "@" in hostpart:
+                known_hosts[name.lower()] = hostpart.partition("@")[2]
+                userhosts += 1
+        emit("NAMES", chan, f"N={len(entries)}", f"USERHOSTS={userhosts}")
         return
     if cmd == "NOTICE":
         parts = rest.split(" :", 1)
@@ -715,8 +845,29 @@ def handle_server_line(line):
         if target.startswith("#") and nick.lower() != NICK.lower():
             _arm_idle(target)
         return
+    if cmd == "ACCOUNT":
+        # account-notify: the live account (or logout) for a nick, no WHOIS.
+        acct = rest.strip()
+        if acct == "*":
+            trust_reset(nick, "account-logout")
+        else:
+            note_account(nick, acct)
+        emit("ACCOUNT", nick, f"HOST={host}", acct)
+        return
     if cmd == "JOIN":
-        emit("JOIN", nick, f"HOST={host}", rest.lstrip(":"))
+        head = rest.split(" :", 1)[0]
+        toks = head.split()
+        chan = toks[0].lstrip(":") if toks else ""
+        if "extended-join" in caps_ack and len(toks) > 1:
+            # extended-join: JOIN <chan> <account> :<realname>; `*` = logged
+            # out, so any account knowledge for the nick is stale.
+            if toks[1] == "*":
+                trust_reset(nick, "account-logout")
+            else:
+                note_account(nick, toks[1])
+            emit("JOIN", nick, f"HOST={host}", chan, f"ACCOUNT={toks[1]}")
+        else:
+            emit("JOIN", nick, f"HOST={host}", rest.lstrip(":"))
         return
     if cmd == "PART":
         emit("PART", nick, f"HOST={host}", rest)
@@ -729,7 +880,10 @@ def handle_server_line(line):
     if cmd == "NICK":
         new_nick = rest.lstrip(":")
         emit("NICK_CHANGE", nick, f"HOST={host}", new_nick)
+        moved_account = accounts.pop(nick.lower(), None)
         trust_reset(nick, "nick-change")
+        if moved_account:
+            note_account(new_nick, moved_account)
         if ghost_needed and new_nick.lower() == NICK.lower():
             ghost_needed = False
             if NICKSERV_PASS:
@@ -882,6 +1036,14 @@ def process_cmd(line):
              "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC")
 
 
+def send_registration():
+    # CAP LS 302 before NICK/USER so the server answers with its v3.2 cap
+    # list; the REQ (and END) go out after 001, in handle_server_line.
+    send_raw("CAP LS 302")
+    send_raw(f"NICK {NICK}")
+    send_raw(f"USER {IDENT} 0 * :{REAL}")
+
+
 def main():
     global sock
     load_trust()
@@ -908,8 +1070,7 @@ def main():
         sock = raw
         sock.settimeout(420)
         emit("TCP_OK", HOST, PORT, "plaintext")
-    send_raw(f"NICK {NICK}")
-    send_raw(f"USER {IDENT} 0 * :{REAL}")
+    send_registration()
 
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()

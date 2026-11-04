@@ -229,6 +229,8 @@ Bot variables (unchanged from round 1 — the bridge is the same program):
 | `BOT_ENV` | `.env` | NickServ password file |
 | `BOT_STARTUP` | `bot.startup` | post-auth command replay |
 | `NICKSERV_PASS` | *(empty)* | NickServ identify |
+| `BOT_SEND_RATE` | `2` | outbound pacing, msgs/s sustained (token bucket; `RATE_WAIT` events when it is dry — issue #7's Excess Flood) |
+| `BOT_SEND_BURST` | `4` | outbound pacing, instantaneous burst; `PONG`/`QUIT` and the CAP/PASS/NICK/USER registration burst bypass the bucket |
 
 Brain variables:
 
