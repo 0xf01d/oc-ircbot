@@ -2,7 +2,8 @@
 """bot.py — minimal IRC bridge between an AI brain and IRC.
 
 A close port of vjt/claude-ircbot's bot.py: TLS IRC transport, trust model,
-and a FIFO command grammar (SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC). It
+and a FIFO command grammar (SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC
+RELOAD, plus hot-reloadable external verbs from handlers.py). It
 is brain-agnostic: selected events go to stdout and BOT_EVENTS for a sidecar
 brain (brain.py) to tail, and commands arrive over the FIFO.
 
@@ -11,6 +12,7 @@ external sidecars stamp their name into bot.log and the reply stream without
 being parseable as a verb themselves. The tag is the vjt contract — dropping
 it turned every pre-existing sidecar's line into CMD_ERROR.
 """
+import base64
 import fnmatch
 import os
 import random
@@ -21,6 +23,9 @@ import sys
 import threading
 import time
 
+import handlers
+import plug
+import webhook
 from leak_guard import LeakGuard
 from util import env, env_bool, now
 
@@ -41,14 +46,35 @@ BIND = env("IRC_BIND", "")
 # validate (vjt's order, 2026-08-25).
 TLS_VERIFY = env_bool("IRC_TLS_VERIFY", True)
 TLS = env_bool("IRC_TLS", True)          # plaintext escape hatch for smoke tests
+# IRCnet answers WHOIS with 311 only — no 307/330 ever — so a listed nick with
+# a matching host stays pending-whois forever there. BOT_TRUST_311 resolves a
+# pending WHOIS on the 311 host field matching the trust glob; off (default)
+# keeps the strict 307/330 verification on every other network.
+TRUST_VIA_311 = env_bool("BOT_TRUST_311", False)
 
 LOG = env("BOT_LOG", os.path.join(HERE, "bot.log"))
 FIFO = env("BOT_FIFO", os.path.join(HERE, "bot.send"))
+# This instance's network label, derived from its FIFO name (bot.send.<net>).
+# The base instance (/data/bot.send) has none -> "". Two grammars exist and
+# mixing them is the recurring 401: the brain's ANSWER grammar is
+# `SAY net|target text`, the per-network FIFO grammar is `SAY target text`.
+# A sidecar that pastes the answer form straight into a per-net FIFO makes us
+# PRIVMSG `net|#chan` (401 No such nick). See process_cmd().
+_bn = os.path.basename(FIFO)
+NET_LABEL = _bn.split("bot.send.", 1)[1] if _bn.startswith("bot.send.") else ""
 # Event stream for sidecar brains: a second container tails this instead of stdout.
 EVENTS_FILE = env("BOT_EVENTS", "/data/events.log")
 TRUST_FILE = env("BOT_TRUST", os.path.join(HERE, "bot.trust"))
 ENV_FILE = env("BOT_ENV", os.path.join(HERE, ".env"))
 STARTUP_FILE = env("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
+# Extra FIFO verbs, hot-reloadable: kubectl cp a new file onto the PVC and the
+# next command picks it up — no restart, the IRC connection is never touched
+# (see handlers.py, the loader and the shipped reference copy).
+HANDLERS_FILE = env("BOT_HANDLERS", "/data/handlers.py")
+# The bot's own plugin file (plug.py): the outbound(target, text, verb) hook,
+# the bot-side twin of the brain's. Same deal: plugins live on the PVC; /app
+# is read-only and never patched. (The Plugin object is built after emit().)
+BOT_PLUGIN_FILE = env("BOT_PLUGIN", "/data/bot_plugin.py")
 # Shared by ALL instances on purpose (not per-network): see leak_guard.py.
 RESERVED_FILE = env("BOT_RESERVED", os.path.join(HERE, "bot.reserved"))
 RESERVED_STORE = env("BOT_RESERVED_STORE", os.path.join(HERE, "reserved_recent.tsv"))
@@ -71,6 +97,24 @@ def load_env():
 
 ENV = load_env()
 NICKSERV_PASS = ENV.get("NICKSERV_PASS") or os.environ.get("NICKSERV_PASS") or ""
+# SASL PLAIN: hackint removed NickServ IDENTIFY in 2026-02, so password auth
+# only exists at connect time. Generic env (SASL_ACCOUNT / SASL_PASS or
+# SASL_PASS_FILE) plus a hackint default pointing at the saved credential.
+SASL_ACCOUNT = ENV.get("SASL_ACCOUNT") or os.environ.get("SASL_ACCOUNT", "") or ""
+SASL_PASS = ENV.get("SASL_PASS") or os.environ.get("SASL_PASS", "") or ""
+SASL_PASS_FILE = ENV.get("SASL_PASS_FILE") or os.environ.get("SASL_PASS_FILE", "") or ""
+if not SASL_ACCOUNT and HOST == "irc.hackint.org":
+    SASL_ACCOUNT = NICK
+    SASL_PASS_FILE = SASL_PASS_FILE or "/data/.ocbot_hackint_nickserv"
+if not SASL_PASS and SASL_PASS_FILE:
+    try:
+        with open(SASL_PASS_FILE) as _f:
+            SASL_PASS = _f.read().strip()
+    except OSError:
+        pass
+SASL_ENABLED = bool(SASL_ACCOUNT and SASL_PASS)
+sasl_requested = False
+sasl_done = False
 startup_fired = False
 
 # Ghost-on-connect: a line drop leaves our old connection holding NICK as a
@@ -93,6 +137,32 @@ MAX_BODY = 400
 
 sock = None
 send_lock = threading.Lock()
+
+# Outbound pacing. The hackint link died of Excess Flood (2026-11-04 ~22:04):
+# trust_check WHOIS'd ~25 nicks back-to-back and the wire had no throttle.
+# Every send_raw now reserves a slot at BOT_SEND_RATE lines/sec per process
+# (= per network). PONG and QUIT skip the queue so a backed-up burst can never
+# make us miss a keepalive or delay a clean part. 0 disables the limiter.
+SEND_RATE = float(env("BOT_SEND_RATE", "2"))
+SEND_INTERVAL = (1.0 / SEND_RATE) if SEND_RATE > 0 else 0.0
+send_pace_lock = threading.Lock()
+send_next_at = 0.0
+
+
+def _pace_send():
+    """Reserve the next outbound slot and sleep until it is due. Thread-safe:
+    callers queue by reservation time and the wire never exceeds SEND_RATE."""
+    global send_next_at
+    if SEND_INTERVAL <= 0:
+        return
+    with send_pace_lock:
+        slot = max(time.monotonic(), send_next_at)
+        send_next_at = slot + SEND_INTERVAL
+    delay = slot - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+
+
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
@@ -146,6 +216,12 @@ def emit(kind, *parts):
             f.write(line + "\n")
     except OSError:
         pass
+
+
+# The bot's own plugin (plug.py): the outbound(target, text, verb) hook, the
+# bot-side twin of the brain's. Plugins live on the PVC; /app is read-only
+# and never patched.
+bot_plugin = plug.Plugin(BOT_PLUGIN_FILE, emit)
 
 
 def load_trust():
@@ -292,6 +368,8 @@ def log(direction, line, origin=None):
 
 
 def send_raw(s, origin=None):
+    if not (s.startswith("PONG ") or s == "QUIT" or s.startswith("QUIT ")):
+        _pace_send()
     log(">", s, origin)
     with send_lock:
         try:
@@ -544,7 +622,7 @@ def _reclaim_after_ghost():
 
 
 def handle_server_line(line):
-    global registered, ghost_needed, tmp_nick
+    global registered, ghost_needed, tmp_nick, sasl_requested, sasl_done
     log("<", line)
     if line.startswith("PING "):
         send_raw("PONG " + line[5:])
@@ -559,6 +637,37 @@ def handle_server_line(line):
     # against the trust host glob, in the stream itself.
     host = prefix.split("@", 1)[1] if prefix and "@" in prefix else ""
     rest = rest or ""
+    if SASL_ENABLED and cmd == "CAP":
+        parts = rest.split()
+        sub = parts[1].upper() if len(parts) > 1 else ""
+        if sub == "LS":
+            if "sasl" in rest.lower():
+                if not sasl_requested:
+                    sasl_requested = True
+                    send_raw("CAP REQ :sasl")
+            else:
+                sasl_done = True
+                send_raw("CAP END")
+                emit("SASL_UNAVAILABLE")
+        elif sub == "ACK" and "sasl" in rest.lower():
+            send_raw("AUTHENTICATE PLAIN")
+        return
+    if SASL_ENABLED and cmd == "AUTHENTICATE" and rest.strip() == "+":
+        token = base64.b64encode(
+            ("\0%s\0%s" % (SASL_ACCOUNT, SASL_PASS)).encode("utf-8")
+        ).decode("ascii")
+        send_raw("AUTHENTICATE " + token)
+        return
+    if SASL_ENABLED and cmd == "903":
+        sasl_done = True
+        send_raw("CAP END")
+        emit("SASL_OK", SASL_ACCOUNT)
+        return
+    if SASL_ENABLED and cmd in ("904", "905", "906"):
+        sasl_done = True
+        send_raw("CAP END")
+        emit("SASL_FAIL", cmd, rest)
+        return
     if cmd in ("PRIVMSG", "NOTICE", "TOPIC") and " :" in rest:
         tgt, _, body = rest.partition(" :")
         leak_guard.record(tgt.strip(), body)
@@ -618,6 +727,21 @@ def handle_server_line(line):
             whois_pending.discard(target)
             emit("VERIFIED", parts[1])
             dm_flush(parts[1], "330")
+        return
+    if cmd == "311":    # RPL_WHOISUSER (IRCnet sends neither 307 nor 330)
+        parts = rest.split()
+        if TRUST_VIA_311 and len(parts) >= 4:
+            target = parts[1].lower()
+            whois_host = parts[3]
+            if target in whois_pending:
+                if host_matches(target, whois_host):
+                    verified.add(target)
+                    whois_pending.discard(target)
+                    emit("VERIFIED", parts[1], "311")
+                    dm_flush(parts[1], "311")
+                else:
+                    emit("TRUST_DENIED", parts[1], whois_host,
+                         "311-host-mismatch")
         return
     if cmd == "318":
         # RPL_ENDOFWHOIS: pending and not verified => not registered.
@@ -712,6 +836,11 @@ def handle_server_line(line):
         emit("MSG", trust, f"FROM={nick}", f"HOST={host}", f"TO={target}", f"BODY={body}")
         if is_trust_listed(nick) and not trusted:
             emit("TRUST_DENIED", nick, host, reason)
+        if target.startswith("#") and body.startswith("!"):
+            try:
+                _irc_command_dispatch(target, nick, body, trusted)
+            except Exception as e:
+                emit("IRC_CMD_ERROR", repr(e))
         if target.startswith("#") and nick.lower() != NICK.lower():
             _arm_idle(target)
         return
@@ -747,8 +876,42 @@ def handle_server_line(line):
 RECV_RETRY_SLEEP = 0.05
 RECV_RETRY_MAX = 200            # ~10s of solid EAGAIN, then die for real
 
+# Client keepalive: after the initial burst a quiet link (GeekShed, an idle
+# bouncer) can carry no bytes for minutes and the 420s recv timeout fires on
+# a perfectly healthy socket. Past KEEPALIVE_SECS of silence, send one PING;
+# the PONG (any inbound byte) resets last_recv. 0 disables. The 420 socket
+# timeout stays: the keepalive keeps it from firing on a live link and it
+# still kills a genuinely dead one.
+KEEPALIVE_SECS = float(env("BOT_KEEPALIVE", "120"))
+last_recv = time.monotonic()    # last inbound byte; the reader owns it
+last_keepalive = 0.0
+
+
+def keepalive_tick():
+    """One PING per KEEPALIVE_SECS of silence, never more than one per
+    interval: the wake-up cadence is KEEPALIVE_SECS/3, so a link that stays
+    silent must not produce three PINGs and three events per window."""
+    global last_keepalive
+    if KEEPALIVE_SECS <= 0:
+        return
+    nowm = time.monotonic()
+    if nowm - last_recv < KEEPALIVE_SECS:
+        return
+    if nowm - last_keepalive < KEEPALIVE_SECS:
+        return
+    last_keepalive = nowm
+    send_raw("PING :keepalive")
+    emit("KEEPALIVE_SENT")
+
+
+def keepalive_loop():
+    while True:
+        time.sleep(max(KEEPALIVE_SECS / 3.0, 5.0))
+        keepalive_tick()
+
 
 def reader_loop():
+    global last_recv
     buf = b""
     retries = 0
     while True:
@@ -770,6 +933,7 @@ def reader_loop():
         if not data:
             emit("DISCONNECTED")
             return
+        last_recv = time.monotonic()
         buf += data
         while b"\n" in buf:
             raw, buf = buf.split(b"\n", 1)
@@ -825,6 +989,104 @@ def outbound_ok(verb, rest, origin=None):
     return True
 
 
+# The context handed to hot handlers (handlers.dispatch): every primitive a
+# handler may need, without ever importing bot.py (circular import). The
+# wrappers resolve at call time on this module, so a patch of bot.send_raw in
+# tests is what the handlers go through too.
+class HandlerCtx:
+    nick = NICK
+    host = HOST
+
+    @staticmethod
+    def send_raw(s, origin=None):
+        send_raw(s, origin)
+
+    @staticmethod
+    def split_say(target, text, origin=None):
+        split_say(target, text, origin)
+
+    @staticmethod
+    def emit(kind, *parts):
+        emit(kind, *parts)
+
+    @staticmethod
+    def log(direction, line, origin=None):
+        log(direction, line, origin)
+
+    @staticmethod
+    def trust_check(nick, host):
+        return trust_check(nick, host)
+
+    @staticmethod
+    def is_trust_listed(nick):
+        return is_trust_listed(nick)
+
+    @staticmethod
+    def env(key, default=""):
+        return env(key, default)
+
+    @staticmethod
+    def now(fmt):
+        return now(fmt)
+
+
+HANDLER_CTX = HandlerCtx()
+
+
+def load_handlers():
+    """Start-of-run load of the hot handlers. Absence is not an error
+    (HANDLERS_MISSING); a file that fails to import is reported inside
+    handlers.load() and left unloaded — startup never dies for it."""
+    if not os.path.exists(HANDLERS_FILE):
+        emit("HANDLERS_MISSING", HANDLERS_FILE)
+        return
+    if handlers.load(HANDLERS_FILE, emit) is not None:
+        emit("HANDLERS_LOADED", HANDLERS_FILE, f"verbs={len(handlers.verbs())}")
+
+
+# --- persistent IRC commands (!ab2filter et al.) -----------------------------
+# The command bodies live in /data/irc_commands.py on the PVC, so they survive
+# bot restarts; this hook is the only part that lives in the image. Hot reload
+# is mtime-gated like handlers.py.
+IRC_COMMANDS_FILE = env("BOT_IRC_COMMANDS", "/data/irc_commands.py")
+_irc_mod = None
+_irc_mtime = None
+_irc_lock = threading.Lock()
+_irc_missing_seen = False
+
+
+def _irc_command_dispatch(target, nick, body, trusted):
+    global _irc_mod, _irc_mtime, _irc_missing_seen
+    try:
+        mtime = os.stat(IRC_COMMANDS_FILE).st_mtime_ns
+    except OSError:
+        # A missing file used to be silent, which made a dead hook look like a
+        # healthy bot; say it once, then stay quiet (the PVC mounts later than
+        # the first message in the worst case).
+        if not _irc_missing_seen:
+            _irc_missing_seen = True
+            emit("IRC_COMMANDS_MISSING", IRC_COMMANDS_FILE)
+        return
+    with _irc_lock:
+        if _irc_mod is None or mtime != _irc_mtime:
+            import importlib.util
+            name = "ocbot_irc_commands_%d" % int(time.time() * 1000)
+            spec = importlib.util.spec_from_file_location(name, IRC_COMMANDS_FILE)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as e:
+                sys.modules.pop(name, None)
+                emit("IRC_CMD_IMPORT_ERROR", repr(e))
+                return
+            _irc_mod = mod
+            _irc_mtime = mtime
+            emit("IRC_COMMANDS_LOADED", IRC_COMMANDS_FILE)
+        mod = _irc_mod
+    return mod.handle(target, nick, body, trusted, send_raw, emit, split_say)
+
+
 def process_cmd(line):
     if " " in line:
         verb, rest = line.split(" ", 1)
@@ -839,8 +1101,28 @@ def process_cmd(line):
                  "allowed: [a-z0-9_-]{1,24}")
             return
     verb = verb.upper()
+    # Defensive: a sidecar wrote the answer grammar into this per-net FIFO
+    # (`SAY net|#chan hi`) instead of the FIFO grammar (`SAY #chan hi`). Strip
+    # the prefix ONLY when it is this instance's own label, so a real target
+    # that merely contains a pipe is never touched. Covers SAY/ACT/NOTICE and
+    # JOIN/PART/WHOIS/RAW, which all take `rest` verbatim.
+    if NET_LABEL and rest.partition("|")[0] == NET_LABEL:
+        _t, _sep, _r = rest.partition("|")
+        if _sep and _r:
+            emit("CMD_NET_PREFIX_STRIPPED", NET_LABEL, verb, f"->{_r.split(' ', 1)[0]}")
+            rest = _r
     if not outbound_ok(verb, rest, origin):
         return
+    if verb in ("SAY", "ACT", "NOTICE") and " " in rest:
+        # The plugin's outbound hook sits exactly between the leak gate and
+        # the wire: a str return replaces the text, None blocks the line.
+        target, text = rest.split(" ", 1)
+        res = bot_plugin.call("outbound", target, text, verb)
+        if res is not plug.MISSING:
+            if res is None:
+                emit("BOT_PLUGIN_BLOCKED", verb, target)
+                return
+            rest = f"{target} {res}"
     if verb == "SAY":
         if " " not in rest:
             emit("CMD_ERROR", "SAY needs <target> <text>", repr(rest))
@@ -877,14 +1159,33 @@ def process_cmd(line):
         nick, name = parts[0], parts[1].strip()
         offer = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
         dcc_send(nick, name, origin, offer)
+    elif verb == "RELOAD":
+        # Explicit hot-reload path (the FIFO is trusted; the automatic path is
+        # the mtime gate in handlers.dispatch). A broken file is reported and
+        # the previous handlers keep working.
+        handlers.load(HANDLERS_FILE, emit)
+        n = len(handlers.verbs())
+        emit("HANDLERS_RELOADED", f"verbs={n}")
+        if origin:
+            send_raw(f"NOTICE {origin} :handlers reloaded, verbs={n}", origin)
     else:
+        # Not built-in: the hot handlers get first refusal, so a kubectl cp of
+        # handlers.py is enough to teach the bot a new verb. Anything still
+        # unclaimed is the usual loud unknown-verb, with the current hot verb
+        # list in the detail so the log says what exists.
+        handled, _ = handlers.dispatch(HANDLER_CTX, verb, rest, origin)
+        if handled:
+            return
+        hot = handlers.verbs()
         emit("CMD_ERROR", "unknown-verb", repr(verb),
-             "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC")
+             "valid: SAY ACT NOTICE JOIN PART WHOIS QUIT RAW DCC RELOAD",
+             "hot: " + (" ".join(hot) if hot else "none"))
 
 
 def main():
     global sock
     load_trust()
+    load_handlers()
     ctx = ssl.create_default_context()
     if not TLS_VERIFY:
         # check_hostname must go first: CERT_NONE with hostname checking raises.
@@ -908,11 +1209,22 @@ def main():
         sock = raw
         sock.settimeout(420)
         emit("TCP_OK", HOST, PORT, "plaintext")
+    if SASL_ENABLED:
+        send_raw("CAP LS 302")
     send_raw(f"NICK {NICK}")
     send_raw(f"USER {IDENT} 0 * :{REAL}")
+    if SASL_ENABLED:
+        def _sasl_timeout():
+            time.sleep(10)
+            if not sasl_done:
+                emit("SASL_TIMEOUT")
+                send_raw("CAP END")
+        threading.Thread(target=_sasl_timeout, daemon=True).start()
 
     threading.Thread(target=writer_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
+    webhook.start(log=emit)   # inbound webhooks, when /data/webhooks.json says so
     reader_loop()
 
 

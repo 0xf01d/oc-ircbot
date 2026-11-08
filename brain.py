@@ -29,6 +29,7 @@ from functools import partial
 
 import memory_log
 import networks
+import plug
 import policy
 from util import emit as _emit
 from util import env, env_bool
@@ -62,9 +63,17 @@ MODELS_FILE = env("BRAIN_MODELS_FILE", "/data/models.json")
 # answers itself over the net's FIFO — latency, tokens, tps, model, quota
 # state — data straight from the opencode API's own per-message records.
 STATS_CMD = env("BRAIN_STATS_CMD", "!stats")
+# The brain's own plugin (plug.py): optional drop/rewrite/handle/outbound/
+# event hooks from one file on the PVC. Replaces the old self-patch of /app —
+# plugins live on the PVC; /app is read-only and never patched.
+PLUGIN_FILE = env("BRAIN_PLUGIN", "/data/brain_plugin.py")
+plugin = plug.Plugin(PLUGIN_FILE, emit)
 
 OPENCODE_BIN = "opencode"
-BATCH_MAX = 5          # submit a batch once it grows this big
+BATCH_MAX = int(env("BRAIN_BATCH_MAX", "25"))  # submit a batch once it grows
+# this big: a busy channel settles into a handful of fat turns instead of a
+# stream of thin ones. BATCH_WINDOW below still caps how long the oldest
+# event may wait, so a quiet channel is never held hostage by the number.
 PROBE_SECS = float(env("BRAIN_PROBE_SECS", "300"))  # best-model probe cadence
 # Nothing is ever dropped for being late (vjt's model: the writer queues, the
 # agent catches up) — a large backlog is only announced, loudly, here and in
@@ -75,6 +84,10 @@ PENDING_BACKLOG = 128
 MAX_TURNS = int(env("BRAIN_MAX_TURNS", "100"))         # turn cap per session
 RESET_SECS = int(env("BRAIN_RESET_SECS", "900"))       # /clear cadence (15 min)
 TURN_TIMEOUT = float(env("BRAIN_TURN_TIMEOUT", "180"))  # wedged-turn abort
+PREEMPT_ON_ADDRESS = env_bool("BRAIN_PREEMPT_ON_ADDRESS", True)  # an
+# addressed message aborts the running turn: the operator outranks the
+# agent's own background work.
+PREEMPT_COOLDOWN = float(env("BRAIN_PREEMPT_COOLDOWN", "10"))
 DRY_RUN = env_bool("BRAIN_DRY_RUN")   # lets compose/k8s dry-run without
                                       # editing the container command
 
@@ -266,11 +279,43 @@ def split_model(model):
 
 
 # --- FIFO -------------------------------------------------------------------
-def write_fifo(lines, path, deadline=10.0):
+_CHAT_VERBS = ("SAY", "ACT", "NOTICE")
+
+
+def _outbound_hook(net_name, lines):
+    """The plugin's outbound gate, applied just before the FIFO write — the
+    ONE place every brain chat line passes. SAY/ACT/NOTICE only (QUIT, JOIN,
+    WHOIS and the bot's own RAW/DCC escape hatches are never rewritten): a
+    str return replaces the line's text, None blocks it (OUTBOUND_BLOCKED)."""
+    out = []
+    for ln in lines:
+        verb, _, rest = ln.partition(" ")
+        up = verb.upper()
+        if up not in _CHAT_VERBS or " " not in rest:
+            out.append(ln)
+            continue
+        target, _, text = rest.partition(" ")
+        res = plugin.call("outbound", net_name, up, target, text)
+        if res is plug.MISSING:
+            out.append(ln)
+        elif res is None:
+            emit("OUTBOUND_BLOCKED", net_name, up, target)
+        else:
+            out.append(f"{verb} {target} {res}")
+    return out
+
+
+def write_fifo(lines, path, deadline=10.0, net=None):
     """Write FIFO lines into the bot's named pipe. Non-blocking open + retry:
-    a bot that is down must not wedge the brain. Returns lines written."""
+    a bot that is down must not wedge the brain. Returns lines written.
+    `net` (a network label) switches on the plugin's outbound hook for that
+    batch; callers that know their net pass it, bare test callers don't."""
     if not lines:
         return 0
+    if net is not None:
+        lines = _outbound_hook(net, lines)
+        if not lines:
+            return 0
     payload = "".join(f"{ln}\n" for ln in lines).encode("utf-8")
     end = time.monotonic() + deadline
     while time.monotonic() < end:
@@ -289,6 +334,45 @@ def write_fifo(lines, path, deadline=10.0):
             os.close(fd)
     emit("FIFO_WRITE_TIMEOUT", path)
     return 0
+
+
+# --- plugin surface -----------------------------------------------------------
+class _HandleCtx:
+    """The namespace the `handle` hook gets, built fresh per event: FIFO
+    primitives bound to that event's net (the brain's own verb grammar,
+    verbatim — no bot.py import), the net's learned nick, and the BRAIN log.
+    With no known net the senders no-op: a plugin must never be able to
+    wedge the brain on a vanished network."""
+
+    __slots__ = ("net", "nick", "_fifo")
+
+    def __init__(self, net_name, nick, fifo):
+        self.net = net_name
+        self.nick = nick
+        self._fifo = fifo
+
+    def say(self, target, text):
+        if self._fifo:
+            write_fifo([f"SAY {target} {text}"], self._fifo, net=self.net)
+
+    def notice(self, target, text):
+        if self._fifo:
+            write_fifo([f"NOTICE {target} {text}"], self._fifo, net=self.net)
+
+    def send(self, raw):
+        if self._fifo:
+            write_fifo([raw], self._fifo, net=self.net)
+
+    @staticmethod
+    def emit(*parts):
+        emit(*parts)
+
+
+def plugin_event(name, **payload):
+    """Fire-and-forget lifecycle notification to the plugin's `event` hook.
+    Inline by design (a plugin is code, not a service — no threads): the
+    loader's try/except is the whole isolation story."""
+    plugin.call("event", name, payload)
 
 
 # --- tail -------------------------------------------------------------------
@@ -344,7 +428,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "born")
+                 "preempted_ts", "born", "reset_guard")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -362,6 +446,10 @@ class Session:
         self.tps = None                    # last turn's output tokens/sec
         self.model_id = None               # last turn's model
         self.prompt_ts = None              # monotonic when submit() fired
+        self.preempted_ts = None           # monotonic when a preempt aborted
+                                           # the running turn: the next idle
+                                           # belongs to that aborted turn
+        self.reset_guard = False           # RESET_LOOP_GUARD: never reset again
 
 
 def last_assistant_text(messages):
@@ -414,6 +502,7 @@ class Brain:
         self._probe_sid = None             # side session for best-model probes
         self._probe_model = None           # model the current probe rides
         self._probe_next = 0.0             # monotonic clock gate
+        self._last_preempt = float("-inf")  # monotonic of the last preempt
         self.refusals = refusal_pats or policy.DEFAULT_REFUSAL_PATTERNS
         self.stored_sid = None             # sid from disk, for re-attach
         self.stop_flag = False
@@ -482,6 +571,7 @@ class Brain:
         sess = Session(sid, title, system)
         with self.lock:
             self.sess = sess
+        self.stored_sid = sid             # memory mirrors the persisted sid
         self.save_session_store()
         emit("SESSION_NEW", title, sid)
         self.rehydrate(sess)
@@ -502,7 +592,16 @@ class Brain:
 
     def reset_session(self, sess, reason):
         """The `/clear`: abandon the session, start a new one, rehydrate from
-        disk. Aborts first so we never reset mid-turn."""
+        disk. Aborts first so we never reset mid-turn. stored_sid is dropped
+        before ensure_session: the discarded session still exists on the
+        server, so a live stored_sid made the "fresh" session a re-attach
+        of the very session being reset — turns >= MAX_TURNS again, reset
+        again, ~750 spins in two minutes (the live incident). A fresh
+        session that arrives still over cap means a broken server count:
+        RESET_LOOP_GUARD retires that session object instead of spinning —
+        one reset per session, never per poll."""
+        if sess.reset_guard:
+            return
         try:
             self.api.abort(sess.sid)
         except OSError:
@@ -511,12 +610,19 @@ class Brain:
             if self.sess is sess:
                 self.sess = None
             leftover = sess.pending
+            sess.pending = []
+        self.stored_sid = None
         self.save_session_store()
         emit("SESSION_RESET", sess.title, reason, f"turns={sess.turns}")
+        plugin_event("reset", reason=reason, turns=sess.turns)
         self.mem.append_activity(
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
         self.registers = registers()      # registers live like the session
         fresh = self.ensure_session()
+        if fresh is not None and fresh.turns >= MAX_TURNS:
+            emit("RESET_LOOP_GUARD", fresh.title, fresh.sid,
+                 f"turns={fresh.turns}")
+            fresh.reset_guard = True
         if fresh is not None and leftover:
             with self.lock:
                 fresh.pending = leftover + fresh.pending
@@ -525,6 +631,16 @@ class Brain:
     def feed(self, net_name, ev):
         if ev is None:
             return
+        # Plugin hooks first, before every built-in gate: drop makes the
+        # event never have existed (even when addressed); rewrite replaces
+        # it wholesale — every later check runs on what the plugin left.
+        if plugin.call("drop", ev, net_name) is True:
+            return
+        rewritten = plugin.call("rewrite", ev, net_name)
+        if rewritten is not plug.MISSING:
+            if rewritten is None:
+                return
+            ev = rewritten
         if policy.is_muted(ev, MUTE):
             return
         sess = self.ensure_session()
@@ -540,14 +656,22 @@ class Brain:
         if not policy.wakes_model(ev, nick, ADDRESS_ONLY):
             return
         # !stats: trusted users get telemetry straight from the brain — no
-        # model turn, no batch, the answer rides the FIFO right now.
+        # model turn, no batch, the answer rides the FIFO right now. It stays
+        # ahead of the plugin's handle hook: the built-in wins. (No outer
+        # lock here: ensure_session takes self.lock itself — the old
+        # `with self.lock:` around it deadlocked the brain on every !stats.)
         body = (ev.get("body") or "").strip().lower()
         if (ev.get("kind") == "MSG" and body == STATS_CMD
                 and ev.get("trust") == "TRUSTED"):
-            with self.lock:
-                sess2 = self.ensure_session()
-                if sess2 is not None:
-                    self.stats_reply(sess2, ev)
+            sess2 = self.ensure_session()
+            if sess2 is not None:
+                self.stats_reply(sess2, ev)
+            return
+        # handle: the plugin may serve the event itself — say/notice/send
+        # over the FIFO, no model turn, nothing batched. False/absent falls
+        # through to the normal batch path.
+        ctx = self._plugin_ctx(net_name)
+        if plugin.call("handle", ev, net_name, ctx) is True:
             return
         with self.lock:
             sess.pending.append((time.monotonic(), ev))
@@ -556,6 +680,48 @@ class Brain:
             # Visible, never dropped: a slow model must not strand events
             # silently (vjt never discards; neither do we).
             emit("PENDING_BACKLOG", sess.title, f"events={depth}")
+        if PREEMPT_ON_ADDRESS:
+            self._maybe_preempt(sess, ev, nick)
+
+    def _plugin_ctx(self, net_name):
+        net = self.net_by_name.get(net_name)
+        return _HandleCtx(net_name, self._net_nick(net_name),
+                          net.fifo if net else None)
+
+    # -- preemption -------------------------------------------------------------------
+    def _maybe_preempt(self, sess, ev, nick):
+        """An addressed MSG aborts the running turn: the operator outranks
+        the agent's own background work — the bot drops what it had in
+        background and takes the message on the fly. The abort is armed
+        (preempted_ts) before the API call so an idle that races it still
+        reads as the aborted turn's; its partial output is never dispatched
+        and it never counts as a wedge. A cooldown keeps a burst of
+        addressed messages from abort-looping the model."""
+        if ev.get("kind") != "MSG" or not policy.is_addressed(ev, nick):
+            return
+        with self.lock:
+            busy = sess.busy_since is not None
+        if not busy:
+            return
+        now = time.monotonic()
+        if now - self._last_preempt < PREEMPT_COOLDOWN:
+            emit("PREEMPT_SKIP_COOLDOWN", sess.title, ev.get("from") or "?")
+            return
+        self._last_preempt = now
+        with self.lock:
+            sess.preempted_ts = now
+        try:
+            self.api.abort(sess.sid)
+        except OSError as e:
+            with self.lock:
+                sess.preempted_ts = None
+            emit("ABORT_ERROR", sess.title, repr(e))
+            return
+        with self.lock:
+            sess.busy_since = None
+        emit("PREEMPT", f"{ev.get('net', '?')}|{policy.reply_target(ev)}",
+             ev.get("from") or "?")
+        self.submit(sess)
 
     def due(self, sess):
         with self.lock:
@@ -585,13 +751,18 @@ class Brain:
                                   model=self.model)
         except OSError as e:
             emit("PROMPT_ERROR", sess.title, repr(e))
+            plugin_event("error", reason=repr(e)[:200])
             with self.lock:
                 sess.pending = batch + sess.pending
             return
         with self.lock:
             sess.busy_since = time.monotonic()
             sess.prompt_ts = sess.busy_since
+            # A freshly submitted turn is not the aborted one: its idle must
+            # be dispatched like any other.
+            sess.preempted_ts = None
         emit("PROMPT_SENT", sess.title, f"events={len(batch)}")
+        plugin_event("turn_start", turns=sess.turns)
 
     # -- collect ----------------------------------------------------------------------
     def _note_metrics(self, sess, msgs):
@@ -634,7 +805,8 @@ class Brain:
         if net is None:
             emit("STATS_ERROR", "unknown net", repr(net_name))
             return
-        write_fifo([f"NOTICE {target} [stats] {l}" for l in lines], net.fifo)
+        write_fifo([f"NOTICE {target} [stats] {l}" for l in lines], net.fifo,
+                   net=net_name)
         emit("STATS_SENT", net_name, target)
 
     def on_idle(self, sid):
@@ -647,15 +819,31 @@ class Brain:
             emit("COLLECT_ERROR", sess.title, repr(e))
             return
         sess.last_count = len(msgs)
+        with self.lock:
+            started = sess.busy_since
+            preempted = sess.preempted_ts is not None
+            sess.preempted_ts = None
+            sess.busy_since = None
+        if preempted:
+            # This idle belongs to the turn a preempt aborted: its partial
+            # output is never dispatched or counted (last_count is already
+            # advanced, so a later catch-up cannot redispatch it either).
+            # The batch that caused the preempt flows instead.
+            if self.due(sess):
+                self.submit(sess)
+            return
         self._note_metrics(sess, msgs)
         text = last_assistant_text(msgs)
-        with self.lock:
-            sess.busy_since = None
         self.record_turn(sess, text)
+        still_live = self.sess is sess    # record_turn may have reset it
         self._note_clean_turn(sess)
         self.dispatch(sess, text)
-        # Monitor queueing: the next due batch goes out now.
-        if self.due(sess):
+        plugin_event("turn_end", turns=sess.turns,
+                     seconds=(round(time.monotonic() - started, 3)
+                              if started else None))
+        # Monitor queueing: the next due batch goes out now — on the live
+        # session only; a reset moved the queue to the fresh one.
+        if still_live and self.due(sess):
             self.submit(sess)
 
     def record_turn(self, sess, text):
@@ -711,7 +899,8 @@ class Brain:
                 continue
             by_net.setdefault(net_name, []).append(f"{verb} {arg}".rstrip())
         for net_name, lines in by_net.items():
-            n = write_fifo(lines, self.net_by_name[net_name].fifo)
+            n = write_fifo(lines, self.net_by_name[net_name].fifo,
+                           net=net_name)
             emit("SENT", n, sess.title, net_name, " ".join(lines)[:200])
 
     # -- agent guard (wedged turns) ---------------------------------------------------
@@ -756,7 +945,7 @@ class Brain:
         if sess is not None:
             line = (f"NOTICE {ADMIN} [gate] denied {what} ({patterns})")
             for net in self.nets:
-                write_fifo([line], net.fifo)
+                write_fifo([line], net.fifo, net=net.name)
 
     # -- SSE loop ------------------------------------------------------------------------
     def catch_up_missed_idles(self):
@@ -786,6 +975,7 @@ class Brain:
         while not self.stop_flag:
             try:
                 self.catch_up_missed_idles()
+                plugin_event("connect")
                 for ev in self.api.events():
                     self.on_event(ev)
                     backoff = 1.0
@@ -795,6 +985,7 @@ class Brain:
                 if self.stop_flag:
                     return
                 emit("SSE_ERROR", repr(e))
+                plugin_event("error", reason=repr(e)[:200])
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
@@ -815,6 +1006,7 @@ class Brain:
                     sess.busy_since = sess.busy_since or time.monotonic()
         elif etype == "session.error":
             emit("SESSION_ERROR", str(props)[:200])
+            plugin_event("error", reason=str(props)[:200])
         elif etype == "permission.asked":
             self.gate(props)
         elif etype in ("session.next.compaction.ended", "session.compacted"):
@@ -997,11 +1189,13 @@ class Brain:
              f"model={MODEL}", "dry-run" if self.dry_run else "live",
              f"mute={','.join(MUTE) or '-'}",
              "address-only" if ADDRESS_ONLY else "all-events")
+        plugin_event("start")
         self.mem = self.mem or setup_workdir()
         self.load_session_store()
         if not self.dry_run:
             self.serve = Serve.attached() if SERVE_URL else Serve.spawned()
             emit("SERVE_ATTACH" if SERVE_URL else "SERVE_UP", self.serve.url)
+            plugin_event("serve_up")
             self.api = Api(self.serve.url)
         else:
             self.serve = None
@@ -1054,6 +1248,7 @@ class Brain:
                     with self.lock:
                         self.sess = None
                     emit("SERVE_UP", fresh.url)
+                    plugin_event("serve_up")
             time.sleep(POLL)
         if self.serve:
             self.serve.stop()

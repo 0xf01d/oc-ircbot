@@ -187,6 +187,68 @@ def test_build_system_without_registers():
     assert "Channel registers" not in policy.build_system([("n", "bot")])
 
 
+# --- disclosure block (cross-channel and internal leakage) --------------------
+def test_build_system_disclosure_block_once_before_persona():
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert s.count("Disclosure (absolute):") == 1
+    assert s.index("Disclosure (absolute):") < s.index("Persona (absolute")
+
+
+def test_build_system_disclosure_names_the_leak_classes():
+    # The stable contract substrings: sealed channels, private material.
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert "sealed compartment" in s
+    assert "do not discuss other channels" in s
+    assert "private message" in s and "private material" in s
+
+
+# --- owner carve-out (the operator is not a compartment) ------------------------
+def test_build_system_carves_the_owner_out_of_the_seal():
+    # Issue #5 live symptom: a TRUSTED operator asked about a file that
+    # another channel was discussing and got "sono sigillata". TRUSTED
+    # users are the system administrators: the seal never hides from them.
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert "own every compartment" in s
+    assert "never hides anything from the operator" in s
+    assert "here you already know everything" in s
+    # Reads as consistent with the Authority block that precedes it.
+    assert s.index("Authority: TRUSTED users are the system administrators") \
+        < s.index("own every compartment")
+
+
+def test_build_system_owner_carveout_limits_stay_absolute():
+    s = policy.build_system([("azzurra", "ocbot")])
+    # Secrets stay absolute for everyone (top rule + Authority restatement).
+    assert "Never post secrets, tokens, account numbers" in s
+    assert "credentials, tokens and account numbers are never posted" in s
+    # Cross-user protection for UNTRUSTED is exactly as before.
+    assert "what another user said in a private message" in s
+    assert "still never relayed" in s
+    # The old closing sentence stays true — just no longer the operator's
+    # limit — and still precedes the carve-out.
+    assert "The channel where the material already lives keeps its " \
+        "conversation" in s
+    assert s.index("where the material already lives") \
+        < s.index("own every compartment")
+
+
+def test_trusted_and_untrusted_events_still_parse_the_same():
+    tr = _msg("hello there", trust="TRUSTED")
+    un = _msg("hello there", trust="UNTRUSTED")
+    assert tr["trust"] == "TRUSTED"
+    assert un["trust"] == "UNTRUSTED"
+    for ev in (tr, un):
+        assert ev["kind"] == "MSG"
+        assert ev["from"] == "alice"
+        assert ev["to"] == "#test"
+        assert ev["body"] == "hello there"
+
+
+def test_build_system_is_deterministic_for_same_arguments():
+    args = ([("azzurra", "a"), ("libera", "b")], {"#olografix": "reg"}, "x")
+    assert policy.build_system(*args) == policy.build_system(*args)
+
+
 def test_fmt_event_vjt_prefix_and_host():
     # The vjt shape: [HH:MM] net|target <nick>: text — and HOST= never
     # stripped (the anti-spoof rule: the Monitor must never be host-blind).

@@ -149,6 +149,8 @@ class StubServe:
                             self._json(404, {"error": "no session"})
                             return
                         sess["busy"] = True
+                        sess["gen"] = sess.get("gen", 0) + 1
+                        gen = sess["gen"]
                         msg_id = f"msg_u{time.time_ns()}"
                         sess["messages"].append(
                             {"info": {"id": msg_id, "role": "user"},
@@ -157,7 +159,8 @@ class StubServe:
                                  {"sessionID": sid,
                                   "status": {"type": "busy"}})
                     threading.Thread(target=serve._run_turn,
-                                     args=(sid, text), daemon=True).start()
+                                     args=(sid, text, gen),
+                                     daemon=True).start()
                     self.send_response(204)
                     self.end_headers()
                 elif re.match(r"^/session/[^/]+/abort$", self.path):
@@ -167,6 +170,10 @@ class StubServe:
                         sess = st.sessions.get(sid)
                         if sess:
                             sess["busy"] = False
+                            # An abort kills the CURRENT turn only — a fresh
+                            # prompt starts a new generation and runs (the
+                            # real server does the same).
+                            sess["aborted_gen"] = sess.get("gen", 0)
                     self._json(200, True)
                 elif re.match(r"^/permission/[^/]+/reply$", self.path):
                     req_id = self.path.split("/")[2]
@@ -209,19 +216,17 @@ class StubServe:
         self.port = self.httpd.server_address[1]
         self.url = f"http://{host}:{self.port}"
 
-    def _run_turn(self, sid, prompt):
+    def _run_turn(self, sid, prompt, gen):
         time.sleep(self.turn_delay)
         st = self.state
-        if sid in st.aborted:
-            return
         answer = self.answer(prompt, st)
         amsg = {"info": {"id": f"msg_a{time.time_ns()}",
                          "role": "assistant"},
                 "parts": [{"type": "text", "text": answer}]}
         with st.lock:
             sess = st.sessions.get(sid)
-            if sess is None:
-                return
+            if sess is None or sess.get("aborted_gen") == gen:
+                return                  # aborted mid-turn: nothing lands
             sess["messages"].append(amsg)
             sess["busy"] = False
         st.broadcast("session.status",
