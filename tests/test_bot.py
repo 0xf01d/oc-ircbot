@@ -506,3 +506,33 @@ def test_send_raw_paces_privmsg_but_not_pong_or_quit():
         bot.send_raw("QUIT bye")
     assert paced_after_chat == 1     # the PRIVMSG waited its turn
     assert pace.call_count == 1      # PONG and QUIT went straight out
+
+
+def test_process_cmd_strips_own_net_prefix_from_fifo_target():
+    # A sidecar pasted the brain's ANSWER grammar (`SAY net|#chan hi`) into
+    # this network's FIFO. The bot must strip its own label only; the wire
+    # target is the bare channel (a real 401 in production, 2026-11-08).
+    with mock.patch.object(bot, "NET_LABEL", "hackint"), \
+            mock.patch.object(bot, "send_raw") as sr:
+        bot.process_cmd("SAY hackint|#probe hi")
+    sr.assert_called_once_with("PRIVMSG #probe :hi", None)
+
+
+def test_process_cmd_keeps_pipe_when_label_is_foreign():
+    # Only OUR label is stripped: a target that legitimately contains a pipe
+    # (or another network's label) must go to the wire untouched.
+    with mock.patch.object(bot, "NET_LABEL", "hackint"), \
+            mock.patch.object(bot, "send_raw") as sr:
+        bot.process_cmd("SAY ircnet|#c hi")
+        bot.process_cmd("SAY nick|with|pipes hi")
+    assert sr.call_args_list[0].args[0] == "PRIVMSG ircnet|#c :hi"
+    assert sr.call_args_list[1].args[0] == "PRIVMSG nick|with|pipes :hi"
+
+
+def test_process_cmd_no_label_on_base_instance():
+    # The base instance (/data/bot.send) has no label: nothing is stripped,
+    # so a pipe in a nick stays a pipe.
+    with mock.patch.object(bot, "NET_LABEL", ""), \
+            mock.patch.object(bot, "send_raw") as sr:
+        bot.process_cmd("SAY hackint|#c hi")
+    assert sr.call_args.args[0] == "PRIVMSG hackint|#c :hi"

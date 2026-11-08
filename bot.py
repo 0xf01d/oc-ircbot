@@ -54,6 +54,14 @@ TRUST_VIA_311 = env_bool("BOT_TRUST_311", False)
 
 LOG = env("BOT_LOG", os.path.join(HERE, "bot.log"))
 FIFO = env("BOT_FIFO", os.path.join(HERE, "bot.send"))
+# This instance's network label, derived from its FIFO name (bot.send.<net>).
+# The base instance (/data/bot.send) has none -> "". Two grammars exist and
+# mixing them is the recurring 401: the brain's ANSWER grammar is
+# `SAY net|target text`, the per-network FIFO grammar is `SAY target text`.
+# A sidecar that pastes the answer form straight into a per-net FIFO makes us
+# PRIVMSG `net|#chan` (401 No such nick). See process_cmd().
+_bn = os.path.basename(FIFO)
+NET_LABEL = _bn.split("bot.send.", 1)[1] if _bn.startswith("bot.send.") else ""
 # Event stream for sidecar brains: a second container tails this instead of stdout.
 EVENTS_FILE = env("BOT_EVENTS", "/data/events.log")
 TRUST_FILE = env("BOT_TRUST", os.path.join(HERE, "bot.trust"))
@@ -1093,6 +1101,16 @@ def process_cmd(line):
                  "allowed: [a-z0-9_-]{1,24}")
             return
     verb = verb.upper()
+    # Defensive: a sidecar wrote the answer grammar into this per-net FIFO
+    # (`SAY net|#chan hi`) instead of the FIFO grammar (`SAY #chan hi`). Strip
+    # the prefix ONLY when it is this instance's own label, so a real target
+    # that merely contains a pipe is never touched. Covers SAY/ACT/NOTICE and
+    # JOIN/PART/WHOIS/RAW, which all take `rest` verbatim.
+    if NET_LABEL and rest.partition("|")[0] == NET_LABEL:
+        _t, _sep, _r = rest.partition("|")
+        if _sep and _r:
+            emit("CMD_NET_PREFIX_STRIPPED", NET_LABEL, verb, f"->{_r.split(' ', 1)[0]}")
+            rest = _r
     if not outbound_ok(verb, rest, origin):
         return
     if verb in ("SAY", "ACT", "NOTICE") and " " in rest:
