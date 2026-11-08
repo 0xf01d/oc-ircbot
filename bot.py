@@ -12,6 +12,7 @@ external sidecars stamp their name into bot.log and the reply stream without
 being parseable as a verb themselves. The tag is the vjt contract — dropping
 it turned every pre-existing sidecar's line into CMD_ERROR.
 """
+import base64
 import fnmatch
 import os
 import random
@@ -88,6 +89,24 @@ def load_env():
 
 ENV = load_env()
 NICKSERV_PASS = ENV.get("NICKSERV_PASS") or os.environ.get("NICKSERV_PASS") or ""
+# SASL PLAIN: hackint removed NickServ IDENTIFY in 2026-02, so password auth
+# only exists at connect time. Generic env (SASL_ACCOUNT / SASL_PASS or
+# SASL_PASS_FILE) plus a hackint default pointing at the saved credential.
+SASL_ACCOUNT = ENV.get("SASL_ACCOUNT") or os.environ.get("SASL_ACCOUNT", "") or ""
+SASL_PASS = ENV.get("SASL_PASS") or os.environ.get("SASL_PASS", "") or ""
+SASL_PASS_FILE = ENV.get("SASL_PASS_FILE") or os.environ.get("SASL_PASS_FILE", "") or ""
+if not SASL_ACCOUNT and HOST == "irc.hackint.org":
+    SASL_ACCOUNT = NICK
+    SASL_PASS_FILE = SASL_PASS_FILE or "/data/.ocbot_hackint_nickserv"
+if not SASL_PASS and SASL_PASS_FILE:
+    try:
+        with open(SASL_PASS_FILE) as _f:
+            SASL_PASS = _f.read().strip()
+    except OSError:
+        pass
+SASL_ENABLED = bool(SASL_ACCOUNT and SASL_PASS)
+sasl_requested = False
+sasl_done = False
 startup_fired = False
 
 # Ghost-on-connect: a line drop leaves our old connection holding NICK as a
@@ -110,6 +129,7 @@ MAX_BODY = 400
 
 sock = None
 send_lock = threading.Lock()
+
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
@@ -567,7 +587,7 @@ def _reclaim_after_ghost():
 
 
 def handle_server_line(line):
-    global registered, ghost_needed, tmp_nick
+    global registered, ghost_needed, tmp_nick, sasl_requested, sasl_done
     log("<", line)
     if line.startswith("PING "):
         send_raw("PONG " + line[5:])
@@ -582,6 +602,37 @@ def handle_server_line(line):
     # against the trust host glob, in the stream itself.
     host = prefix.split("@", 1)[1] if prefix and "@" in prefix else ""
     rest = rest or ""
+    if SASL_ENABLED and cmd == "CAP":
+        parts = rest.split()
+        sub = parts[1].upper() if len(parts) > 1 else ""
+        if sub == "LS":
+            if "sasl" in rest.lower():
+                if not sasl_requested:
+                    sasl_requested = True
+                    send_raw("CAP REQ :sasl")
+            else:
+                sasl_done = True
+                send_raw("CAP END")
+                emit("SASL_UNAVAILABLE")
+        elif sub == "ACK" and "sasl" in rest.lower():
+            send_raw("AUTHENTICATE PLAIN")
+        return
+    if SASL_ENABLED and cmd == "AUTHENTICATE" and rest.strip() == "+":
+        token = base64.b64encode(
+            ("\0%s\0%s" % (SASL_ACCOUNT, SASL_PASS)).encode("utf-8")
+        ).decode("ascii")
+        send_raw("AUTHENTICATE " + token)
+        return
+    if SASL_ENABLED and cmd == "903":
+        sasl_done = True
+        send_raw("CAP END")
+        emit("SASL_OK", SASL_ACCOUNT)
+        return
+    if SASL_ENABLED and cmd in ("904", "905", "906"):
+        sasl_done = True
+        send_raw("CAP END")
+        emit("SASL_FAIL", cmd, rest)
+        return
     if cmd in ("PRIVMSG", "NOTICE", "TOPIC") and " :" in rest:
         tgt, _, body = rest.partition(" :")
         leak_guard.record(tgt.strip(), body)
@@ -1113,8 +1164,17 @@ def main():
         sock = raw
         sock.settimeout(420)
         emit("TCP_OK", HOST, PORT, "plaintext")
+    if SASL_ENABLED:
+        send_raw("CAP LS 302")
     send_raw(f"NICK {NICK}")
     send_raw(f"USER {IDENT} 0 * :{REAL}")
+    if SASL_ENABLED:
+        def _sasl_timeout():
+            time.sleep(10)
+            if not sasl_done:
+                emit("SASL_TIMEOUT")
+                send_raw("CAP END")
+        threading.Thread(target=_sasl_timeout, daemon=True).start()
 
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()

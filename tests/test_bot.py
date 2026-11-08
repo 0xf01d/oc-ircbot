@@ -403,3 +403,68 @@ def test_shipped_irc_commands_imports_cleanly():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert callable(mod.handle)
+
+
+# --- SASL PLAIN -------------------------------------------------------------
+# hackint dropped NickServ IDENTIFY (2026-02), so a password can only be
+# presented at registration time. These pin the handshake order: CAP LS 302 ->
+# CAP REQ sasl -> AUTHENTICATE PLAIN -> base64(\0acct\0pass) -> CAP END on 903.
+# Getting the order wrong parks the connection in registration forever, and
+# the bot would look "connected" (TCP) while never joining a channel.
+
+
+def _sasl(sasl=True, acct="ocbot", pw="s3cret"):
+    return mock.patch.multiple(bot, SASL_ENABLED=sasl, SASL_ACCOUNT=acct,
+                               SASL_PASS=pw)
+
+
+def test_sasl_cap_ls_requests_sasl():
+    with _sasl(), mock.patch.object(bot, "sasl_requested", False), \
+            mock.patch.object(bot, "send_raw") as sr:
+        bot.handle_server_line(":irc.hackint.org CAP * LS :sasl account-tag")
+        assert sr.call_args.args[0] == "CAP REQ :sasl"
+        assert bot.sasl_requested is True   # inside the patch: it restores
+
+
+def test_sasl_cap_ls_without_sasl_ends_registration():
+    with _sasl(), mock.patch.object(bot, "send_raw") as sr, \
+            mock.patch.object(bot, "emit") as em:
+        bot.handle_server_line(":irc.hackint.org CAP * LS :account-tag")
+    assert sr.call_args.args[0] == "CAP END"
+    assert any(c.args[0] == "SASL_UNAVAILABLE" for c in em.call_args_list)
+
+
+def test_sasl_authenticate_plain_payload():
+    import base64
+    with _sasl(), mock.patch.object(bot, "send_raw") as sr:
+        bot.handle_server_line("AUTHENTICATE +")
+    want = "AUTHENTICATE " + base64.b64encode(b"\x00ocbot\x00s3cret").decode()
+    assert sr.call_args.args[0] == want
+
+
+def test_sasl_903_ends_cap_and_reports():
+    with _sasl(), mock.patch.object(bot, "sasl_done", False), \
+            mock.patch.object(bot, "send_raw") as sr, \
+            mock.patch.object(bot, "emit") as em:
+        bot.handle_server_line(":irc.hackint.org 903 ocbot :SASL ok")
+        assert sr.call_args.args[0] == "CAP END"
+        assert bot.sasl_done is True
+    assert any(c.args[0] == "SASL_OK" for c in em.call_args_list)
+
+
+def test_sasl_failure_still_ends_registration():
+    # 904 bad credentials: never leave the client hanging in CAP.
+    for code in ("904", "905", "906"):
+        with _sasl(), mock.patch.object(bot, "sasl_done", False), \
+                mock.patch.object(bot, "send_raw") as sr, \
+                mock.patch.object(bot, "emit") as em:
+            bot.handle_server_line(f":irc.hackint.org {code} ocbot :nope")
+        assert sr.call_args.args[0] == "CAP END"
+        assert any(c.args[0] == "SASL_FAIL" for c in em.call_args_list)
+
+
+def test_sasl_disabled_leaves_cap_alone():
+    # No credentials -> the old plain NICK/USER path, untouched.
+    with _sasl(sasl=False), mock.patch.object(bot, "send_raw") as sr:
+        bot.handle_server_line(":irc.hackint.org CAP * LS :sasl")
+    sr.assert_not_called()
