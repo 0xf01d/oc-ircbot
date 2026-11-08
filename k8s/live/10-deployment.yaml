@@ -2,22 +2,26 @@
 #
 #   brain (main: persistent OpenCode session, spawns `opencode serve`
 #          on 127.0.0.1:46099)  <-  watchdog (sidecar, same netns)
-#   bot (the IRC bridge; nets.py supervises bot.py against freebnc)
+#   bot (the IRC bridge; nets.py supervises one bot.py per network)
 #
 # Compose expressed `watchdog reaches the loopback-only serve` with
 # network_mode: service:brain; in Kubernetes the three containers of one pod
-# share the network namespace, so http://127.0.0.1:46099 just works. The
-# shared state (bot.send FIFO, events.log, bot.log, heartbeat, workspace)
-# is a pod-scoped emptyDir at /data, like compose's botdata volume.
+# share the network namespace, so http://127.0.0.1:46099 just works.
+#
+# This file is the PRODUCTION manifest: it is what runs in the cluster, kept in
+# sync by hand-checked commits (see README.md for the reconciliation rule). The
+# shape below was captured from the live Deployment, not designed: /data is the
+# shared PVC `lane-work` (NOT an emptyDir), because the network map, the
+# per-network trust/startup files and every sidecar's state have to survive a
+# rollout. `NETWORKS_FILE=/data/networks.json` makes that PVC copy the only
+# source of truth; the ConfigMap does not carry a seed copy on purpose (two
+# copies of the network map is exactly how label/mismatch double-bots happen).
 #
 # Code comes from the images (single multi-stage Dockerfile, three targets),
 # NOT from a ConfigMap: the brain image carries the Node OpenCode CLI.
-# bot.trust / bot.startup / bot.reserved ride the oc-ircbot-live ConfigMap
-# (00-config.yaml). Secrets are referenced, never committed: create
-# oc-ircbot-secrets out-of-band — see README.md.
-#
-# Recreate (not RollingUpdate): one IRC connection, one nick — two pods
-# racing for it would 433-flap.
+# Secrets are referenced, never committed: create oc-ircbot-secrets out of band
+# — see README.md. Recreate (not RollingUpdate): one IRC connection, one nick,
+# two pods would 433-flap.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -42,13 +46,18 @@ spec:
       # nets.py SIGTERM path parts cleanly with a 10 s QUIT grace; leave
       # the default 30 s so it never gets SIGKILL mid-part.
       terminationGracePeriodSeconds: 30
+      # /data is the shared PVC lane-work: the network map, the per-network
+      # BOT_TRUST/BOT_STARTUP files and the FIFO set all survive a rollout.
+      # Nothing seeds it from the ConfigMap on purpose — networks.json on the
+      # PVC is the live source of truth (NETWORKS_FILE) and hot-editable.
       volumes:
         - name: conf
           configMap:
             name: oc-ircbot-live
             defaultMode: 0444
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: lane-work
       containers:
         # --- main: the persistent-session brain ------------------------------
         - name: brain
@@ -57,6 +66,28 @@ spec:
           env:
             - {name: IRC_NICK, value: ocbot}
             - {name: BRAIN_ADMIN, value: katia}
+            # One logical name (aisix) in front of the model ladder: the
+            # gateway decides, the ladder is the failover order. Keeping the
+            # ladder here, not in code, is what lets a dead free model be
+            # demoted without a rebuild.
+            - {name: BRAIN_MODEL, value: aisix/auto}
+            - {name: BRAIN_MODEL_LADDER, value: "aisix/auto,aisix/go-glm-5.3-flash,aisix/glm-5.3-flash,aisix/claude-sonnet-5-5"}
+            - {name: OC_MODEL, value: opencode/deepseek-v4.1-flash-free}
+            - {name: OPENCODE_CONFIG, value: /data/oc/aisix.json}
+            - {name: NETWORKS_FILE, value: /data/networks.json}
+            # 1800 s /clear: a long-lived session otherwise pays the whole
+            # history on every turn. TURN_TIMEOUT 300 leaves room for a free
+            # model that thinks for minutes before the abort fires.
+            - {name: BRAIN_RESET_SECS, value: "1800"}
+            - {name: BRAIN_TURN_TIMEOUT, value: "300"}
+            # 0: an addressed line does NOT abort the running turn. Off on
+            # purpose — preemption kept killing multi-minute turns mid-answer.
+            - {name: BRAIN_PREEMPT_ON_ADDRESS, value: "0"}
+            - name: AISIX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aisix-client-key
+                  key: AISIX_API_KEY
             - name: OPENCODE_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -76,10 +107,12 @@ spec:
                   else 1)
             initialDelaySeconds: 60
             periodSeconds: 15
+            timeoutSeconds: 1
+            successThreshold: 1
             failureThreshold: 4
           resources:
-            requests: {cpu: 50m, memory: 128Mi}
-            limits: {memory: 1Gi}
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {cpu: "1", memory: 2Gi}
 
         # --- the IRC bridge ---------------------------------------------------
         - name: bot
@@ -96,6 +129,10 @@ spec:
             - {name: BOT_TRUST, value: /conf/bot.trust}
             - {name: BOT_RESERVED, value: /conf/bot.reserved}
             - {name: BOT_STARTUP, value: /conf/bot.startup}
+            # nets.py reads the PVC map, so a new network is a file edit
+            - {name: NETWORKS_FILE, value: /data/networks.json}
+            - {name: OC_MODEL, value: opencode/glm-5.3-flash-free}
+            - {name: BRAIN_MODEL, value: opencode/longcat-2.5-preview-free}
             - name: NICKSERV_PASS
               valueFrom:
                 secretKeyRef:
@@ -116,6 +153,8 @@ spec:
           env:
             - {name: BRAIN_SERVE_URL, value: "http://127.0.0.1:46099"}
             - {name: BRAIN_AGENT_STATUS, value: /data/agent.status}
+            - {name: OC_MODEL, value: opencode/longcat-2.5-preview-free}
+            - {name: BRAIN_MODEL, value: opencode/longcat-2.5-preview-free}
             - {name: WATCHDOG_POLL, value: "10"}
             - {name: WATCHDOG_STALL, value: "30"}
             - {name: WATCHDOG_MAX_STALLS, value: "3"}
