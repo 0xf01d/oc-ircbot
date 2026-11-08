@@ -732,22 +732,34 @@ class Brain:
                     time.monotonic() - oldest >= BATCH_WINDOW)
 
     # -- submit ---------------------------------------------------------------------
+    def _batch_mode(self, batch):
+        """A batch is act when any event carries a hands-on directive; plain
+        address-only chatter stays chat and skips the agent scaffold."""
+        for _t, ev in batch:
+            if policy.needs_hands(ev.get("body") or ev.get("raw") or ""):
+                return "act"
+        return "chat"
+
     def submit(self, sess):
         with self.lock:
             if not sess.pending or sess.busy_since is not None:
                 return
             batch = sess.pending
             sess.pending = []
-        addressed = [id(ev) for _t, ev in batch
+        events = [ev for _t, ev in batch]
+        addressed = [id(ev) for ev in events
                      if policy.is_addressed(
                          ev, self._net_nick(ev.get("net")))]
-        prompt = policy.build_prompt([ev for _t, ev in batch], addressed)
+        mode = self._batch_mode(batch)
+        system = policy.build_system(self._roster(), self.registers, mode=mode)
+        emit("TURN_MODE", mode)
+        prompt = policy.build_prompt(events, addressed)
         if self.dry_run:
             emit("DRY_RUN_PROMPT", sess.title)
             print(prompt, flush=True)
             return
         try:
-            self.api.prompt_async(sess.sid, prompt, system=sess.system,
+            self.api.prompt_async(sess.sid, prompt, system=system,
                                   model=self.model)
         except OSError as e:
             emit("PROMPT_ERROR", sess.title, repr(e))

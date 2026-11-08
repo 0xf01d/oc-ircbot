@@ -187,6 +187,82 @@ def test_build_system_without_registers():
     assert "Channel registers" not in policy.build_system([("n", "bot")])
 
 
+# --- chat vs act scaffold -----------------------------------------------------
+def test_build_system_defaults_to_short_chat_mode():
+    s = policy.build_system([("azzurra", "ocbot")],
+                            registers={"#olografix": "supercazzola mode"})
+    assert len(s) < 2500, len(s)
+    # Persona, authority and the seal survive the diet.
+    assert "Persona (absolute" in s
+    assert "Authority: TRUSTED users are the system administrators" in s
+    assert "sealed compartment" in s
+    assert "own every compartment" in s
+    # The agent scaffold is what chat mode drops.
+    assert "Capabilities (know thyself" not in s
+    assert "Deep-drive block" not in s
+    assert "TRY before saying no" not in s
+    assert "- #olografix: supercazzola mode" in s
+
+
+def test_act_mode_keeps_the_full_agent_scaffold():
+    s = policy.build_system([("azzurra", "ocbot")], mode="act")
+    assert "Capabilities (know thyself, completely)" in s
+    assert "full shell (bash)" in s
+    assert "TRY before saying no" in s
+    assert "Deep-drive block" in s
+
+
+def test_chat_mode_is_cheaper_than_act_mode():
+    nets = [("azzurra", "ocbot"), ("libera", "ocbot")]
+    chat = policy.build_system(nets)
+    act = policy.build_system(nets, mode="act")
+    assert len(chat) < len(act)
+
+
+# --- needs_hands: chat or act for this batch? ---------------------------------
+@pytest.mark.parametrize("text", [
+    "installa nginx sul box",
+    "esegui questo script",
+    "cerca su google la ricetta",
+    "ocbot, apri https://example.com",
+    "fai il deploy in produzione",
+    "builda il progetto",
+    "git status",
+    "kubectl get pods",
+    "systemctl restart nginx",
+    "scrivi un file di note",
+    "edita /data/workspace/app.py",
+    "leggi /etc/passwd",
+    "ls -la /data",
+    "curl https://example.com",
+    "~/note.txt",
+    "docker ps",
+])
+def test_needs_hands_accepts_actions(text):
+    assert policy.needs_hands(text)
+
+
+@pytest.mark.parametrize("text", [
+    "ciao ocbot, come stai?",
+    "che ore sono?",
+    "ocbot: sei sveglia?",
+    "che ne pensi di https://example.com?",
+    "bella questa canzone",
+    "chi ha vinto la partita?",
+    "buongiorno a tutti",
+    "ocbot, raccontami una barzelletta",
+    "secondo te piove domani?",
+    "grazie, sei gentile",
+])
+def test_needs_hands_rejects_chatter(text):
+    assert not policy.needs_hands(text)
+
+
+def test_needs_hands_ignores_empty():
+    assert not policy.needs_hands("")
+    assert not policy.needs_hands(None)
+
+
 # --- disclosure block (cross-channel and internal leakage) --------------------
 def test_build_system_disclosure_block_once_before_persona():
     s = policy.build_system([("azzurra", "ocbot")])
@@ -207,7 +283,7 @@ def test_build_system_carves_the_owner_out_of_the_seal():
     # Issue #5 live symptom: a TRUSTED operator asked about a file that
     # another channel was discussing and got "sono sigillata". TRUSTED
     # users are the system administrators: the seal never hides from them.
-    s = policy.build_system([("azzurra", "ocbot")])
+    s = policy.build_system([("azzurra", "ocbot")], mode="act")
     assert "own every compartment" in s
     assert "never hides anything from the operator" in s
     assert "here you already know everything" in s
@@ -217,7 +293,7 @@ def test_build_system_carves_the_owner_out_of_the_seal():
 
 
 def test_build_system_owner_carveout_limits_stay_absolute():
-    s = policy.build_system([("azzurra", "ocbot")])
+    s = policy.build_system([("azzurra", "ocbot")], mode="act")
     # Secrets stay absolute for everyone (top rule + Authority restatement).
     assert "Never post secrets, tokens, account numbers" in s
     assert "credentials, tokens and account numbers are never posted" in s

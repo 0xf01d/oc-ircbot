@@ -184,6 +184,27 @@ def test_batching_waits_for_the_window(world):
     assert "[12:00] irc|#test <b>: two (trusted; HOST=b@h)" in body
 
 
+@pytest.mark.parametrize("body,mode,has_capabilities", [
+    ("ciao ocbot, come stai?", "chat", False),
+    ("ocbot, installa nginx", "act", True),
+])
+def test_submit_selects_the_system_prompt_per_batch(
+        tmp_path, capsys, body, mode, has_capabilities):
+    # Chat is the default: only a batch with a hands-on directive pays for
+    # the full agent scaffold. The chosen mode is visible in events.log.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    ev = policy.parse_event(
+        f"[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY={body}")
+    sess.pending = [(time.monotonic(), ev)]
+    b.submit(sess)
+    system = b.api.prompt_async.call_args.kwargs["system"]
+    assert ("Capabilities (know thyself" in system) is has_capabilities
+    assert f"TURN_MODE {mode}" in capsys.readouterr().out
+
+
 def test_one_session_carries_every_channel_and_network(tmp_path):
     # THE architecture: two channels on two networks interleave in ONE
     # session, one continuous conversation; routing comes from the answers.
