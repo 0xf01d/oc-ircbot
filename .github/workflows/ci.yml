@@ -14,7 +14,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+        # pyyaml: tests/test_configs.py parses k8s/live/*.yaml, so the manifest
+        # assertions are structural (env/volumes/probes) and not a grep over
+        # prose in a comment.
+        run: python -m pip install --upgrade pip pytest pyyaml
       - name: Run unit tests
         run: python -m pytest tests -q
       - name: brain --dry-run smoke (prints the prompt, invokes nothing)
