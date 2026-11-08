@@ -130,6 +130,31 @@ MAX_BODY = 400
 sock = None
 send_lock = threading.Lock()
 
+# Outbound pacing. The hackint link died of Excess Flood (2026-11-04 ~22:04):
+# trust_check WHOIS'd ~25 nicks back-to-back and the wire had no throttle.
+# Every send_raw now reserves a slot at BOT_SEND_RATE lines/sec per process
+# (= per network). PONG and QUIT skip the queue so a backed-up burst can never
+# make us miss a keepalive or delay a clean part. 0 disables the limiter.
+SEND_RATE = float(env("BOT_SEND_RATE", "2"))
+SEND_INTERVAL = (1.0 / SEND_RATE) if SEND_RATE > 0 else 0.0
+send_pace_lock = threading.Lock()
+send_next_at = 0.0
+
+
+def _pace_send():
+    """Reserve the next outbound slot and sleep until it is due. Thread-safe:
+    callers queue by reservation time and the wire never exceeds SEND_RATE."""
+    global send_next_at
+    if SEND_INTERVAL <= 0:
+        return
+    with send_pace_lock:
+        slot = max(time.monotonic(), send_next_at)
+        send_next_at = slot + SEND_INTERVAL
+    delay = slot - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+
+
 leak_guard = LeakGuard(HOST, RESERVED_FILE, RESERVED_STORE)
 
 # Per-channel random cooldown after the last HUMAN PRIVMSG; when elapsed, emit
@@ -335,6 +360,8 @@ def log(direction, line, origin=None):
 
 
 def send_raw(s, origin=None):
+    if not (s.startswith("PONG ") or s == "QUIT" or s.startswith("QUIT ")):
+        _pace_send()
     log(">", s, origin)
     with send_lock:
         try:

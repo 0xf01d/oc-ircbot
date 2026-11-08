@@ -468,3 +468,41 @@ def test_sasl_disabled_leaves_cap_alone():
     with _sasl(sasl=False), mock.patch.object(bot, "send_raw") as sr:
         bot.handle_server_line(":irc.hackint.org CAP * LS :sasl")
     sr.assert_not_called()
+
+
+# --- outbound pacing --------------------------------------------------------
+# hackint killed the link with Excess Flood on 2026-11-04: trust_check WHOIS'd
+# ~25 nicks back to back and nothing throttled the wire. send_raw now reserves
+# a slot at BOT_SEND_RATE lines/sec per process, except for PONG/QUIT, which
+# must never queue behind a backlog (a late PONG is a ping timeout, a late
+# QUIT is an unclean part).
+
+
+def test_pace_send_spaces_reservations():
+    with mock.patch.object(bot, "SEND_INTERVAL", 0.01), \
+            mock.patch.object(bot, "send_next_at", 0.0), \
+            mock.patch("time.sleep") as sl:
+        bot._pace_send()
+        bot._pace_send()
+        bot._pace_send()
+    # First call is immediate (no backlog), the next two each reserve 10 ms.
+    assert [c.args[0] for c in sl.call_args_list if c.args] != []
+
+
+def test_pace_send_disabled_at_rate_zero():
+    with mock.patch.object(bot, "SEND_INTERVAL", 0.0), \
+            mock.patch("time.sleep") as sl:
+        bot._pace_send()
+    sl.assert_not_called()
+
+
+def test_send_raw_paces_privmsg_but_not_pong_or_quit():
+    with mock.patch.object(bot, "_pace_send") as pace, \
+            mock.patch.object(bot, "sock") as sk:
+        sk.sendall = mock.MagicMock()
+        bot.send_raw("PRIVMSG #c :hi")
+        paced_after_chat = pace.call_count
+        bot.send_raw("PONG :tok")
+        bot.send_raw("QUIT bye")
+    assert paced_after_chat == 1     # the PRIVMSG waited its turn
+    assert pace.call_count == 1      # PONG and QUIT went straight out
