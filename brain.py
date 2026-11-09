@@ -922,8 +922,6 @@ class Brain:
         model. Chat is already free for the next batch."""
         trigger = events[-1]
         net_name = trigger.get("net") or (self.nets[0].name if self.nets else "")
-        # Ack before touching the API: the channel hears "on it" immediately.
-        self._ack_work(net_name, trigger)
         worker = self.ensure_worker(net_name, trigger)
         chat = self.sess
         if worker is None:                   # never drop: fall back to chat
@@ -938,13 +936,20 @@ class Brain:
             busy = worker.busy_since is not None
         emit("TURN_ROUTE", mode, worker.title)
         if busy:
-            return                           # one in-flight act per channel
+            # One in-flight act per channel. No ack either: the work is already
+            # running and the channel was told so when it started; a second
+            # "on it" for every message of a burst is noise.
+            return
+        # Ack only when work actually starts, and before touching the API so
+        # the channel hears "on it" immediately. An event with no channel and
+        # no sender has no target worth speaking to: stay silent.
+        self._ack_work(net_name, trigger)
         self._drain(worker)
 
     def _ack_work(self, net_name, ev):
         target = policy.reply_target(ev)
         net = self.net_by_name.get(net_name)
-        if net is None:
+        if net is None or not target or target == "?":
             return
         write_fifo([f"SAY {target} {WORK_ACKS[0]}"], net.fifo, net=net_name)
         emit("WORK_ACK", net_name, target)
