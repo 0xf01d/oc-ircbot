@@ -194,12 +194,14 @@ def test_submit_selects_the_system_prompt_per_batch(
     # the full agent scaffold. The chosen mode is visible in events.log.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
     sess = brain.Session("s1", "irc:global", "sys")
     b.sess = sess
     ev = policy.parse_event(
         f"[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY={body}")
     sess.pending = [(time.monotonic(), ev)]
-    b.submit(sess)
+    with mock.patch.object(brain, "write_fifo", return_value=1):
+        b.submit(sess)
     system = b.api.prompt_async.call_args.kwargs["system"]
     assert ("Capabilities (know thyself" in system) is has_capabilities
     assert f"TURN_MODE {mode}" in capsys.readouterr().out
@@ -714,15 +716,23 @@ def test_submit_records_the_latest_batch_trust(tmp_path):
 
 
 def test_submit_never_treats_a_synthetic_turn_as_trusted(tmp_path):
+    # A synthetic event (the model's own NEED_TOOLS follow-up) is act work, so
+    # it lands on a worker. Whatever session runs it, `trust=TRUSTED` on the
+    # synthetic event must not become a TRUSTED batch: the model cannot ask
+    # itself for permission.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
     sess = brain.Session("s1", "irc:global", "sys")
     b.sess = sess
     sess.pending = [(time.monotonic(), {
         "kind": "MSG", "net": "irc", "from": "system", "to": "#test",
         "body": "tool turn", "trust": "TRUSTED", "synthetic": True})]
-    b.submit(sess)
+    with mock.patch.object(brain, "write_fifo", return_value=1):
+        b.submit(sess)
     assert sess.last_trust is None
+    for worker in b.workers.values():
+        assert worker.last_trust is None
 
 
 def test_idle_clears_the_latest_batch_trust(tmp_path):
@@ -1215,6 +1225,127 @@ def test_need_tools_arms_an_act_turn(tmp_path, capsys):
     assert len(sess.pending) == 1
     assert sess.pending[0][1]["synthetic"] is True
     assert b._batch_mode(sess.pending) == "act"
+
+
+# --- act turns run in a worker session, never in the chat conversation --------
+def _pending(sess, body, target="#test"):
+    ev = policy.parse_event(
+        f"[12:00] MSG TRUSTED FROM=alice HOST=h TO={target} BODY={body}")
+    sess.pending = [(time.monotonic(), ev)]
+    return ev
+
+
+def test_chat_batch_never_creates_the_worker(tmp_path, capsys):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    _pending(sess, "ciao ocbot")
+    b.submit(sess)
+    b.api.create_session.assert_not_called()
+    b.api.prompt_async.assert_called_once()
+    assert b.api.prompt_async.call_args.args[0] == "s1"
+    assert b.workers == {}
+    assert "TURN_ROUTE chat irc:global" in capsys.readouterr().out
+
+
+def test_act_batch_routes_to_a_lazy_worker_and_acks(tmp_path, capsys):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    _pending(sess, "installa nginx")
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.submit(sess)
+    assert b.api.create_session.call_args.args[0] == "irc:#test:work"
+    b.api.prompt_async.assert_called_once()
+    assert b.api.prompt_async.call_args.args[0] == "w1"
+    # The chat session neither went busy nor lost its collected-message mark.
+    assert sess.busy_since is None and sess.last_count == 0
+    worker = b.workers["irc|#test"]
+    assert worker.sid == "w1" and worker.busy_since is not None
+    # One short ack, composed by the brain, costs no model tokens.
+    assert ["SAY #test on it"] in [c.args[0] for c in wf.call_args_list]
+    out = capsys.readouterr().out
+    assert "TURN_MODE act" in out
+    assert "TURN_ROUTE act irc:#test:work" in out
+
+
+def test_act_while_worker_is_busy_queues_on_the_same_worker(tmp_path, capsys):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    worker = brain.Session("w1", "irc:#test:work", "sys")
+    worker.busy_since = time.monotonic()
+    b.workers["irc|#test"] = worker
+    ev = _pending(chat, "installa nginx")
+    with mock.patch.object(brain, "write_fifo", return_value=1):
+        b.submit(chat)
+    # No second act turn: the events are appended to the worker's own queue.
+    b.api.prompt_async.assert_not_called()
+    assert [e for _t, e in worker.pending] == [ev]
+    assert chat.pending == []
+    assert b.workers["irc|#test"] is worker
+
+
+def test_worker_idle_dispatches_its_own_verbs_and_leaves_chat_alone(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.messages.return_value = [
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "q"}]},
+        {"info": {"role": "assistant"},
+         "parts": [{"type": "text", "text": "SAY irc|#test worker-done"}]},
+    ]
+    chat = brain.Session("s1", "irc:global", "sys")
+    chat.last_count = 7
+    b.sess = chat
+    worker = brain.Session("w1", "irc:#test:work", "sys")
+    worker.busy_since = time.monotonic()
+    b.workers["irc|#test"] = worker
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.on_idle("w1")
+    assert wf.call_args.args[0] == ["SAY #test worker-done"]
+    assert chat.last_count == 7            # chat collection untouched
+    assert b.sess is chat
+    assert b.workers["irc|#test"] is worker  # kept, not reset or destroyed
+    assert worker.last_count == 2
+    assert worker.busy_since is None
+
+
+def test_stats_reports_the_worker_state(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    ev = policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=a HOST=h TO=#test BODY=!stats")
+    ev["net"] = "irc"
+    worker = brain.Session("w1", "irc:#test:work", "sys")
+    b.workers["irc|#test"] = worker
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.stats_reply(chat, ev)
+    assert any("work=idle" in line for line in wf.call_args.args[0])
+    worker.busy_since = time.monotonic() - 5
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.stats_reply(chat, ev)
+    assert any("work=busy:5" in line for line in wf.call_args.args[0])
+
+
+def test_worker_age_is_reaped_by_the_same_guard(tmp_path, capsys):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    worker = brain.Session("w1", "irc:#test:work", "sys")
+    worker.born = time.monotonic() - brain.RESET_SECS - 1
+    b.workers["irc|#test"] = worker
+    b._reap_aged()
+    assert "irc|#test" not in b.workers
+    assert b.api.abort.called
+    assert b.sess is chat
+    assert "TURN" not in capsys.readouterr().out
 
 
 # --- batching by quiescence: a burst becomes ONE turn ------------------------
