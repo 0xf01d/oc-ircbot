@@ -191,7 +191,7 @@ def test_build_system_without_registers():
 def test_build_system_defaults_to_short_chat_mode():
     s = policy.build_system([("azzurra", "ocbot")],
                             registers={"#olografix": "supercazzola mode"})
-    assert len(s) < 2500, len(s)
+    assert len(s) < 2900, len(s)
     # Persona, authority and the seal survive the diet.
     assert "Persona (absolute" in s
     assert "Authority: TRUSTED users are the system administrators" in s
@@ -390,3 +390,22 @@ def test_chat_prompt_points_at_the_notes_on_disk():
     assert "project_activity_log.md" in s
     assert "/data/workspace" in s
     assert "amnesia" in s
+
+
+# --- NEED_TOOLS: the model asks for hands, the brain arms a tool turn --------
+def test_need_tools_is_a_parsed_verb():
+    out = policy.parse_answer("SAY #c on it\nNEED_TOOLS restart bird2")
+    assert ("SAY", "#c", "on it") in out
+    assert ("NEED_TOOLS", "", "restart bird2") in out
+
+
+def test_need_tools_is_not_forwarded_to_the_fifo():
+    # The FIFO grammar has no NEED_TOOLS: forwarding it would put a bogus
+    # verb on the wire and the bot would answer 421 Unknown command.
+    assert "NEED_TOOLS" not in policy.VERBS[:7]
+
+
+def test_chat_prompt_documents_need_tools():
+    s = policy.build_system([("n", "ocbot")])
+    assert "NEED_TOOLS" in s
+    assert "tools enabled" in s

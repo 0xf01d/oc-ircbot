@@ -1054,3 +1054,22 @@ def test_learned_fallback_nick_addressed(tmp_path):
         b.submit(sess)
     # the batch must contain the addressed event (no crash, pending drained)
     assert sess.pending == []
+
+
+def test_need_tools_arms_an_act_turn(tmp_path, capsys):
+    # The model cannot load tools mid-turn, so it announces NEED_TOOLS and the
+    # brain shapes the FOLLOW-UP turn as `act` via a synthetic event.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    ev = policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=katia HOST=h TO=#test BODY=restart bird2")
+    sess.pending = []
+    sess.last_net = "test"
+    b.dispatch(sess, "SAY #test on it\nNEED_TOOLS restart bird2")
+    out = capsys.readouterr().out
+    assert "NEED_TOOLS" in out
+    assert len(sess.pending) == 1
+    assert sess.pending[0][1]["synthetic"] is True
+    assert b._batch_mode(sess.pending) == "act"
