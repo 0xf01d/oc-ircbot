@@ -1391,3 +1391,40 @@ def test_due_full_batch_short_circuits(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 99.0)
     sess.pending = [(now, {"body": str(i)}) for i in range(3)]
     assert b.due(sess) is True
+
+
+# --- the ack is a promise, not a tic -----------------------------------------
+def test_ack_fires_once_per_started_work_not_per_queued_message(tmp_path, capsys):
+    # A burst of three act messages: the first starts the work and acks, the
+    # other two queue on the busy worker and must stay silent.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        _pending(sess, "installa nginx")
+        b.submit(sess)
+        first = len(wf.call_args_list)
+        _pending(sess, "poi mariadb")
+        b.submit(sess)
+        _pending(sess, "e redis")
+        b.submit(sess)
+    assert first == 1
+    assert len(wf.call_args_list) == 1        # queued work does not re-ack
+    assert sum("on it" in str(c) for c in wf.call_args_list) == 1
+
+
+def test_ack_is_silent_when_the_event_has_no_target(tmp_path, capsys):
+    # reply_target() falls back to "?" for an event with neither channel nor
+    # sender: saying "SAY ? on it" is worse than saying nothing.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    ev = {"kind": "MSG", "net": "irc", "from": "", "to": "", "body": "x"}
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        with mock.patch.object(brain.Brain, "_drain"):
+            b._route_to_worker([(time.monotonic(), ev)], [ev], [], "act")
+    assert wf.call_count == 0
