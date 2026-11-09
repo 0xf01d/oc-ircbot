@@ -48,6 +48,13 @@ SERVE_URL = env("BRAIN_SERVE_URL", "")         # attach mode (tests/CI)
 SERVE_PORT = int(env("BRAIN_SERVE_PORT", "46099"))
 POLL = float(env("BRAIN_POLL", "1.0"))
 BATCH_WINDOW = float(env("BRAIN_BATCH_WINDOW", "3.0"))
+# Quiescence window: a batch fires when the queue has been still this long.
+# This is the knob that coalesces a human burst; BATCH_WINDOW alone measured
+# from the OLDEST event, so a burst of five messages became five thin turns.
+BATCH_QUIET = float(env("BRAIN_BATCH_QUIET", "2.5"))
+# Starvation cap: never hold the oldest event longer than this even if the
+# channel never goes quiet (someone typing in another net, a bot loop).
+BATCH_MAX_WAIT = float(env("BRAIN_BATCH_MAX_WAIT", "12.0"))
 FROM_START = env_bool("BRAIN_FROM_START")
 MUTE = tuple(c.strip().lower() for c in env("BRAIN_MUTE", "").split(",")
              if c.strip())                     # chan_filter.awk port
@@ -715,12 +722,23 @@ class Brain:
         self.submit(sess)
 
     def due(self, sess):
+        """A batch is due when the queue has grown to BATCH_MAX, or when it has
+        gone QUIET: nothing new for BATCH_QUIET seconds. Quiescence (not the
+        oldest event's age) is what coalesces a burst — measuring from the
+        oldest sent event #1 out while events #2-#9 were still arriving, so one
+        human burst became five turns. The OLDEST cap still applies as a
+        safety net for a channel that never goes quiet."""
         with self.lock:
             if not sess.pending:
                 return False
             oldest = sess.pending[0][0]
-            return (len(sess.pending) >= BATCH_MAX or
-                    time.monotonic() - oldest >= BATCH_WINDOW)
+            newest = sess.pending[-1][0]
+            now = time.monotonic()
+            if len(sess.pending) >= BATCH_MAX:
+                return True
+            quiet = now - newest >= BATCH_QUIET
+            starved = now - oldest >= BATCH_MAX_WAIT
+            return quiet or starved
 
     # -- submit ---------------------------------------------------------------------
     def _batch_mode(self, batch):

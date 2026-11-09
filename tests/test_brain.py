@@ -1073,3 +1073,48 @@ def test_need_tools_arms_an_act_turn(tmp_path, capsys):
     assert len(sess.pending) == 1
     assert sess.pending[0][1]["synthetic"] is True
     assert b._batch_mode(sess.pending) == "act"
+
+
+# --- batching by quiescence: a burst becomes ONE turn ------------------------
+def test_due_waits_for_quiet_not_oldest_age(tmp_path, monkeypatch):
+    b, _ = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    now = time.monotonic()
+    # Five messages 0.4s apart: the oldest is already older than the old 3s
+    # window by the time they stop arriving, but the queue is still growing.
+    monkeypatch.setattr(brain, "BATCH_QUIET", 2.5)
+    monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 12.0)
+    sess.pending = [(now - 3.5 + i * 0.4, {"body": f"m{i}"}) for i in range(5)]
+    assert b.due(sess) is False        # still warm: keep collecting
+
+
+def test_due_fires_after_quiet(tmp_path, monkeypatch):
+    b, _ = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    now = time.monotonic()
+    monkeypatch.setattr(brain, "BATCH_QUIET", 2.5)
+    monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 12.0)
+    sess.pending = [(now - 10, {"body": "a"}), (now - 4, {"body": "b"})]
+    assert b.due(sess) is True         # 4s of silence -> one batch
+
+
+def test_due_starvation_cap(tmp_path, monkeypatch):
+    b, _ = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    now = time.monotonic()
+    monkeypatch.setattr(brain, "BATCH_QUIET", 2.5)
+    monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 12.0)
+    # Never quiet (a new event every second) but the oldest is past the cap.
+    sess.pending = [(now - 13, {"body": "old"}), (now, {"body": "new"})]
+    assert b.due(sess) is True
+
+
+def test_due_full_batch_short_circuits(tmp_path, monkeypatch):
+    b, _ = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    now = time.monotonic()
+    monkeypatch.setattr(brain, "BATCH_MAX", 3)
+    monkeypatch.setattr(brain, "BATCH_QUIET", 99.0)
+    monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 99.0)
+    sess.pending = [(now, {"body": str(i)}) for i in range(3)]
+    assert b.due(sess) is True
