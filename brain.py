@@ -427,7 +427,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "preempted_ts", "born")
+                 "preempted_ts", "born", "last_net")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -446,6 +446,7 @@ class Session:
         self.model_id = None               # last turn's model
         self.prompt_ts = None              # monotonic when submit() fired
         self.preempted_ts = None           # monotonic when a preempt aborted
+        self.last_net = None               # last event's network (synthetic turns)
                                            # the running turn: the next idle
                                            # belongs to that aborted turn
 
@@ -663,6 +664,7 @@ class Brain:
         if plugin.call("handle", ev, net_name, ctx) is True:
             return
         with self.lock:
+            sess.last_net = net_name
             sess.pending.append((time.monotonic(), ev))
             depth = len(sess.pending)
         if depth >= PENDING_BACKLOG and depth % PENDING_BACKLOG == 0:
@@ -722,10 +724,12 @@ class Brain:
 
     # -- submit ---------------------------------------------------------------------
     def _batch_mode(self, batch):
-        """A batch is act when any event carries a hands-on directive; plain
-        address-only chatter stays chat and skips the agent scaffold."""
+        """A batch is act when any event carries a hands-on directive, or when
+        a previous turn asked for tools via NEED_TOOLS (which also raises the
+        scaffold for exactly one follow-up turn)."""
         for _t, ev in batch:
-            if policy.needs_hands(ev.get("body") or ev.get("raw") or ""):
+            if ev.get("synthetic") or policy.needs_hands(
+                    ev.get("body") or ev.get("raw") or ""):
                 return "act"
         return "chat"
 
@@ -867,6 +871,27 @@ class Brain:
         answer = policy.parse_answer(text)
         if not answer:
             emit("NO_VERBS", sess.title)
+            return
+        # NEED_TOOLS is consumed here and never forwarded: the model already
+        # sent its one-line acknowledgement itself, we arm one synthetic event
+        # so the NEXT turn is built with the full `act` scaffold (tools
+        # actually loaded) and the model can do the work it just announced.
+        wanted = [b for v, _t, b in answer if v == "NEED_TOOLS"]
+        answer = [a for a in answer if a[0] != "NEED_TOOLS"]
+        if wanted:
+            emit("NEED_TOOLS", sess.title, wanted[0][:80])
+            if self.mem is not None:
+                self.mem.append_activity(
+                    f"{sess.title}: NEED_TOOLS {wanted[0][:60]}")
+            with self.lock:
+                sess.pending.append((time.monotonic(), {
+                    "kind": "MSG", "net": sess.last_net or "",
+                    "from": "system", "body": f"tool turn: {wanted[0][:200]}",
+                    "trust": "TRUSTED", "synthetic": True,
+                }))
+        if not answer:
+            if wanted:
+                self.submit(sess)
             return
         # Routing comes from the ANSWER: `VERB net|rest` — the net selects the
         # bot FIFO, the rest is that bot's own grammar verbatim. A line whose

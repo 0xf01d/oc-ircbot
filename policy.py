@@ -154,7 +154,8 @@ def refusal_hits(text, patterns=DEFAULT_REFUSAL_PATTERNS):
 # network, a |, then the bot's own grammar verbatim — `SAY azzurra|#c text`.
 # The brain splits on the first | and writes the rest to that network's FIFO;
 # a line without a known net| prefix is dropped loudly (ROUTE_ERROR).
-VERBS = ("SAY", "ACT", "NOTICE", "JOIN", "PART", "WHOIS", "QUIT")
+# NEED_TOOLS is the one verb the brain consumes itself and never forwards.
+VERBS = ("SAY", "ACT", "NOTICE", "JOIN", "PART", "WHOIS", "QUIT", "NEED_TOOLS")
 _VERB_LINE = re.compile(rf"^({'|'.join(VERBS)})\s+(.+)$", re.IGNORECASE)
 _OWN_DROP_VERBS = {"SAY", "ACT", "NOTICE"}  # allowed to name others, not us
 
@@ -179,6 +180,8 @@ def parse_answer(text):
             if verb in ("JOIN", "PART", "WHOIS", "QUIT"):
                 if not rest:
                     continue
+                out.append((verb, "", rest))
+            elif verb == "NEED_TOOLS":
                 out.append((verb, "", rest))
             else:
                 if " " not in rest:
@@ -442,6 +445,10 @@ def _build_chat_system(nets, registers=None, extra=""):
         "/data/memory (MEMORY.md, project_activity_log.md) and "
         "/data/workspace before answering — never claim amnesia, your old "
         "context is on disk.",
+        "If a request needs the shell, files or the web and your hands are "
+        "not loaded right now: answer the human in ONE short line first (so "
+        "they know you are on it), then add `NEED_TOOLS <what you will do>`. "
+        "The next turn arrives with your tools enabled — do the work there.",
         "Output: one FIFO command per line, nothing else. Route each line as "
         "NETWORK|command: SAY azzurra|#channel text, SAY azzurra|nick text, "
         "ACT libera|#channel text, NOTICE azzurra|nick text, JOIN "
