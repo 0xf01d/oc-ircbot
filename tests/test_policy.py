@@ -379,3 +379,14 @@ def test_rehydrate_prompt_carries_memory():
     p = policy.rehydrate_prompt("bot", "# index\n- note", "- today stuff")
     assert "MEMORY.md" in p and "note" in p and "today stuff" in p
     assert "Do not send anything to IRC" in p
+
+
+def test_chat_prompt_points_at_the_notes_on_disk():
+    # Recall, not amnesia: the agent's old context is on disk and it has a
+    # shell. Chat mode tells it, in character, to grep before saying "I don't
+    # remember".
+    s = policy.build_system([("azzurra", "ocbot")])
+    assert "/data/memory" in s
+    assert "project_activity_log.md" in s
+    assert "/data/workspace" in s
+    assert "amnesia" in s
