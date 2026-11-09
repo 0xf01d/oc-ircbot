@@ -284,6 +284,16 @@ def split_model(model):
     return (p, m) if p and m else None
 
 
+def batch_trust(events):
+    """The trust of the batch that triggered the latest turn. Synthetic
+    (model self-initiated) events never count; a mixed batch is untrusted."""
+    trusts = [ev.get("trust") for ev in events
+              if not ev.get("synthetic") and ev.get("trust")]
+    if not trusts:
+        return None
+    return "TRUSTED" if all(t == "TRUSTED" for t in trusts) else "UNTRUSTED"
+
+
 # --- FIFO -------------------------------------------------------------------
 _CHAT_VERBS = ("SAY", "ACT", "NOTICE")
 # Fixed acknowledgement for an act handoff: the brain composes it, so it costs
@@ -491,7 +501,8 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "preempted_ts", "born", "last_net", "last_target")
+                 "preempted_ts", "born", "last_net", "last_target",
+                 "last_trust")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -514,6 +525,7 @@ class Session:
                                            # belongs to that aborted turn
         self.last_net = None               # last event's network (synthetic turns)
         self.last_target = None            # last event's reply target
+        self.last_trust = None             # trust of the batch behind this turn
 
 
 def last_assistant_text(messages):
@@ -551,6 +563,8 @@ class Brain:
         self.total_turns = 0
         self.total_refusals = 0
         self.total_wedges = 0
+        self.total_denies = 0
+        self.total_allows = 0
         self.registers = registers()
         self.model = split_model(MODEL)
         # Model ladder: free-tier quotas burn out mid-flight, so when the
@@ -953,6 +967,9 @@ class Brain:
     def _send_batch(self, sess, batch, events, addressed, mode):
         system = policy.build_system(self._roster(), self.registers, mode=mode)
         prompt = policy.build_prompt(events, addressed)
+        trust = batch_trust(events)
+        with self.lock:
+            sess.last_trust = trust
         if self.dry_run:
             emit("DRY_RUN_PROMPT", sess.title)
             print(prompt, flush=True)
@@ -965,6 +982,7 @@ class Brain:
             plugin_event("error", reason=repr(e)[:200])
             with self.lock:
                 sess.pending = batch + sess.pending
+                sess.last_trust = None
             return
         with self.lock:
             sess.busy_since = time.monotonic()
@@ -1015,6 +1033,8 @@ class Brain:
             f"refusals: {self.total_refusals} | wedges: {self.total_wedges}"
             f" | pending: {len(sess.pending)}",
             f"work={wstate}",
+            f"permission: denies={self.total_denies}"
+            f" allows={self.total_allows}",
             f"nets: {','.join(n.name for n in self.nets)}",
         ]
         target = policy.reply_target(ev)
@@ -1041,6 +1061,7 @@ class Brain:
             preempted = sess.preempted_ts is not None
             sess.preempted_ts = None
             sess.busy_since = None
+            sess.last_trust = None
         if preempted:
             # This idle belongs to the turn a preempt aborted: its partial
             # output is never dispatched or counted (last_count is already
@@ -1165,17 +1186,33 @@ class Brain:
 
     # -- permission gate -----------------------------------------------------------------
     def gate(self, props):
-        """permission.asked: reject on sight, announce over the FIFO."""
+        """permission.asked: allow only the batch's own TRUSTED turn; every
+        other request is rejected fast and announced to the admin."""
         req_id = props.get("id") or ""
         sess, _route = self._session_for_sid(props.get("sessionID"))
         what = props.get("permission") or "unknown"
-        patterns = ",".join(props.get("patterns") or [])[:120]
-        emit("PERMISSION_DENIED", what, patterns)
+        raw_patterns = props.get("patterns") or []
+        patterns = ",".join(str(p) for p in raw_patterns)[:120]
+        trust = sess.last_trust if sess is not None else None
+        trust_level = trust if trust in ("TRUSTED", "UNTRUSTED") \
+            else "UNTRUSTED"
+        decision = policy.permission_decision(trust, what, raw_patterns)
+        if decision == "allow":
+            self.total_allows += 1
+            emit("PERMISSION_ALLOWED", what, patterns,
+                 f"trust={trust_level}")
+            self.mem.append_activity(
+                f"permission allowed: {what} {patterns}")
+            try:
+                self.api.permission_reply(req_id, "allow")
+            except OSError as e:
+                emit("PERMISSION_REPLY_ERROR", repr(e))
+            return
+        self.total_denies += 1
+        emit("PERMISSION_DENIED", what, patterns, f"trust={trust_level}")
         self.mem.append_activity(f"permission denied: {what} {patterns}")
         try:
-            self.api.permission_reply(
-                req_id, "reject",
-                "headless IRC agent: tool use outside policy is denied")
+            self.api.permission_reply(req_id, "reject", decision)
         except OSError as e:
             emit("PERMISSION_REPLY_ERROR", repr(e))
         if sess is not None:

@@ -645,6 +645,156 @@ def test_permission_asked_is_rejected_and_announced(world):
     assert lines and lines[0].startswith("NOTICE admin [gate] denied bash")
 
 
+def test_permission_asked_is_allowed_on_a_trusted_turn(world):
+    sess = world.brain.ensure_session()
+    sess.last_trust = "TRUSTED"
+    world.brain.gate({"id": "per_2", "sessionID": sess.sid,
+                      "permission": "bash", "patterns": ["git status"]})
+    req_id, body = world.serve.state.permission_replies[0]
+    assert req_id == "per_2" and body["reply"] == "allow"
+    assert world.brain.total_allows == 1
+    assert world.brain.total_denies == 0
+
+
+def test_permission_asked_is_denied_on_an_untrusted_turn(world):
+    sess = world.brain.ensure_session()
+    sess.last_trust = "UNTRUSTED"
+    with mock.patch.object(brain, "write_fifo"):
+        world.brain.gate({"id": "per_3", "sessionID": sess.sid,
+                          "permission": "bash", "patterns": ["rm -rf /"]})
+    _req_id, body = world.serve.state.permission_replies[0]
+    assert body["reply"] == "reject"
+    assert body["message"] == "headless IRC agent: untrusted turn"
+    assert world.brain.total_denies == 1
+    assert world.brain.total_allows == 0
+
+
+def test_permission_secrets_denied_even_on_a_trusted_turn(world):
+    sess = world.brain.ensure_session()
+    sess.last_trust = "TRUSTED"
+    with mock.patch.object(brain, "write_fifo"):
+        world.brain.gate({"id": "per_4", "sessionID": sess.sid,
+                          "permission": "edit",
+                          "patterns": ["/data/secrets/credentials"]})
+    _req_id, body = world.serve.state.permission_replies[0]
+    assert body["reply"] == "reject"
+    assert "/data/secrets" in body["message"]
+    assert world.brain.total_allows == 0
+
+
+def test_permission_gate_logs_trust_on_each_decision(world, capsys):
+    sess = world.brain.ensure_session()
+    sess.last_trust = "TRUSTED"
+    with mock.patch.object(brain, "write_fifo"):
+        world.brain.gate({"id": "per_a", "sessionID": sess.sid,
+                          "permission": "bash", "patterns": ["ls"]})
+        sess.last_trust = "UNTRUSTED"
+        world.brain.gate({"id": "per_d", "sessionID": sess.sid,
+                          "permission": "bash", "patterns": ["ls"]})
+    out = capsys.readouterr().out
+    assert "PERMISSION_ALLOWED bash ls trust=TRUSTED" in out
+    assert "PERMISSION_DENIED bash ls trust=UNTRUSTED" in out
+
+
+def test_submit_records_the_latest_batch_trust(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    sess.pending = [(time.monotonic(), {
+        "kind": "MSG", "net": "irc", "from": "alice", "to": "#test",
+        "body": "hi", "trust": "TRUSTED"})]
+    b.submit(sess)
+    assert sess.last_trust == "TRUSTED"
+    sess.busy_since = None
+
+    sess.pending = [(time.monotonic(), {
+        "kind": "MSG", "net": "irc", "from": "bob", "to": "#test",
+        "body": "hi", "trust": "UNTRUSTED"})]
+    b.submit(sess)
+    assert sess.last_trust == "UNTRUSTED"
+
+
+def test_submit_never_treats_a_synthetic_turn_as_trusted(tmp_path):
+    # A synthetic event (the model's own NEED_TOOLS follow-up) is act work, so
+    # it lands on a worker. Whatever session runs it, `trust=TRUSTED` on the
+    # synthetic event must not become a TRUSTED batch: the model cannot ask
+    # itself for permission.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    sess.pending = [(time.monotonic(), {
+        "kind": "MSG", "net": "irc", "from": "system", "to": "#test",
+        "body": "tool turn", "trust": "TRUSTED", "synthetic": True})]
+    with mock.patch.object(brain, "write_fifo", return_value=1):
+        b.submit(sess)
+    assert sess.last_trust is None
+    for worker in b.workers.values():
+        assert worker.last_trust is None
+
+
+def test_idle_clears_the_latest_batch_trust(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.messages.return_value = []
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    sess.last_trust = "TRUSTED"
+    sess.busy_since = time.monotonic()
+    b.on_idle(sess.sid)
+    assert sess.last_trust is None
+
+
+def test_gate_never_allows_an_idle_turn_after_an_empty_batch(tmp_path, capsys):
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    assert sess.last_trust is None       # no batch has ever been submitted
+    with mock.patch.object(brain, "write_fifo"):
+        b.gate({"id": "per_idle", "sessionID": sess.sid,
+                "permission": "bash", "patterns": ["ls"]})
+    _req_id, reply, reason = b.api.permission_reply.call_args.args
+    assert reply == "reject"
+    assert reason == "headless IRC agent: untrusted turn"
+    out = capsys.readouterr().out
+    assert "PERMISSION_ALLOWED" not in out
+    assert "PERMISSION_DENIED bash ls trust=UNTRUSTED" in out
+
+
+def test_gate_secrets_hard_stop_ignores_log_truncation(tmp_path):
+    # The decision sees the full pattern list; only the log line is clipped,
+    # so a secrets path past 120 chars can never ride a trusted allow.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("s1", "irc:global", "sys")
+    sess.last_trust = "TRUSTED"
+    b.sess = sess
+    with mock.patch.object(brain, "write_fifo"):
+        b.gate({"id": "per_long", "sessionID": sess.sid,
+                "permission": "edit",
+                "patterns": ["x" * 200, "/data/secrets/token"]})
+    _req_id, reply, reason = b.api.permission_reply.call_args.args
+    assert reply == "reject"
+    assert "/data/secrets" in reason
+
+
+def test_stats_reply_carries_permission_counters(tmp_path):
+    b, _nets = _bare_brain(tmp_path)
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    b.total_denies, b.total_allows = 2, 3
+    ev = policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=alice HOST=a@h TO=#test BODY=!stats")
+    ev["net"] = "irc"
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.stats_reply(sess, ev)
+    text = "\n".join(wf.call_args.args[0])
+    assert "denies=2 allows=3" in text
+
+
 # --- session persistence across restarts -------------------------------------------
 def test_restart_reattaches_the_one_session_and_counts_turns(tmp_path):
     w = Env(tmp_path)

@@ -126,6 +126,24 @@ def wakes_model(ev, nick, address_only=False):
     return True
 
 
+# --- permission gate --------------------------------------------------------
+SECRETS_PATH = "/data/secrets"
+
+
+def permission_decision(trust, what, patterns):
+    """Decide a permission.asked event. Returns "allow" or the rejection
+    reason. Only a turn triggered by a TRUSTED event may allow, and the
+    secrets hard stop outranks trust; absent trust fails closed."""
+    if isinstance(patterns, str):
+        patterns = (patterns,)
+    text = " ".join(str(p) for p in (patterns or ()))
+    if SECRETS_PATH in f"{what or ''} {text}":
+        return "headless IRC agent: /data/secrets is never allowed"
+    if trust == "TRUSTED":
+        return "allow"
+    return "headless IRC agent: untrusted turn"
+
+
 # --- refusal patterns (agent watchdog trigger) ------------------------------
 DEFAULT_REFUSAL_PATTERNS = (
     r"(?i)\bI (?:can'?t|cannot|won'?t|will not) (?:help|assist|comply|do) with",

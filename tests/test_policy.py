@@ -398,6 +398,41 @@ def test_chat_prompt_points_at_the_notes_on_disk():
     assert "amnesia" in s
 
 
+# --- permission decision: trust-aware, fail closed, secrets always denied ----
+def test_permission_decision_trusted_ordinary_allows():
+    assert policy.permission_decision(
+        "TRUSTED", "bash", ["rm -rf /tmp/x"]) == "allow"
+
+
+def test_permission_decision_untrusted_ordinary_denies():
+    reason = policy.permission_decision("UNTRUSTED", "bash", ["rm -rf /tmp/x"])
+    assert reason != "allow"
+    assert reason == "headless IRC agent: untrusted turn"
+
+
+def test_permission_decision_missing_trust_denies():
+    for trust in (None, "", "MAYBE"):
+        assert policy.permission_decision(trust, "bash", ["ls"]) != "allow"
+
+
+def test_permission_decision_secrets_denied_even_on_a_trusted_turn():
+    for patterns in (["/data/secrets/token"], ["/data/secrets/**"],
+                     ["ok", "/data/secrets/id_rsa"]):
+        reason = policy.permission_decision("TRUSTED", "edit", patterns)
+        assert reason != "allow"
+        assert "/data/secrets" in reason
+
+
+def test_permission_decision_secrets_in_what_are_denied_too():
+    assert policy.permission_decision(
+        "TRUSTED", "read /data/secrets/token", []) != "allow"
+
+
+def test_permission_decision_accepts_a_plain_pattern_string():
+    assert policy.permission_decision(
+        "TRUSTED", "edit", "/data/secrets/token") != "allow"
+
+
 # --- NEED_TOOLS: the model asks for hands, the brain arms a tool turn --------
 def test_need_tools_is_a_parsed_verb():
     out = policy.parse_answer("SAY #c on it\nNEED_TOOLS restart bird2")
