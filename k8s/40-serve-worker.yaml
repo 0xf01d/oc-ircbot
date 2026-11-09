@@ -1,0 +1,74 @@
+# Standalone opencode worker: a second `opencode serve` that the brain can
+# be pointed at with BRAIN_SERVE_URL (attach mode). One pod, one serve, one
+# Service — same image as the brain container, same API key secret, workspace
+# on the shared PVC so opencode.json matches the brain's. The brain talks to
+# ONE serve at a time (hardcoded single-serve loop); this worker is the
+# attach target when the brain's own spawn is not wanted (e.g. resource
+# split, or restarting the brain without killing in-flight agent turns).
+# NOTE: no fallback/load-balancing exists in brain.py — point BRAIN_SERVE_URL
+# at either the in-pod serve (default) or this Service, never both.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-serve-worker
+  namespace: hermes-generated-content
+  labels: {app: oc-serve-worker}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: oc-serve-worker}
+  template:
+    metadata:
+      labels: {app: oc-serve-worker}
+    spec:
+      volumes:
+        - {name: data, persistentVolumeClaim: {claimName: lane-work}}
+        - {name: key, secret: {secretName: oc-ircbot-secrets, items: [{key: OPENCODE_API_KEY, path: OPENCODE_API_KEY}]}}
+      initContainers:
+        # opencode reads auth once at startup from XDG_DATA_HOME/opencode/auth.json.
+        # Same secret the brain uses; this materialises it where the worker's
+        # XDG_DATA_HOME points. Never logged, mode 600.
+        - name: auth-seed
+          image: ghcr.io/0xf01d/oc-ircbot:brain
+          command: ["sh", "-c", "mkdir -p /data/worker-xdg/opencode && { printf '{\"opencode\":{\"type\":\"api\",\"key\":\"'; cat /key/OPENCODE_API_KEY; printf '\"}}'; } > /data/worker-xdg/opencode/auth.json && chmod 600 /data/worker-xdg/opencode/auth.json"]
+          env:
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oc-ircbot-secrets
+                  key: OPENCODE_API_KEY
+                  optional: true
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: key, mountPath: /key, readOnly: true}
+      containers:
+        - name: serve
+          image: ghcr.io/0xf01d/oc-ircbot:brain
+          # Unlike brain.py's managed serve (loopback-only), this one binds
+          # 0.0.0.0 so the Service can reach it. The Service is cluster-internal
+          # only (ClusterIP); the API has no auth of its own, so do NOT expose
+          # it via Ingress/LB.
+          command: ["/usr/local/bin/opencode", "serve", "--hostname", "0.0.0.0", "--port", "4090", "--log-level", "WARN"]
+          workingDir: /data/workspace
+          env:
+            - {name: XDG_DATA_HOME, value: /data/worker-xdg}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 1Gi}
+          readinessProbe:
+            httpGet: {path: /global/health, port: 4090}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oc-serve-worker
+  namespace: hermes-generated-content
+  labels: {app: oc-serve-worker}
+spec:
+  selector: {app: oc-serve-worker}
+  ports:
+    - {name: http, port: 4090, targetPort: 4090}

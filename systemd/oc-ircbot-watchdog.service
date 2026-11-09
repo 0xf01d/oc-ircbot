@@ -1,0 +1,19 @@
+[Unit]
+Description=oc-ircbot watchdog (heartbeat + serve + agent layers)
+After=oc-ircbot-brain.service
+Wants=oc-ircbot-brain.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oc-ircbot
+# BRAIN_HEARTBEAT / BRAIN_AGENT_STATUS / BRAIN_SERVE_URL and the escalation
+# lever go in .env; e.g.
+#   BRAIN_SERVE_URL=http://127.0.0.1:46099
+#   WATCHDOG_RESTART_CMD=systemctl --user restart oc-ircbot-brain
+EnvironmentFile=-%h/oc-ircbot/.env
+ExecStart=/usr/bin/python3 -u %h/oc-ircbot/watchdog.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

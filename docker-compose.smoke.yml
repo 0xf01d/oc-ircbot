@@ -1,0 +1,88 @@
+# Offline smoke overlay: adds a mock IRC server and a stub opencode serve,
+# and points the stack at both. Used by CI and by the on-cluster test (the
+# k8s/ manifests mirror the same topology).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml \
+#       up --abort-on-container-exit --exit-code-from mock-irc
+#
+# The mock exits 0 as soon as it records the brain's PRIVMSG (marker
+# MOCK_EXPECT, default `stub-ok`); that exit code is the smoke assertion.
+# The brain here is the REAL brain (tail -> prompt_async -> SSE -> idle ->
+# messages -> FIFO); only the model server is stubbed, by tests/stub_opencode_serve.py.
+
+services:
+  stub-serve:
+    image: python:3.12-slim
+    command:
+      - python3
+      - -u
+      - /app/tests/stub_opencode_serve.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "46099"
+    volumes:
+      - ./tests:/app/tests:ro
+    restart: "no"
+
+  mock-irc:
+    image: python:3.12-slim
+    command:
+      - python3
+      - -u
+      - /app/tests/mock_irc_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6667"
+      - --inject
+      - ${MOCK_INJECT:-#test hello bot}
+      - --out
+      - /tmp/mock.out
+      - --expect
+      - ${MOCK_EXPECT:-stub-ok}
+      - --timeout
+      - "90"
+    volumes:
+      - ./tests:/app/tests:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import socket;socket.create_connection(('127.0.0.1',6667),2).close()
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: "no"
+
+  bot:
+    environment:
+      IRC_HOST: mock-irc
+      IRC_PORT: "6667"
+      IRC_TLS: "0"
+      IRC_NICK: ocbot
+      IRC_IDENT: ocbot
+      IRC_REAL: oc-ircbot smoke
+      # A crashed bot must be back well inside the mock's 90 s window.
+      NETS_RESTART_SEC: "5"
+    depends_on:
+      mock-irc:
+        condition: service_healthy
+
+  brain:
+    environment:
+      BRAIN_SERVE_URL: http://stub-serve:46099
+      BRAIN_FROM_START: "1"
+      BRAIN_POLL: "0.3"
+      BRAIN_BATCH_WINDOW: "1.0"
+      IRC_NICK: ocbot
+    depends_on:
+      - stub-serve
+      - mock-irc
+
+  # The watchdog shares the brain's netns (base file); in the smoke the serve
+  # it monitors is the stub, so point it there and its server layer is live.
+  watchdog:
+    environment:
+      BRAIN_SERVE_URL: http://stub-serve:46099

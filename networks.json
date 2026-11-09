@@ -1,0 +1,21 @@
+{
+  "azzurra": {
+    "IRC_HOST": "irc.azzurra.chat",
+    "IRC_PORT": "6697",
+    "IRC_NICK": "vjt-claude",
+    "BOT_TRUST": "bot.trust"
+  },
+  "libera": {
+    "IRC_HOST": "irc.libera.chat",
+    "IRC_PORT": "6697",
+    "IRC_NICK": "vjt-claude",
+    "BOT_TRUST": "bot.trust.libera"
+  },
+  "ircnet": {
+    "IRC_HOST": "irc.ipv4.ircnet.org",
+    "IRC_PORT": "6697",
+    "IRC_NICK": "vjt-claude",
+    "IRC_TLS_VERIFY": "0",
+    "BOT_TRUST": "bot.trust.ircnet"
+  }
+}

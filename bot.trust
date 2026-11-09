@@ -1,0 +1,9 @@
+# bot.trust — who the bot tags as TRUSTED.
+#
+# One rule per line:  <nick> <host_glob>
+# All three checks must pass (see README): nick listed here, host matching
+# the glob (fnmatch), and registered+identified to services (307/330).
+# Lines starting with '#' are comments.
+#
+# Example:
+# vjt *.openssl.it

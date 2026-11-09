@@ -1,0 +1,35 @@
+# The bot's little config files, mounted read-only at /conf in the bot
+# container (BOT_TRUST / BOT_RESERVED / BOT_STARTUP point there). Nothing here
+# is secret: the trust model is "nick listed + host glob + WHOIS-verified
+# account to services", so even a broad host glob still requires the operator
+# to be identified.
+#
+# This ConfigMap is exactly what the cluster holds (kubectl get cm
+# oc-ircbot-live -o yaml), comments included: it was captured from the live
+# object, not designed here. The network map is deliberately NOT a key here —
+# it lives on the PVC at /data/networks.json (NETWORKS_FILE) because nets.py
+# re-reads it at runtime: a PVC edit adds a network without a restart, a
+# ConfigMap edit would not. k8s/live/networks.json in this repo is that file.
+#
+# Any NickServ / API secret lives in oc-ircbot-secrets, created out-of-band —
+# never in git (see 10-deployment.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oc-ircbot-live
+  namespace: hermes-generated-content
+data:
+  bot.reserved: |
+    # empty on purpose: the bot sits only in #hermes today; leak_guard has
+    # nothing to guard between channels. Uncomment to add private targets.
+    # #hermes-staff
+  bot.startup: |
+    # replayed after connect (no NickServ pass -> right after 001)
+    JOIN #hermes
+  bot.startup.hackint: |
+    # hackint: also drugs HR channel
+    JOIN #hermes
+    JOIN #drugs
+  bot.trust: |
+    # katia runs the place: any host, but services must confirm the account.
+    katia *

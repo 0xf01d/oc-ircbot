@@ -1,0 +1,46 @@
+#!/bin/sh
+# bot.say — write to the bot.send FIFO without a quoting footgun.
+#
+# printf into the FIFO breaks on the things people actually type: a bare '%'
+# eats the next word as a format specifier, and apostrophes and accents have
+# to survive a layer of shell quoting. bot.say takes the body on STDIN, so
+# only the target (a simple token) is ever a shell argument:
+#
+#     ./bot.say '#mychannel' <<'EOF'
+#     100% d'accordo — accents, apostrophes and percent signs all arrive intact
+#     EOF
+#
+#     ./bot.say -v ACT '#mychannel' <<'EOF'   # any verb: ACT, NOTICE, ...
+#     waves
+#     EOF
+#
+# Each non-empty stdin line becomes one message, so a heredoc sends several.
+# -f <path> points it at a different FIFO (the second-instance case).
+set -eu
+
+verb=SAY
+fifo=${BOT_FIFO:-bot.send}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verb="$2"; shift 2 ;;
+        -f) fifo="$2"; shift 2 ;;
+        --) shift; break ;;
+        -h|--help)
+            echo "usage: bot.say [-v VERB] [-f FIFO] <target>  (body on stdin)" >&2
+            exit 0 ;;
+        -*) echo "bot.say: unknown option: $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+target=${1:-}
+if [ -z "$target" ]; then
+    echo "usage: bot.say [-v VERB] [-f FIFO] <target>  (body on stdin)" >&2
+    exit 2
+fi
+
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s %s %s\n' "$verb" "$target" "$line"
+done >> "$fifo"

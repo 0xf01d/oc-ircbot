@@ -1,0 +1,7 @@
+# bot.trust.libera — Libera.Chat trust list (nick + host glob, one per line).
+# Start empty like bot.trust.ircnet: on a network with services, list a nick
+# only together with the host glob its services cloaks resolve to, and let the
+# 307/330 registration check do the rest. Add real entries on this network,
+# never borrowed from another: trust does not travel between networks.
+#
+# <nick> <host_glob>

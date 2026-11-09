@@ -1,0 +1,7 @@
+# bot.trust.ircnet — trust list for the IRCnet instance (BOT_TRUST override).
+#
+# IRCnet has no services and no 307/330 numerics, so IRC_TLS_VERIFY=0 and
+# trust verification is host-glob only. See bot.trust for the grammar.
+#
+# Example:
+# foo *.example.net

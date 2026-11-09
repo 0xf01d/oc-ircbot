@@ -1,0 +1,18 @@
+# runtime artifacts (never committed)
+bot.log
+bot.*.log
+bot.send
+bot.send.*
+events.log
+reserved_recent.tsv
+*.heartbeat
+.env
+dcc/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local smoke leftovers
+/tmp/

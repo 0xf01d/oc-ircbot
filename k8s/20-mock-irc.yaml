@@ -1,0 +1,67 @@
+# Mock IRC server for the on-cluster smoke test.
+#
+# It registers the bot (001 after NICK/USER), injects one channel PRIVMSG so
+# the brain has something to answer, and exits 0 as soon as it records the
+# brain's PRIVMSG (marker `stub-ok`). The Service gives the bridge pod a DNS
+# name to dial.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-mock-irc
+  namespace: hermes-generated-content
+  labels:
+    app: oc-mock-irc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oc-mock-irc
+  template:
+    metadata:
+      labels:
+        app: oc-mock-irc
+    spec:
+      volumes:
+        - name: code
+          configMap:
+            name: oc-ircbot-code
+            defaultMode: 0555
+        - name: data
+          emptyDir: {}
+      containers:
+        - name: mock-irc
+          image: python:3.12-slim
+          command:
+            - python3
+            - -u
+            - /code/mock_irc_server.py
+            - --host
+            - 0.0.0.0
+            - --port
+            - "6667"
+            - --inject
+            - "#test hello bot"
+            - --out
+            - /data/mock.out
+            - --expect
+            - stub-ok
+            - --timeout
+            - "120"
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: data, mountPath: /data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oc-mock-irc
+  namespace: hermes-generated-content
+  labels:
+    app: oc-mock-irc
+spec:
+  selector:
+    app: oc-mock-irc
+  ports:
+    - name: irc
+      port: 6667
+      targetPort: 6667

@@ -1,0 +1,38 @@
+{
+  "freebnc": {
+    "IRC_HOST": "irc.freebnc.net",
+    "IRC_PORT": "6697",
+    "BOT_TRUST": "/data/bot.trust.freebnc"
+  },
+  "hackint": {
+    "IRC_HOST": "irc.hackint.org",
+    "IRC_PORT": "6697",
+    "BOT_STARTUP": "/data/bot.startup.hackint"
+  },
+  "espernet": {
+    "IRC_HOST": "irc.esper.net",
+    "IRC_PORT": "6697",
+    "BOT_STARTUP": "/data/bot.startup.espernet"
+  },
+  "ircnet": {
+    "IRC_HOST": "openirc.snt.utwente.nl",
+    "IRC_PORT": "6667",
+    "IRC_TLS": "0",
+    "BOT_TRUST": "/data/bot.trust.ircnet",
+    "BOT_STARTUP": "/data/bot.startup.ircnet",
+    "IRC_NICK": "mammt",
+    "BOT_TRUST_311": "1",
+    "BOT_KEEPALIVE": "120"
+  },
+  "libera": {
+    "IRC_HOST": "irc.libera.chat",
+    "IRC_PORT": "6697",
+    "BOT_STARTUP": "/data/bot.startup.libera"
+  },
+  "gamesurge": {
+    "IRC_HOST": "irc.gamesurge.net",
+    "IRC_PORT": "6667",
+    "IRC_TLS": "0",
+    "BOT_STARTUP": "/data/bot.startup.gamesurge"
+  }
+}
