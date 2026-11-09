@@ -716,10 +716,9 @@ def test_submit_records_the_latest_batch_trust(tmp_path):
 
 
 def test_submit_never_treats_a_synthetic_turn_as_trusted(tmp_path):
-    # A synthetic event (the model's own NEED_TOOLS follow-up) is act work, so
-    # it lands on a worker. Whatever session runs it, `trust=TRUSTED` on the
-    # synthetic event must not become a TRUSTED batch: the model cannot ask
-    # itself for permission.
+    # A synthetic event is act work, so it lands on a worker. Whatever session
+    # runs it, `trust=TRUSTED` on the synthetic event must not become a
+    # TRUSTED batch: the model cannot ask itself for permission.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     b.api.create_session.return_value = {"id": "w1"}
@@ -1208,23 +1207,19 @@ def test_learned_fallback_nick_addressed(tmp_path):
     assert sess.pending == []
 
 
-def test_need_tools_arms_an_act_turn(tmp_path, capsys):
-    # The model cannot load tools mid-turn, so it announces NEED_TOOLS and the
-    # brain shapes the FOLLOW-UP turn as `act` via a synthetic event.
+def test_need_tools_no_longer_arms_a_follow_up_turn(tmp_path, capsys):
+    # Tools are loaded on every turn: NEED_TOOLS is no longer a verb, so it
+    # is ignored as prose and never queues a synthetic act event.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     sess = brain.Session("s1", "irc:global", "sys")
     b.sess = sess
-    ev = policy.parse_event(
-        "[12:00] MSG TRUSTED FROM=katia HOST=h TO=#test BODY=restart bird2")
     sess.pending = []
     sess.last_net = "test"
-    b.dispatch(sess, "SAY #test on it\nNEED_TOOLS restart bird2")
+    b.dispatch(sess, "NEED_TOOLS restart bird2")
     out = capsys.readouterr().out
-    assert "NEED_TOOLS" in out
-    assert len(sess.pending) == 1
-    assert sess.pending[0][1]["synthetic"] is True
-    assert b._batch_mode(sess.pending) == "act"
+    assert "NEED_TOOLS" not in out
+    assert sess.pending == []
 
 
 # --- act turns run in a worker session, never in the chat conversation --------
