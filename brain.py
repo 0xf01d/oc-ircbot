@@ -296,9 +296,6 @@ def batch_trust(events):
 
 # --- FIFO -------------------------------------------------------------------
 _CHAT_VERBS = ("SAY", "ACT", "NOTICE")
-# Fixed acknowledgement for an act handoff: the brain composes it, so it costs
-# no model tokens and no turn latency. Deliberately not configurable.
-WORK_ACKS = ("on it",)
 
 
 class _Workers(dict):
@@ -918,8 +915,7 @@ class Brain:
 
     def _route_to_worker(self, batch, events, addressed, mode):
         """Act work leaves the conversation: hand it to (or queue it on) the
-        network-channel's worker, and ack the channel without asking the
-        model. Chat is already free for the next batch."""
+        network-channel's worker. Chat is already free for the next batch."""
         trigger = events[-1]
         net_name = trigger.get("net") or (self.nets[0].name if self.nets else "")
         worker = self.ensure_worker(net_name, trigger)
@@ -936,23 +932,12 @@ class Brain:
             busy = worker.busy_since is not None
         emit("TURN_ROUTE", mode, worker.title)
         if busy:
-            # One in-flight act per channel. No ack either: the work is already
-            # running and the channel was told so when it started; a second
-            # "on it" for every message of a burst is noise.
+            # One in-flight act per channel. The work is already running; a
+            # second handoff for every message of a burst would be noise.
             return
-        # Ack only when work actually starts, and before touching the API so
-        # the channel hears "on it" immediately. An event with no channel and
-        # no sender has no target worth speaking to: stay silent.
-        self._ack_work(net_name, trigger)
+        # The worker speaks when it has something to say; there is no
+        # provisional acknowledgement.
         self._drain(worker)
-
-    def _ack_work(self, net_name, ev):
-        target = policy.reply_target(ev)
-        net = self.net_by_name.get(net_name)
-        if net is None or not target or target == "?":
-            return
-        write_fifo([f"SAY {target} {WORK_ACKS[0]}"], net.fifo, net=net_name)
-        emit("WORK_ACK", net_name, target)
 
     def _drain(self, sess):
         """Send the pending batch on an already-chosen session (the act
