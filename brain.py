@@ -888,9 +888,9 @@ class Brain:
 
     # -- submit ---------------------------------------------------------------------
     def _batch_mode(self, batch):
-        """A batch is act when any event carries a hands-on directive, or when
-        a previous turn asked for tools via NEED_TOOLS (which also raises the
-        scaffold for exactly one follow-up turn)."""
+        """A batch is act when any event carries a hands-on directive; that is
+        only a routing hint for the richer prompt and the worker session —
+        every turn already has the full toolset."""
         for _t, ev in batch:
             if ev.get("synthetic") or policy.needs_hands(
                     ev.get("body") or ev.get("raw") or ""):
@@ -1109,28 +1109,6 @@ class Brain:
         answer = policy.parse_answer(text)
         if not answer:
             emit("NO_VERBS", sess.title)
-            return
-        # NEED_TOOLS is consumed here and never forwarded: the model already
-        # sent its one-line acknowledgement itself, we arm one synthetic event
-        # so the NEXT turn is built with the full `act` scaffold (tools
-        # actually loaded) and the model can do the work it just announced.
-        wanted = [b for v, _t, b in answer if v == "NEED_TOOLS"]
-        answer = [a for a in answer if a[0] != "NEED_TOOLS"]
-        if wanted:
-            emit("NEED_TOOLS", sess.title, wanted[0][:80])
-            if self.mem is not None:
-                self.mem.append_activity(
-                    f"{sess.title}: NEED_TOOLS {wanted[0][:60]}")
-            with self.lock:
-                sess.pending.append((time.monotonic(), {
-                    "kind": "MSG", "net": sess.last_net or "",
-                    "to": sess.last_target or "",
-                    "from": "system", "body": f"tool turn: {wanted[0][:200]}",
-                    "trust": "TRUSTED", "synthetic": True,
-                }))
-        if not answer:
-            if wanted:
-                self.submit(sess)
             return
         # Routing comes from the ANSWER: `VERB net|rest` — the net selects the
         # bot FIFO, the rest is that bot's own grammar verbatim. A line whose
