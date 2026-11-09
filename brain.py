@@ -10,7 +10,7 @@
     serialized, no per-channel parallelism. Routing comes from the ANSWER:
     every FIFO verb line carries its network (`SAY azzurra|#chan text`) and
     is written to that network's bot FIFO. A wedged turn is cancelled with
-    /abort; refusals, turn caps and repeated wedges reset the session, which
+    /abort; refusals and repeated wedges reset the session, which
     rehydrates from disk memory (memory_log.py). Permission requests are
     rejected on sight and announced to the admin over the bot FIFO — an
     interactive prompt would dead-lock a headless agent, so deny fast and
@@ -81,8 +81,7 @@ PROBE_SECS = float(env("BRAIN_PROBE_SECS", "300"))  # best-model probe cadence
 PENDING_BACKLOG = 128
 # A free-tier model can legitimately turn for minutes: these stay env-tunable
 # so a slow deploy can tune around guaranteed abort->wedge->reset loops.
-MAX_TURNS = int(env("BRAIN_MAX_TURNS", "100"))         # turn cap per session
-RESET_SECS = int(env("BRAIN_RESET_SECS", "900"))       # /clear cadence (15 min)
+RESET_SECS = int(env("BRAIN_RESET_SECS", "21600"))     # age guard (6 h)
 TURN_TIMEOUT = float(env("BRAIN_TURN_TIMEOUT", "180"))  # wedged-turn abort
 PREEMPT_ON_ADDRESS = env_bool("BRAIN_PREEMPT_ON_ADDRESS", True)  # an
 # addressed message aborts the running turn: the operator outranks the
@@ -428,7 +427,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "preempted_ts", "born", "reset_guard")
+                 "preempted_ts", "born")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -449,7 +448,6 @@ class Session:
         self.preempted_ts = None           # monotonic when a preempt aborted
                                            # the running turn: the next idle
                                            # belongs to that aborted turn
-        self.reset_guard = False           # RESET_LOOP_GUARD: never reset again
 
 
 def last_assistant_text(messages):
@@ -595,13 +593,8 @@ class Brain:
         disk. Aborts first so we never reset mid-turn. stored_sid is dropped
         before ensure_session: the discarded session still exists on the
         server, so a live stored_sid made the "fresh" session a re-attach
-        of the very session being reset — turns >= MAX_TURNS again, reset
-        again, ~750 spins in two minutes (the live incident). A fresh
-        session that arrives still over cap means a broken server count:
-        RESET_LOOP_GUARD retires that session object instead of spinning —
-        one reset per session, never per poll."""
-        if sess.reset_guard:
-            return
+        of the very session being reset — ~750 spins in two minutes (the
+        live incident)."""
         try:
             self.api.abort(sess.sid)
         except OSError:
@@ -619,10 +612,6 @@ class Brain:
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
         self.registers = registers()      # registers live like the session
         fresh = self.ensure_session()
-        if fresh is not None and fresh.turns >= MAX_TURNS:
-            emit("RESET_LOOP_GUARD", fresh.title, fresh.sid,
-                 f"turns={fresh.turns}")
-            fresh.reset_guard = True
         if fresh is not None and leftover:
             with self.lock:
                 fresh.pending = leftover + fresh.pending
@@ -870,9 +859,7 @@ class Brain:
                 f"refusal detected in {sess.title}: {hits[0][:60]}")
             self.reset_session(sess, "refusal")
             return
-        if sess.turns >= MAX_TURNS:
-            self.reset_session(sess, "turn-cap")
-        elif text:
+        if text:
             self.mem.append_activity(
                 f"{sess.title}: turn {sess.turns}, {len(text)} chars")
 
@@ -1231,17 +1218,14 @@ class Brain:
                     self.feed(net_name, policy.parse_event(line))
             if self.sess is not None and self.due(self.sess):
                 self.submit(self.sess)
-            # Periodic /clear: a session that never idles (wedged turn) never
-            # reaches the turn-cap check in record_turn, so turns grow without
-            # bound across watchdog restarts (seen: 636). Clear on age too.
+            # Periodic age reset: a session that never idles (wedged turn)
+            # would otherwise live forever across watchdog restarts. Age is a
+            # hygiene/token guard, not amnesia — six hours by default.
             if (not self.dry_run and self.sess is not None
-                    and (self.sess.turns >= MAX_TURNS
-                         or (self.sess.born
-                             and time.monotonic() - self.sess.born >= RESET_SECS
-                             and self.sess.busy_since is None))):
-                self.reset_session(self.sess,
-                                   f"periodic (turns={self.sess.turns}, "
-                                   f"age>{RESET_SECS}s)")
+                    and self.sess.born
+                    and time.monotonic() - self.sess.born >= RESET_SECS
+                    and self.sess.busy_since is None):
+                self.reset_session(self.sess, f"periodic (age>{RESET_SECS}s)")
             if not self.dry_run and self.sess is not None:
                 self._probe_best(self.sess)
             self.guard_tick()

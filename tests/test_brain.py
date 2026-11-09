@@ -344,7 +344,7 @@ def _drain(fifo, timeout=10):
     return got
 
 
-# --- agent guard: refusal, turn cap, wedged turns ------------------------------
+# --- agent guard: refusal, age reset, wedged turns ----------------------------
 def _refusal_answer(prompt, state):
     if "Do not send anything to IRC right now" in prompt:
         return ""
@@ -373,80 +373,56 @@ def test_refusal_resets_the_session(tmp_path):
         w.stop()
 
 
-def test_turn_cap_resets_the_session(tmp_path):
-    w = Env(tmp_path)
-    w.start()
-    try:
-        sess = w.brain.ensure_session()
-        old_sid = sess.sid
-        sess.turns = brain.MAX_TURNS - 1
-        w.brain.record_turn(sess, "no refusal here")
-        assert w.brain.sess.sid != old_sid
-    finally:
-        w.stop()
+def test_a_long_session_is_never_reset_for_turn_count(tmp_path):
+    # Katia's verdict on the old 100-turn cap: losing the whole conversation
+    # was worse than the tokens it saved. Compaction is the token guard; 150
+    # turns in one session must keep that same session alive.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    sess = brain.Session("ses_long", "irc:global", "sys")
+    b.sess = sess
+    for _ in range(150):
+        b.record_turn(sess, "")
+    assert b.sess is sess
+    assert sess.turns == 150
+    assert b.api.create_session.call_count == 0
+    assert b.api.abort.call_count == 0
 
 
-def test_turn_cap_reset_ends_on_a_fresh_zero_turn_session(tmp_path):
+def test_no_turn_cap_constant_remains():
+    assert not hasattr(brain, "MAX_TURNS")
+    with open(brain.__file__) as f:
+        assert "MAX_TURNS" not in f.read()
+
+
+def test_reset_ends_on_a_fresh_session_and_persists_it(tmp_path):
     # The live incident (issue #5): reset_session kept self.stored_sid
-    # pointing at the discarded session, ensure_session re-attached it
-    # (still on the server, still over cap) and the cap check fired again
-    # — ~750 resets in two minutes. A turn-cap reset must end on a
-    # genuinely fresh session at turns == 0, with the new sid persisted,
-    # and no second reset may follow.
+    # pointing at the discarded session, ensure_session re-attached it and
+    # the guard fired again — ~750 resets in two minutes. A reset must end
+    # on a genuinely fresh session with the new sid persisted.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     b.api.list_sessions.return_value = [{"id": "ses_old"}]  # still on server
     b.api.create_session.return_value = {"id": "ses_new"}
     sess = brain.Session("ses_old", "irc:global", "sys")
-    sess.turns = brain.MAX_TURNS
+    sess.turns = 150
     b.sess = sess
     with mock.patch.object(brain, "WORKDIR", str(tmp_path)):
         b.stored_sid = "ses_old"          # the discarded sid, still in memory
-        b.record_turn(sess, "no refusal here")     # turns >= MAX -> reset
+        b.reset_session(sess, "refusal")
         assert b.sess.sid == "ses_new"    # fresh, not a re-attach of ses_old
         assert b.sess.turns == 0
         assert b.stored_sid == "ses_new"  # memory mirrors the persisted sid
         assert json.load(open(str(tmp_path / "sessions.json"))) == \
             {"session": "ses_new"}
-        # The cap check cannot re-arm on the fresh session: one reset, done.
         b.record_turn(b.sess, "no refusal here")
         assert b.api.create_session.call_count == 1
         assert b.sess.sid == "ses_new"
         assert b.sess.turns == 1
 
 
-def test_reset_loop_guard_retires_a_still_over_cap_session(tmp_path, capsys):
-    # Defence in depth: a reset that produces a session STILL over cap
-    # (a broken server count coming back through re-attach) must not
-    # spin — RESET_LOOP_GUARD logs once and retires that session object;
-    # every later poll re-sees it as a no-op instead of a reset.
-    b, _nets = _bare_brain(tmp_path)
-    b.api = mock.Mock()
-    overcap = brain.Session("ses_still", "irc:global", "sys")
-    overcap.turns = brain.MAX_TURNS
-    sess = brain.Session("ses_old", "irc:global", "sys")
-    sess.turns = brain.MAX_TURNS
-    b.sess = sess
-
-    def broken_ensure():
-        with b.lock:
-            b.sess = overcap
-        return overcap
-
-    with mock.patch.object(brain, "WORKDIR", str(tmp_path)), \
-            mock.patch.object(b, "ensure_session", broken_ensure):
-        b.reset_session(sess, "turn-cap")
-        assert "RESET_LOOP_GUARD" in capsys.readouterr().out
-        assert b.sess is overcap
-        assert overcap.reset_guard
-        b.reset_session(overcap, "turn-cap")
-        b.reset_session(overcap, "wedged-twice")
-    assert "RESET_LOOP_GUARD" not in capsys.readouterr().out   # logged once
-    assert b.api.create_session.call_count == 0
-
-
-def test_idle_after_a_cap_reset_never_submits_to_the_dead_sid(tmp_path):
-    # The turn that hits the cap still dispatches its answer, but the
+def test_idle_after_a_refusal_reset_never_submits_to_the_dead_sid(tmp_path):
+    # The turn that triggers the reset still dispatches its answer, but the
     # leftover queue now belongs to the fresh session: the abandoned
     # session object is never driven again.
     b, _nets = _bare_brain(tmp_path)
@@ -456,10 +432,10 @@ def test_idle_after_a_cap_reset_never_submits_to_the_dead_sid(tmp_path):
     b.api.messages.return_value = [
         {"info": {"role": "assistant", "time": {"created": 1, "completed": 2},
                   "tokens": {"output": 5}, "modelID": "m"},
-         "parts": [{"type": "text", "text": "SAY irc|#c done"}]},
+         "parts": [{"type": "text",
+                    "text": "SAY irc|#c done\nI can't help with that."}]},
     ]
     sess = brain.Session("ses_old", "irc:global", "sys")
-    sess.turns = brain.MAX_TURNS
     sess.busy_since = time.monotonic()
     sess.preempted_ts = None
     ev = policy.parse_event("[12:00] MSG TRUSTED FROM=a HOST=h TO=#test "
@@ -887,18 +863,27 @@ def test_registers_config_from_file(tmp_path, monkeypatch):
 
 
 def test_turn_knobs_and_dry_run_env_tunable(tmp_path):
-    # A free-tier model can turn for minutes: MAX_TURNS / TURN_TIMEOUT must
-    # stay env-tunable (hardcoding them made a slow turn an untouchable
+    # A free-tier model can turn for minutes: the age reset and TURN_TIMEOUT
+    # must stay env-tunable (hardcoding them made a slow turn an untouchable
     # abort->wedge->reset loop), and BRAIN_DRY_RUN lets compose/k8s dry-run
     # without editing the container command. Same for the preempt knobs.
-    code = ("import brain; print(brain.MAX_TURNS, brain.TURN_TIMEOUT, "
+    code = ("import brain; print(brain.RESET_SECS, brain.TURN_TIMEOUT, "
             "brain.DRY_RUN, brain.PREEMPT_ON_ADDRESS, brain.PREEMPT_COOLDOWN)")
-    env = dict(os.environ, BRAIN_MAX_TURNS="7", BRAIN_TURN_TIMEOUT="240.5",
+    env = dict(os.environ, BRAIN_RESET_SECS="1234", BRAIN_TURN_TIMEOUT="240.5",
                BRAIN_DRY_RUN="1", BRAIN_WORKDIR=str(tmp_path),
                BRAIN_PREEMPT_ON_ADDRESS="0", BRAIN_PREEMPT_COOLDOWN="2.5")
     out = subprocess.run([sys.executable, "-c", code], env=env, check=True,
                          capture_output=True, text=True, timeout=30).stdout
-    assert out.split() == ["7", "240.5", "True", "False", "2.5"]
+    assert out.split() == ["1234", "240.5", "True", "False", "2.5"]
+
+
+def test_default_age_reset_is_six_hours(tmp_path):
+    code = "import brain; print(brain.RESET_SECS)"
+    env = dict(os.environ, BRAIN_WORKDIR=str(tmp_path))
+    env.pop("BRAIN_RESET_SECS", None)
+    out = subprocess.run([sys.executable, "-c", code], env=env, check=True,
+                         capture_output=True, text=True, timeout=30).stdout
+    assert out.strip() == "21600"
 
 
 def test_serve_spawn_binds_loopback_only():

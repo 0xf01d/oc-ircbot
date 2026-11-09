@@ -102,3 +102,18 @@ def test_live_deployment_keeps_the_model_ladder_in_the_manifest():
     assert env["BRAIN_MODEL"] == "aisix/auto"
     assert "aisix/auto" in env["BRAIN_MODEL_LADDER"]
     assert env["BRAIN_PREEMPT_ON_ADDRESS"] == "0"
+
+
+def test_no_turn_cap_remains_in_shipped_files():
+    # The cap threw the whole conversation away; compaction is the token
+    # guard now. No shipped file may reintroduce the knob.
+    for rel in ("brain.py", "README.md", "docker-compose.yml",
+                "docs/design.md", "k8s/00-configmap.yaml",
+                "k8s/live/10-deployment.yaml"):
+        assert "MAX_TURNS" not in read(rel), rel
+
+
+def test_live_deployment_uses_the_six_hour_age_reset():
+    conts, _ = _containers()
+    env = {e["name"]: e.get("value") for e in conts["brain"]["env"]}
+    assert env["BRAIN_RESET_SECS"] == "21600"

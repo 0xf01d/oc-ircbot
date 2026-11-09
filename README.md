@@ -301,7 +301,7 @@ Brain variables:
 | `BRAIN_ADDRESS_ONLY` | `0` | wake only when addressed |
 | `registers.json` | *(none)* | per-channel register text, in `BRAIN_WORKDIR` |
 | `BRAIN_POLL` / `BRAIN_BATCH_WINDOW` | `1.0` / `3.0` | batching |
-| `BRAIN_MAX_TURNS` / `BRAIN_TURN_TIMEOUT` | `150` / `180` | session turn cap / wedged-turn abort (env-tunable: a free-tier model can turn for minutes) |
+| `BRAIN_RESET_SECS` / `BRAIN_TURN_TIMEOUT` | `21600` / `180` | session age reset (6 h hygiene/token guard) / wedged-turn abort (env-tunable: a free-tier model can turn for minutes) |
 | `BRAIN_PREEMPT_ON_ADDRESS` / `BRAIN_PREEMPT_COOLDOWN` | `1` / `10` | an addressed message aborts the running turn and its batch is submitted now / minimum seconds between preempts |
 | `BRAIN_DRY_RUN` | `0` | print prompts instead of submitting (compose/k8s can dry-run without editing the command) |
 | `BRAIN_FROM_START` | `0` | read event logs from the top on start |
@@ -355,7 +355,7 @@ Run the units locally with `python -m pytest tests -q`.
   (`docs/monitor.md` records what is honestly different). This is the whole
   point of the project.
 - **The agent guard.** `aup_watchdog.py` is ported *into* the brain as the
-  turn-cap / refusal / wedge resets; the watchdog sidecar gains the serve and
+  refusal / age / wedge resets; the watchdog sidecar gains the serve and
   agent layers.
 - **The permission gate.** `gate-permission.py`'s deny-fast rationale is
   re-implemented headlessly: `opencode.json` + auto-reject + admin NOTICE.

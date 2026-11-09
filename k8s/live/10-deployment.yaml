@@ -75,10 +75,10 @@ spec:
             - {name: OC_MODEL, value: opencode/deepseek-v4.1-flash-free}
             - {name: OPENCODE_CONFIG, value: /data/oc/aisix.json}
             - {name: NETWORKS_FILE, value: /data/networks.json}
-            # 1800 s /clear: a long-lived session otherwise pays the whole
-            # history on every turn. TURN_TIMEOUT 300 leaves room for a free
+            # 21600 s age reset: hygiene, not amnesia. Compaction keeps the
+            # live context lean; TURN_TIMEOUT 300 leaves room for a free
             # model that thinks for minutes before the abort fires.
-            - {name: BRAIN_RESET_SECS, value: "1800"}
+            - {name: BRAIN_RESET_SECS, value: "21600"}
             - {name: BRAIN_TURN_TIMEOUT, value: "300"}
             # 0: an addressed line does NOT abort the running turn. Off on
             # purpose — preemption kept killing multi-minute turns mid-answer.

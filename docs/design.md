@@ -51,7 +51,7 @@ aup_watchdog triggers, ported into the loop):
 | trigger | detection | action |
 |---|---|---|
 | **refusal** | `policy.refusal_hits` on the assistant text (`policy.DEFAULT_REFUSAL_PATTERNS`) | `reset_session`, log to the activity log |
-| **turn cap** | `assistant_turn_count >= MAX_TURNS` (150, in `brain.py`) | `reset_session` — a fresh context, not a zombie |
+| **age** | session older than `RESET_SECS` (6 h by default, in `brain.py`) | `reset_session` — a hygiene/token guard, not amnesia |
 | **wedged turn** | `session.status` busy/retry longer than `TURN_TIMEOUT` (180 s, in `brain.py`) | `POST /session/{id}/abort`; a second wedge resets the session |
 
 Every new session is **rehydrated from disk**: a `rehydrate_prompt` injects
