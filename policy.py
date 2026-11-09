@@ -214,6 +214,14 @@ def filter_answer(answer, nick):
     return [a for a in answer if not is_own_echo(*a, nick)]
 
 
+# --- routing: which session serves this turn? --------------------------------
+def route_for(mode):
+    """Pure session routing: conversation stays in chat, hands-on work goes to
+    the per-channel worker session. No worker exists until an act batch needs
+    one."""
+    return "work" if mode == "act" else "chat"
+
+
 # --- chat vs act: does this batch need hands? --------------------------------
 _URL = re.compile(r"(?i)\bhttps?://[^\s]+")
 _URL_ACTION = re.compile(

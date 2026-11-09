@@ -219,6 +219,12 @@ def test_chat_mode_is_cheaper_than_act_mode():
     assert len(chat) < len(act)
 
 
+# --- routing: chat stays home, act goes to the worker session -----------------
+def test_route_for_sends_only_act_to_work():
+    assert policy.route_for("chat") == "chat"
+    assert policy.route_for("act") == "work"
+
+
 # --- needs_hands: chat or act for this batch? ---------------------------------
 @pytest.mark.parametrize("text", [
     "installa nginx sul box",

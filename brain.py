@@ -286,6 +286,63 @@ def split_model(model):
 
 # --- FIFO -------------------------------------------------------------------
 _CHAT_VERBS = ("SAY", "ACT", "NOTICE")
+# Fixed acknowledgement for an act handoff: the brain composes it, so it costs
+# no model tokens and no turn latency. Deliberately not configurable.
+WORK_ACKS = ("on it",)
+
+
+class _Workers(dict):
+    """Worker sessions keyed `net|channel`, with tolerant lookups (tuple,
+    `net|channel`, `net:channel`, or a bare channel on a single net)."""
+
+    def __init__(self, brain):
+        super().__init__()
+        self._brain = brain
+
+    def _norm(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            return f"{key[0]}|{str(key[1]).lower()}"
+        s = str(key)
+        if "|" in s:
+            net, _, chan = s.partition("|")
+            return f"{net}|{chan.lower()}"
+        if ":" in s and not s.startswith(("#", "&")):
+            net, _, chan = s.partition(":")
+            if chan.lower().endswith(":work"):
+                chan = chan[:-5]
+            return f"{net}|{chan.lower()}"
+        chan = s.lower()
+        matches = [k for k in self.keys() if k.partition("|")[2] == chan]
+        if len(matches) == 1:
+            return matches[0]
+        nets = getattr(self._brain, "nets", []) or []
+        if len(nets) == 1:
+            return f"{nets[0].name}|{chan}"
+        return f"|{chan}"
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._norm(key))
+
+    def __setitem__(self, key, value):
+        return super().__setitem__(self._norm(key), value)
+
+    def __contains__(self, key):
+        return super().__contains__(self._norm(key))
+
+    def __delitem__(self, key):
+        return super().__delitem__(self._norm(key))
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def pop(self, key, *default):
+        return super().pop(self._norm(key), *default)
+
+    def setdefault(self, key, default=None):
+        return super().setdefault(self._norm(key), default)
 
 
 def _outbound_hook(net_name, lines):
@@ -434,7 +491,7 @@ class Session:
     __slots__ = ("sid", "title", "system", "turns", "busy_since",
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
-                 "preempted_ts", "born", "last_net")
+                 "preempted_ts", "born", "last_net", "last_target")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -453,9 +510,10 @@ class Session:
         self.model_id = None               # last turn's model
         self.prompt_ts = None              # monotonic when submit() fired
         self.preempted_ts = None           # monotonic when a preempt aborted
-        self.last_net = None               # last event's network (synthetic turns)
                                            # the running turn: the next idle
                                            # belongs to that aborted turn
+        self.last_net = None               # last event's network (synthetic turns)
+        self.last_target = None            # last event's reply target
 
 
 def last_assistant_text(messages):
@@ -485,7 +543,10 @@ class Brain:
         self.api = None
         self.serve = None
         self.lock = threading.Lock()
-        self.sess = None                   # THE session (created lazily)
+        self.sess = None                   # THE conversation (created lazily)
+        self.workers = _Workers(self)      # net|channel -> act worker, lazily
+        self.work_sessions = self.workers  # aliases for readability/tests
+        self.worker_sessions = self.workers
         self.loop_count = 0
         self.total_turns = 0
         self.total_refusals = 0
@@ -583,6 +644,66 @@ class Brain:
         self.rehydrate(sess)
         return sess
 
+    @property
+    def worker(self):
+        """The sole worker, when there is exactly one (convenience)."""
+        with self.lock:
+            if len(self.workers) == 1:
+                return next(iter(self.workers.values()))
+        return None
+
+    def worker_key(self, net_name, ev):
+        return f"{net_name}|{policy.channel_of(ev)}"
+
+    def worker_for(self, net_name, ev):
+        with self.lock:
+            return self.workers.get(self.worker_key(net_name, ev))
+
+    def ensure_worker(self, net_name, ev):
+        """The act worker for this network-channel, created on first use.
+        A bot that only chats never pays for one."""
+        key = self.worker_key(net_name, ev)
+        with self.lock:
+            worker = self.workers.get(key)
+        if worker is not None:
+            return worker
+        channel = policy.channel_of(ev)
+        title = f"{net_name}:{channel}:work"
+        system = policy.build_system(self._roster(), self.registers, mode="act")
+        if self.api is None:                 # dry-run/local stand-in
+            worker = Session(f"dry-{key}", title, system)
+            with self.lock:
+                return self.workers.setdefault(key, worker)
+        try:
+            sid = self.api.create_session(title)["id"]
+        except (OSError, KeyError, ValueError) as e:
+            emit("WORKER_CREATE_ERROR", title, repr(e))
+            return None
+        worker = Session(sid, title, system)
+        with self.lock:
+            existing = self.workers.setdefault(key, worker)
+        if existing is not worker:
+            return existing
+        emit("WORKER_NEW", title, sid)
+        return worker
+
+    def _session_for_sid(self, sid):
+        """Route an SSE idle/status by its sid: chat vs this worker."""
+        with self.lock:
+            sess = self.sess
+            if sess is not None and sess.sid == sid:
+                return sess, "chat"
+            for worker in self.workers.values():
+                if worker.sid == sid:
+                    return worker, "work"
+        return None, None
+
+    def _session_live(self, sess):
+        with self.lock:
+            if sess is self.sess:
+                return True
+            return any(w is sess for w in self.workers.values())
+
     def rehydrate(self, sess):
         """Wake a fresh session from disk memory (the /resume ritual)."""
         nick = self._net_nick(self.nets[0].name if self.nets else "")
@@ -602,22 +723,32 @@ class Brain:
         before ensure_session: the discarded session still exists on the
         server, so a live stored_sid made the "fresh" session a re-attach
         of the very session being reset — ~750 spins in two minutes (the
-        live incident)."""
+        live incident).
+
+        A worker is simply reaped (forgotten); the next act batch for that
+        channel creates a fresh one lazily. It must never reset chat."""
         try:
             self.api.abort(sess.sid)
         except OSError:
             pass
         with self.lock:
-            if self.sess is sess:
+            is_chat = self.sess is sess
+            if is_chat:
                 self.sess = None
+            else:
+                for key, worker in list(self.workers.items()):
+                    if worker is sess:
+                        del self.workers[key]
             leftover = sess.pending
             sess.pending = []
-        self.stored_sid = None
-        self.save_session_store()
         emit("SESSION_RESET", sess.title, reason, f"turns={sess.turns}")
         plugin_event("reset", reason=reason, turns=sess.turns)
         self.mem.append_activity(
             f"session reset ({reason}) after {sess.turns} turns: {sess.title}")
+        if not is_chat:
+            return
+        self.stored_sid = None
+        self.save_session_store()
         self.registers = registers()      # registers live like the session
         fresh = self.ensure_session()
         if fresh is not None and leftover:
@@ -672,6 +803,7 @@ class Brain:
             return
         with self.lock:
             sess.last_net = net_name
+            sess.last_target = policy.reply_target(ev)
             sess.pending.append((time.monotonic(), ev))
             depth = len(sess.pending)
         if depth >= PENDING_BACKLOG and depth % PENDING_BACKLOG == 0:
@@ -762,8 +894,64 @@ class Brain:
                      if policy.is_addressed(
                          ev, self._net_nick(ev.get("net")))]
         mode = self._batch_mode(batch)
-        system = policy.build_system(self._roster(), self.registers, mode=mode)
         emit("TURN_MODE", mode)
+        route = policy.route_for(mode)
+        if route == "work" and self.sess is not None and sess is self.sess:
+            self._route_to_worker(batch, events, addressed, mode)
+            return
+        emit("TURN_ROUTE", mode, sess.title)
+        self._send_batch(sess, batch, events, addressed, mode)
+
+    def _route_to_worker(self, batch, events, addressed, mode):
+        """Act work leaves the conversation: hand it to (or queue it on) the
+        network-channel's worker, and ack the channel without asking the
+        model. Chat is already free for the next batch."""
+        trigger = events[-1]
+        net_name = trigger.get("net") or (self.nets[0].name if self.nets else "")
+        # Ack before touching the API: the channel hears "on it" immediately.
+        self._ack_work(net_name, trigger)
+        worker = self.ensure_worker(net_name, trigger)
+        chat = self.sess
+        if worker is None:                   # never drop: fall back to chat
+            emit("TURN_ROUTE", mode, chat.title if chat else "?")
+            if chat is not None:
+                self._send_batch(chat, batch, events, addressed, mode)
+            return
+        with self.lock:
+            worker.last_net = net_name
+            worker.last_target = policy.reply_target(trigger)
+            worker.pending.extend(batch)
+            busy = worker.busy_since is not None
+        emit("TURN_ROUTE", mode, worker.title)
+        if busy:
+            return                           # one in-flight act per channel
+        self._drain(worker)
+
+    def _ack_work(self, net_name, ev):
+        target = policy.reply_target(ev)
+        net = self.net_by_name.get(net_name)
+        if net is None:
+            return
+        write_fifo([f"SAY {target} {WORK_ACKS[0]}"], net.fifo, net=net_name)
+        emit("WORK_ACK", net_name, target)
+
+    def _drain(self, sess):
+        """Send the pending batch on an already-chosen session (the act
+        handoff); route/mode were logged by the caller."""
+        with self.lock:
+            if not sess.pending or sess.busy_since is not None:
+                return
+            batch = sess.pending
+            sess.pending = []
+        events = [ev for _t, ev in batch]
+        addressed = [id(ev) for ev in events
+                     if policy.is_addressed(
+                         ev, self._net_nick(ev.get("net")))]
+        mode = self._batch_mode(batch)
+        self._send_batch(sess, batch, events, addressed, mode)
+
+    def _send_batch(self, sess, batch, events, addressed, mode):
+        system = policy.build_system(self._roster(), self.registers, mode=mode)
         prompt = policy.build_prompt(events, addressed)
         if self.dry_run:
             emit("DRY_RUN_PROMPT", sess.title)
@@ -813,6 +1001,12 @@ class Brain:
         over the FIFO itself with the numbers it already owns."""
         q = (" DEMOTED" if self._demoted_stack
              else " OK" if self.model_ladder else "")
+        net_name = ev.get("net")
+        worker = self.worker_for(net_name, ev) if net_name else None
+        if worker is not None and worker.busy_since is not None:
+            wstate = f"busy:{int(time.monotonic() - worker.busy_since)}"
+        else:
+            wstate = "idle"
         lines = [
             f"model: {sess.model_id or (self.model and self.model[1]) or '?'}"
             f"{q} | turns: {self.total_turns}",
@@ -820,10 +1014,10 @@ class Brain:
             f" | tps: {sess.tps or '?'}",
             f"refusals: {self.total_refusals} | wedges: {self.total_wedges}"
             f" | pending: {len(sess.pending)}",
+            f"work={wstate}",
             f"nets: {','.join(n.name for n in self.nets)}",
         ]
         target = policy.reply_target(ev)
-        net_name = ev.get("net")
         net = self.net_by_name.get(net_name)
         if net is None:
             emit("STATS_ERROR", "unknown net", repr(net_name))
@@ -833,8 +1027,8 @@ class Brain:
         emit("STATS_SENT", net_name, target)
 
     def on_idle(self, sid):
-        sess = self.sess
-        if sess is None or sess.sid != sid:
+        sess, _route = self._session_for_sid(sid)
+        if sess is None:
             return
         try:
             msgs = self.api.messages(sid)
@@ -858,7 +1052,7 @@ class Brain:
         self._note_metrics(sess, msgs)
         text = last_assistant_text(msgs)
         self.record_turn(sess, text)
-        still_live = self.sess is sess    # record_turn may have reset it
+        still_live = self._session_live(sess)  # record_turn may have reset it
         self._note_clean_turn(sess)
         self.dispatch(sess, text)
         plugin_event("turn_end", turns=sess.turns,
@@ -904,6 +1098,7 @@ class Brain:
             with self.lock:
                 sess.pending.append((time.monotonic(), {
                     "kind": "MSG", "net": sess.last_net or "",
+                    "to": sess.last_target or "",
                     "from": "system", "body": f"tool turn: {wanted[0][:200]}",
                     "trust": "TRUSTED", "synthetic": True,
                 }))
@@ -948,32 +1143,31 @@ class Brain:
     # -- agent guard (wedged turns) ---------------------------------------------------
     def guard_tick(self):
         with self.lock:
-            sess = self.sess
-            busy = sess is not None and sess.busy_since is not None
-        if not busy:
-            return
+            sessions = ([self.sess] if self.sess is not None else []) + \
+                list(self.workers.values())
         nowm = time.monotonic()
-        if nowm - sess.busy_since < TURN_TIMEOUT:
-            return
-        emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
-        self.total_wedges += 1
-        sess.wedges += 1
-        try:
-            self.api.abort(sess.sid)
-        except OSError as e:
-            emit("ABORT_ERROR", sess.title, repr(e))
-        with self.lock:
-            sess.busy_since = None
-        if sess.wedges >= 2:
-            self.reset_session(sess, "wedged-twice")
+        for sess in sessions:
+            if sess.busy_since is None:
+                continue
+            if nowm - sess.busy_since < TURN_TIMEOUT:
+                continue
+            emit("WEDGED", sess.title, f"{nowm - sess.busy_since:.0f}s")
+            self.total_wedges += 1
+            sess.wedges += 1
+            try:
+                self.api.abort(sess.sid)
+            except OSError as e:
+                emit("ABORT_ERROR", sess.title, repr(e))
+            with self.lock:
+                sess.busy_since = None
+            if sess.wedges >= 2:
+                self.reset_session(sess, "wedged-twice")
 
     # -- permission gate -----------------------------------------------------------------
     def gate(self, props):
         """permission.asked: reject on sight, announce over the FIFO."""
         req_id = props.get("id") or ""
-        sess = self.sess
-        if sess is not None and sess.sid != props.get("sessionID"):
-            sess = None
+        sess, _route = self._session_for_sid(props.get("sessionID"))
         what = props.get("permission") or "unknown"
         patterns = ",".join(props.get("patterns") or [])[:120]
         emit("PERMISSION_DENIED", what, patterns)
@@ -996,19 +1190,22 @@ class Brain:
         otherwise leave the finished reply unfetched — channel silence, then a
         wedged-reset 180 s later for good measure (review should-fix). A turn
         still running shows a non-assistant last message and is left alone."""
-        sess = self.sess
-        if sess is None or sess.busy_since is None:
-            return
-        try:
-            msgs = self.api.messages(sess.sid)
-        except OSError:
-            return
-        if len(msgs) <= sess.last_count:
-            return
-        if msgs[-1].get("info", {}).get("role") != "assistant":
-            return
-        emit("SSE_CATCHUP", sess.title)
-        self.on_idle(sess.sid)
+        with self.lock:
+            sessions = ([self.sess] if self.sess is not None else []) + \
+                list(self.workers.values())
+        for sess in sessions:
+            if sess.busy_since is None:
+                continue
+            try:
+                msgs = self.api.messages(sess.sid)
+            except OSError:
+                continue
+            if len(msgs) <= sess.last_count:
+                continue
+            if msgs[-1].get("info", {}).get("role") != "assistant":
+                continue
+            emit("SSE_CATCHUP", sess.title)
+            self.on_idle(sess.sid)
 
     def sse_loop(self):
         backoff = 1.0
@@ -1037,8 +1234,8 @@ class Brain:
         if etype == "session.idle":
             self.on_idle(props.get("sessionID"))
         elif etype == "session.status":
-            sess = self.sess
-            if sess is not None and sess.sid == props.get("sessionID"):
+            sess, _route = self._session_for_sid(props.get("sessionID"))
+            if sess is not None:
                 status = props.get("status") or {}
                 if status.get("type") == "retry":
                     msg = str(status.get("message", ""))
@@ -1052,10 +1249,9 @@ class Brain:
         elif etype == "permission.asked":
             self.gate(props)
         elif etype in ("session.next.compaction.ended", "session.compacted"):
-            sess = self.sess
+            sess, _route = self._session_for_sid(props.get("sessionID"))
             self.mem.log_compaction()
-            emit("COMPACTED", sess.title if sess and
-                 sess.sid == props.get("sessionID")
+            emit("COMPACTED", sess.title if sess is not None
                  else str(props.get("sessionID", "")))
 
     # -- models.json hot reload ----------------------------------------------------
@@ -1209,13 +1405,14 @@ class Brain:
         except OSError:
             pass
         with self.lock:
-            sess = self.sess
-            snap = ({sess.title: {"turns": sess.turns,
-                                  "refusals": sess.refusals,
-                                  "wedges": sess.wedges,
-                                  "busy": sess.busy_since is not None,
-                                  "pending": len(sess.pending)}}
-                    if sess else {})
+            live = ([self.sess] if self.sess is not None else []) + \
+                list(self.workers.values())
+            snap = {s.title: {"turns": s.turns,
+                              "refusals": s.refusals,
+                              "wedges": s.wedges,
+                              "busy": s.busy_since is not None,
+                              "pending": len(s.pending)}
+                    for s in live}
         try:
             with open(AGENT_STATUS, "w") as f:
                 json.dump({"ts": time.time(), "turns": self.total_turns,
@@ -1224,6 +1421,24 @@ class Brain:
                            "sessions": snap}, f)
         except OSError:
             pass
+
+    def _reap_aged(self):
+        """The periodic age guard covers chat AND workers: a kept worker must
+        not grow forever. Only idle sessions are reaped."""
+        if self.dry_run:
+            return
+        now = time.monotonic()
+        with self.lock:
+            chat = self.sess
+            workers = list(self.workers.values())
+        if (chat is not None and chat.born
+                and now - chat.born >= RESET_SECS
+                and chat.busy_since is None):
+            self.reset_session(chat, f"periodic (age>{RESET_SECS}s)")
+        for worker in workers:
+            if (worker.born and now - worker.born >= RESET_SECS
+                    and worker.busy_since is None):
+                self.reset_session(worker, f"periodic (age>{RESET_SECS}s)")
 
     # -- main loop --------------------------------------------------------------------
     def run(self):
@@ -1261,14 +1476,15 @@ class Brain:
                     self.feed(net_name, policy.parse_event(line))
             if self.sess is not None and self.due(self.sess):
                 self.submit(self.sess)
+            with self.lock:
+                workers = list(self.workers.values())
+            for worker in workers:
+                if self.due(worker):
+                    self.submit(worker)
             # Periodic age reset: a session that never idles (wedged turn)
             # would otherwise live forever across watchdog restarts. Age is a
             # hygiene/token guard, not amnesia — six hours by default.
-            if (not self.dry_run and self.sess is not None
-                    and self.sess.born
-                    and time.monotonic() - self.sess.born >= RESET_SECS
-                    and self.sess.busy_since is None):
-                self.reset_session(self.sess, f"periodic (age>{RESET_SECS}s)")
+            self._reap_aged()
             if not self.dry_run and self.sess is not None:
                 self._probe_best(self.sess)
             self.guard_tick()
