@@ -914,8 +914,40 @@ class Brain:
         self._send_batch(sess, batch, events, addressed, mode)
 
     def _route_to_worker(self, batch, events, addressed, mode):
-        """Act work leaves the conversation: hand it to (or queue it on) the
-        network-channel's worker. Chat is already free for the next batch."""
+        """Act work leaves the conversation. The intake batch is partitioned
+        by owning net|channel FIRST: a worker is only ever handed its own
+        channel's events, never a mixed batch whose last event happened to
+        pick it. Chat-only groups stay in the global conversation."""
+        groups = {}
+        for item in batch:
+            ev = item[1]
+            net_name = ev.get("net") or (self.nets[0].name if self.nets else "")
+            groups.setdefault(self.worker_key(net_name, ev), []).append(item)
+        order = {id(item): i for i, item in enumerate(batch)}
+        chat_batch = []
+        for group in groups.values():
+            gev = [ev for _t, ev in group]
+            gmode = self._batch_mode(group)
+            if gmode != "act":
+                chat_batch.extend(group)
+                continue
+            gaddressed = [
+                id(ev) for ev in gev
+                if policy.is_addressed(ev, self._net_nick(ev.get("net")))]
+            self._route_group_to_worker(group, gev, gaddressed, gmode)
+        if chat_batch:
+            chat_batch.sort(key=lambda item: order[id(item)])
+            cev = [ev for _t, ev in chat_batch]
+            caddressed = [
+                id(ev) for ev in cev
+                if policy.is_addressed(ev, self._net_nick(ev.get("net")))]
+            chat = self.sess
+            if chat is not None:
+                emit("TURN_ROUTE", "chat", chat.title)
+                self._send_batch(chat, chat_batch, cev, caddressed, "chat")
+
+    def _route_group_to_worker(self, batch, events, addressed, mode):
+        """Hand one same-net|channel group to (or queue it on) its worker."""
         trigger = events[-1]
         net_name = trigger.get("net") or (self.nets[0].name if self.nets else "")
         worker = self.ensure_worker(net_name, trigger)
