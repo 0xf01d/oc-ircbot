@@ -1325,6 +1325,50 @@ def test_worker_idle_dispatches_its_own_verbs_and_leaves_chat_alone(tmp_path):
     assert worker.busy_since is None
 
 
+def test_mixed_channel_act_batch_is_partitioned_per_worker(tmp_path):
+    # Two act events from different networks/channels in flight must never
+    # share a worker batch: each worker's prompt sees only its own channel.
+    b, _nets = _bare_brain(tmp_path, nets=("net1", "net2"))
+    b.api = mock.Mock()
+    b.api.create_session.side_effect = lambda title: {"id": title}
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    b.feed("net1", policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=a HOST=h TO=#hermes BODY=installa nginx"))
+    b.feed("net2", policy.parse_event(
+        "[12:00] MSG TRUSTED FROM=b HOST=h TO=#milligays BODY=installa redis"))
+    b.submit(chat)
+    w1 = b.workers["net1|#hermes"]
+    w2 = b.workers["net2|#milligays"]
+    prompts = {c.args[0]: c.args[1]
+               for c in b.api.prompt_async.call_args_list}
+    assert set(prompts) == {w1.sid, w2.sid}
+    assert "net1|#hermes" in prompts[w1.sid]
+    assert "net2|#milligays" not in prompts[w1.sid]
+    assert "net2|#milligays" in prompts[w2.sid]
+    assert "net1|#hermes" not in prompts[w2.sid]
+
+
+def test_worker_answer_to_a_foreign_channel_is_dropped_loudly(
+        tmp_path, capsys):
+    # A worker owns exactly one net|channel. An answer naming any other
+    # channel (even on another net) is dropped as ROUTE_ERROR, never
+    # redirected to the worker's own channel.
+    b, _nets = _bare_brain(tmp_path, nets=("freebnc", "hackint"))
+    b.api = mock.Mock()
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    worker = brain.Session("w1", "freebnc:#hermes:work", "sys")
+    b.workers["freebnc|#hermes"] = worker
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.dispatch(worker, "SAY hackint|#MILLIGAYS meow report")
+        b.dispatch(worker, "SAY freebnc|#other meow report")
+        b.dispatch(worker, "SAY #other meow report")
+    wf.assert_not_called()
+    out = capsys.readouterr().out
+    assert out.count("ROUTE_ERROR") == 3
+
+
 def test_stats_reports_the_worker_state(tmp_path):
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
