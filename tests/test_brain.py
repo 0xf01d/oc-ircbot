@@ -1349,6 +1349,26 @@ def test_mixed_channel_act_batch_is_partitioned_per_worker(tmp_path):
     assert "net1|#hermes" not in prompts[w2.sid]
 
 
+def test_worker_answer_to_a_foreign_channel_is_dropped_loudly(
+        tmp_path, capsys):
+    # A worker owns exactly one net|channel. An answer naming any other
+    # channel (even on another net) is dropped as ROUTE_ERROR, never
+    # redirected to the worker's own channel.
+    b, _nets = _bare_brain(tmp_path, nets=("freebnc", "hackint"))
+    b.api = mock.Mock()
+    chat = brain.Session("s1", "irc:global", "sys")
+    b.sess = chat
+    worker = brain.Session("w1", "freebnc:#hermes:work", "sys")
+    b.workers["freebnc|#hermes"] = worker
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.dispatch(worker, "SAY hackint|#MILLIGAYS meow report")
+        b.dispatch(worker, "SAY freebnc|#other meow report")
+        b.dispatch(worker, "SAY #other meow report")
+    wf.assert_not_called()
+    out = capsys.readouterr().out
+    assert out.count("ROUTE_ERROR") == 3
+
+
 def test_stats_reports_the_worker_state(tmp_path):
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()

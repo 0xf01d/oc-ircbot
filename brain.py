@@ -499,7 +499,7 @@ class Session:
                  "wedges", "refusals", "pending", "last_count",
                  "lat_ms", "out_tokens", "tps", "model_id", "prompt_ts",
                  "preempted_ts", "born", "last_net", "last_target",
-                 "last_trust")
+                 "last_trust", "allowed_targets")
 
     def __init__(self, sid, title, system):
         self.sid = sid
@@ -523,6 +523,7 @@ class Session:
         self.last_net = None               # last event's network (synthetic turns)
         self.last_target = None            # last event's reply target
         self.last_trust = None             # trust of the batch behind this turn
+        self.allowed_targets = set()       # reply targets this batch owns
 
 
 def last_assistant_text(messages):
@@ -669,6 +670,19 @@ class Brain:
     def worker_for(self, net_name, ev):
         with self.lock:
             return self.workers.get(self.worker_key(net_name, ev))
+
+    def _worker_owner(self, sess):
+        """The net|channel a worker session owns; None for the chat session."""
+        with self.lock:
+            for key, worker in self.workers.items():
+                if worker is sess:
+                    net, _, chan = key.partition("|")
+                    return net, chan
+        title = sess.title or ""
+        if title.endswith(":work"):
+            net, _, rest = title.partition(":")
+            return net, rest[:-len(":work")]
+        return None
 
     def ensure_worker(self, net_name, ev):
         """The act worker for this network-channel, created on first use.
@@ -992,6 +1006,7 @@ class Brain:
         trust = batch_trust(events)
         with self.lock:
             sess.last_trust = trust
+            sess.allowed_targets = {policy.reply_target(ev) for ev in events}
         if self.dry_run:
             emit("DRY_RUN_PROMPT", sess.title)
             print(prompt, flush=True)
@@ -1133,6 +1148,7 @@ class Brain:
         # else gates an answer: no rate limits, no dedup, no per-answer caps
         # (vjt's bot drops nothing; the model owns its own pacing).
         by_net = {}
+        owner = self._worker_owner(sess)
         for verb, target, body in answer:
             raw = f"{target} {body}".strip() if target else body
             if verb == "QUIT" and not raw:
@@ -1153,6 +1169,25 @@ class Brain:
                 continue
             nick = self._net_nick(net_name)
             head, _, tail = arg.partition(" ")
+            if owner is not None:
+                # A worker owns exactly one net|channel. Its answer may speak
+                # there and nowhere else: a foreign net/channel is a routing
+                # error, never silently redirected to the worker's own.
+                owner_net, owner_channel = owner
+                if net_name != owner_net:
+                    emit("ROUTE_ERROR", sess.title,
+                         f"worker owns {owner_net}|{owner_channel}, "
+                         f"answer targets {net_name}|{head}")
+                    continue
+                if verb in _CHAT_VERBS:
+                    allowed = (sess.allowed_targets if owner_channel == "#dm"
+                               else {owner_channel})
+                    if (head or "").lower() not in {
+                            a.lower() for a in allowed}:
+                        emit("ROUTE_ERROR", sess.title,
+                             f"worker owns {owner_net}|{owner_channel}, "
+                             f"answer targets {net_name}|{head}")
+                        continue
             if policy.is_own_echo(verb, head, tail, nick):
                 continue
             by_net.setdefault(net_name, []).append(f"{verb} {arg}".rstrip())
