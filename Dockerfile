@@ -51,7 +51,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 # The OpenCode CLI (Node package). Pulls its own binary at install time.
 RUN npm install -g opencode-ai
-COPY brain.py plug.py policy.py networks.py memory_log.py util.py opencode.json tmuxsup.py ./
+COPY brain.py brain_plugin.py plug.py policy.py networks.py memory_log.py util.py opencode.json tmuxsup.py ./
 # tests/ ships the stub serve so the image is smoke-testable offline.
 COPY tests/ ./tests/
 ENV TERM=tmux-256color \

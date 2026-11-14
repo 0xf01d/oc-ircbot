@@ -186,3 +186,99 @@ def h_pingme(ctx, rest, origin):
 #         first = r.read(400).decode("utf-8", "replace").splitlines()[0]
 #     ctx.send_raw(f"PRIVMSG {origin} :{first[:380]}", origin)
 #     return True
+
+
+def h_marco(ctx, rest, origin):
+    if not origin:
+        return None
+    ctx.send_raw(f"NOTICE {origin} :marco-polo {rest}".strip(), origin)
+    return True
+
+
+# --- PROBE: one-shot health report for the operator -------------------------
+# PROBE:katia  ->  NOTICE katia :brain=NNs model=... nets=k fifos=n verbs="..."
+# Answers from what is on disk (heartbeat, models.json, FIFOs), never blocks:
+# every read is a stat or a small file, guarded, so a missing file degrades to
+# "?" instead of raising.
+def h_probe(ctx, rest, origin):
+    import json
+    import os
+    import time
+
+    if not origin:
+        return None
+
+    def age(path):
+        try:
+            return int(time.time() - os.path.getmtime(path))
+        except OSError:
+            return None
+
+    hb = age("/data/brain.heartbeat")
+    st = age("/data/agent.status")
+
+    model = "?"
+    try:
+        with open("/data/models.json") as f:
+            model = (json.load(f).get("model") or "?").split("/")[-1]
+    except (OSError, ValueError):
+        pass
+
+    try:
+        nets = len([n for n in os.listdir("/data") if n.startswith("bot.send.")])
+        evs = sum(os.path.getsize(f"/data/{n}") for n in os.listdir("/data")
+                  if n.startswith("events.") and n.endswith(".log"))
+    except OSError:
+        nets, evs = 0, 0
+
+    verbs = ",".join(sorted(
+        n[2:] for n in dir(__import__("sys").modules[__name__])
+        if n.startswith("h_"))) or "-"
+
+    ctx.send_raw(
+        f"NOTICE {origin} :brain={'-' if hb is None else str(hb) + 's'} "
+        f"status={'-' if st is None else str(st) + 's'} model={model} "
+        f"nets={nets} events={evs // 1024}k verbs={verbs}", origin)
+    return True
+
+
+# Trust is deliberately NOT a FIFO verb. A TRUST command here used to append
+# a rule to the trust file and flip the live `verified` set, which made an IRC
+# message (or anything that could write the FIFO) into a trust grant. Trust
+# now comes only from the read-only config mount (/conf), reviewed and
+# redeployed with the ConfigMap. There is no runtime path to a new entry.
+
+
+# --- BANLIST: read-only ban-list query -------------------------------------
+# `BANLIST #channel` -> `MODE #channel +b`. Strictly read-only: the only mode
+# ever sent is "+b" with no mask, so this can never add/remove a ban or touch
+# any other mode. The channel argument is validated hard (single token,
+# starts with #) so nothing else can be spliced onto the wire.
+def h_banlist(ctx, rest, origin):
+    chan = rest.strip()
+    if (not chan.startswith("#") or len(chan) > 64
+            or any(c.isspace() or c in "\r\n" for c in chan)):
+        return "usage: BANLIST #channel"
+    ctx.send_raw(f"MODE {chan} +b", origin)
+    ctx.emit("BANLIST", chan)
+    return True
+
+
+# --- VOICE: give +v to a nick, narrowly -------------------------------------
+# `VOICE #channel nick` -> `MODE #channel +v nick`. Both tokens are validated
+# hard (single token, channel starts with #, nick has no whitespace/CRLF/comma)
+# so nothing else can be spliced onto the wire. The bot must already be op in
+# the channel; otherwise the server just ignores the mode.
+def h_voice(ctx, rest, origin):
+    parts = rest.split()
+    if len(parts) < 2:
+        return "usage: VOICE #channel nick"
+    chan, nick = parts[0], parts[1]
+    if (not chan.startswith("#") or len(chan) > 64
+            or any(c.isspace() or c in "\r\n" for c in chan)):
+        return "usage: VOICE #channel nick"
+    if any(c.isspace() or c in "\r\n," for c in nick) or len(nick) > 64:
+        return "usage: VOICE #channel nick"
+    ctx.send_raw(f"MODE {chan} +v {nick}", origin)
+    ctx.emit("VOICE", f"{chan} {nick} by {origin or 'fifo'}")
+    return True

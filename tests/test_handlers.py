@@ -194,3 +194,23 @@ def test_unknown_verb_detail_lists_the_hot_verbs(tmp_path):
     err = next(c for c in em.call_args_list if c.args[0] == "CMD_ERROR")
     assert err.args[1] == "unknown-verb"
     assert "ECHO" in err.args[-1]        # the log says what exists
+
+
+def test_shipped_handlers_have_no_trust_grant_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "handlers.py")) as f:
+        src = f.read()
+    # The live /data copy had h_trust/h_untrust; they are deliberately gone.
+    # Trust comes from /conf only. A message handler must never write the set.
+    assert "def h_trust" not in src
+    assert "def h_untrust" not in src
+    assert "TRUST_FORCED" not in src
+    assert "UNTRUST_FORCED" not in src
+    assert "TRUST_FILE" not in src
+
+
+def test_trust_is_not_a_fifo_verb():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert handlers.load(os.path.join(root, "handlers.py")) is not None
+    verbs = handlers.verbs()
+    assert "TRUST" not in verbs and "UNTRUST" not in verbs
