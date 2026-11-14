@@ -167,3 +167,39 @@ def test_live_deployment_uses_the_six_hour_age_reset():
     conts, _ = _containers()
     env = {e["name"]: e.get("value") for e in conts["brain"]["env"]}
     assert env["BRAIN_RESET_SECS"] == "21600"
+
+
+def test_trust_check_rejects_a_nick_planted_only_in_the_pvc_file(tmp_path):
+    # The incident left `szczot3k dn42/person/szczot3k` in a writable /data
+    # trust file. The live ConfigMap is the trust source now, and it does not
+    # carry that line, so a nick planted on the PVC never becomes trusted.
+    import json
+    from unittest import mock
+    import bot
+    import networks
+
+    planted = tmp_path / "bot.trust.hackint"
+    planted.write_text("szczot3k dn42/person/szczot3k\n")
+    reviewed = tmp_path / "bot.trust.hackint.conf"
+    reviewed.write_text(_live_yaml("00-config.yaml")["data"]["bot.trust.hackint"])
+    live = json.loads(read("k8s", "live", "networks.json"))
+    ovr = tmp_path / "networks.json"
+    ovr.write_text(json.dumps({"hackint": dict(live["hackint"],
+                                               BOT_TRUST=str(reviewed))}))
+    net = networks.load(data_dir=str(tmp_path), overrides_path=str(ovr),
+                        base_env={"IRC_NETWORKS": "hackint"})[0]
+    assert net.env["BOT_TRUST"] == str(reviewed)
+
+    old = (bot.TRUST_FILE, bot.trust_rules, set(bot.verified),
+           set(bot.whois_pending))
+    try:
+        bot.TRUST_FILE = net.env["BOT_TRUST"]
+        bot.trust_rules, bot.verified, bot.whois_pending = [], set(), set()
+        with mock.patch.object(bot, "emit"):
+            bot.load_trust()
+        assert not bot.is_trust_listed("szczot3k")
+        assert bot.trust_check("szczot3k", "dn42/person/szczot3k") == \
+            (False, "not-listed")
+    finally:
+        (bot.TRUST_FILE, bot.trust_rules, bot.verified,
+         bot.whois_pending) = old
