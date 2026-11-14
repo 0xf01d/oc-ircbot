@@ -58,6 +58,16 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: lane-work
+        # /app and the rest of the image are read-only. Python and tmux still
+        # need a scratch directory, and opencode keeps its auth/session DB and
+        # tool cache under $HOME — those two paths get their own writable
+        # emptydirs so readOnlyRootFilesystem does not break the brain.
+        - name: tmp
+          emptyDir: {}
+        - name: opencode-state
+          emptyDir: {}
+        - name: opencode-cache
+          emptyDir: {}
       containers:
         # --- main: the persistent-session brain ------------------------------
         - name: brain
@@ -75,6 +85,9 @@ spec:
             - {name: OC_MODEL, value: opencode/deepseek-v4.1-flash-free}
             - {name: OPENCODE_CONFIG, value: /data/oc/aisix.json}
             - {name: NETWORKS_FILE, value: /data/networks.json}
+            # Code comes from the read-only image, never the writable PVC:
+            # /data is data (logs, FIFOs, memory), not a source of executables.
+            - {name: BRAIN_PLUGIN, value: /app/brain_plugin.py}
             # 21600 s age reset: hygiene, not amnesia. Compaction keeps the
             # live context lean; TURN_TIMEOUT 300 leaves room for a free
             # model that thinks for minutes before the abort fires.
@@ -94,8 +107,18 @@ spec:
                   name: oc-ircbot-secrets
                   key: OPENCODE_API_KEY
                   optional: true
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - {name: TMPDIR, value: /tmp}
           volumeMounts:
             - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+            - {name: opencode-state, mountPath: /root/.local/share/opencode}
+            - {name: opencode-cache, mountPath: /root/.cache/opencode}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           livenessProbe:
             exec:
               command:
@@ -131,6 +154,10 @@ spec:
             - {name: BOT_STARTUP, value: /conf/bot.startup}
             # nets.py reads the PVC map, so a new network is a file edit
             - {name: NETWORKS_FILE, value: /data/networks.json}
+            # Same rule as the brain: executable code is image-only. The old
+            # PVC copies stay inert even if an injected shell rewrites them.
+            - {name: BOT_HANDLERS, value: /app/handlers.py}
+            - {name: BOT_IRC_COMMANDS, value: /app/irc_commands.py}
             - {name: OC_MODEL, value: opencode/glm-5.3-flash-free}
             - {name: BRAIN_MODEL, value: opencode/longcat-2.5-preview-free}
             - name: NICKSERV_PASS
@@ -139,9 +166,17 @@ spec:
                   name: oc-ircbot-secrets
                   key: NICKSERV_PASS
                   optional: true
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - {name: TMPDIR, value: /tmp}
           volumeMounts:
             - {name: conf, mountPath: /conf, readOnly: true}
             - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests: {cpu: 20m, memory: 32Mi}
             limits: {memory: 128Mi}
@@ -163,8 +198,16 @@ spec:
             # A sidecar cannot restart its own container here; the honest
             # levers are the liveness probe (brain) and Recreate rollouts.
             - {name: WATCHDOG_EXIT_ON_STALL, value: "0"}
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - {name: TMPDIR, value: /tmp}
           volumeMounts:
             - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {memory: 64Mi}

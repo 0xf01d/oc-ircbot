@@ -89,11 +89,61 @@ def test_live_network_map_is_valid_and_label_consistent():
     assert "freebnc" in nets and "hackint" in nets
     for label, conf in nets.items():
         assert conf["IRC_HOST"], label
-        # Per-network files must live on /data, never the shared /conf default:
-        # two labels pointing at one BOT_TRUST would share a trust list.
-        for key in ("BOT_TRUST", "BOT_STARTUP"):
-            if key in conf:
-                assert conf[key].startswith("/data/"), (label, key, conf[key])
+        # Startup files stay on the PVC (they are runtime state). Trust is the
+        # exception: it must come from the read-only ConfigMap mount, never a
+        # file the bot can rewrite.
+        if "BOT_TRUST" in conf:
+            assert conf["BOT_TRUST"].startswith("/conf/"), \
+                (label, "BOT_TRUST", conf["BOT_TRUST"])
+        if "BOT_STARTUP" in conf:
+            assert conf["BOT_STARTUP"].startswith("/data/"), \
+                (label, "BOT_STARTUP", conf["BOT_STARTUP"])
+
+
+def test_live_per_network_trust_files_exist_in_the_read_only_config():
+    import json
+    nets = json.loads(read("k8s", "live", "networks.json"))
+    cm = _live_yaml("00-config.yaml")["data"]
+    for label, conf in nets.items():
+        path = conf.get("BOT_TRUST")
+        if not path:
+            continue
+        key = path.rsplit("/", 1)[-1]
+        assert key in cm, (label, key)
+    # The injection's result is not carried into the reviewed ConfigMap.
+    assert "szczot3k" not in cm["bot.trust.hackint"]
+
+
+def test_live_containers_run_with_a_read_only_root():
+    dep = _live_yaml("10-deployment.yaml")
+    spec = dep["spec"]["template"]["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["tmp"]["emptyDir"] == {}
+    conts, _ = _containers()
+    for name in ("bot", "brain", "watchdog"):
+        c = conts[name]
+        sc = c["securityContext"]
+        assert sc["readOnlyRootFilesystem"] is True, name
+        assert sc["allowPrivilegeEscalation"] is False, name
+        assert sc["capabilities"]["drop"] == ["ALL"], name
+        mounts = {m["mountPath"] for m in c["volumeMounts"]}
+        assert "/tmp" in mounts, name
+        env = {e["name"]: e.get("value") for e in c["env"]}
+        assert env["PYTHONDONTWRITEBYTECODE"] == "1", name
+    # The brain cannot write its opencode auth/session DB into a read-only
+    # $HOME, so those two cache paths are explicitly writable.
+    brain_mounts = {m["mountPath"] for m in conts["brain"]["volumeMounts"]}
+    assert "/root/.local/share/opencode" in brain_mounts
+    assert "/root/.cache/opencode" in brain_mounts
+
+
+def test_live_loads_executable_code_from_the_image_not_the_pvc():
+    conts, _ = _containers()
+    bot_env = {e["name"]: e.get("value") for e in conts["bot"]["env"]}
+    brain_env = {e["name"]: e.get("value") for e in conts["brain"]["env"]}
+    assert bot_env["BOT_HANDLERS"] == "/app/handlers.py"
+    assert bot_env["BOT_IRC_COMMANDS"] == "/app/irc_commands.py"
+    assert brain_env["BRAIN_PLUGIN"] == "/app/brain_plugin.py"
 
 
 def test_live_deployment_keeps_the_model_ladder_in_the_manifest():
