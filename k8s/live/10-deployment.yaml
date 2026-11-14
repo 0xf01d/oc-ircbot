@@ -46,10 +46,9 @@ spec:
       # nets.py SIGTERM path parts cleanly with a 10 s QUIT grace; leave
       # the default 30 s so it never gets SIGKILL mid-part.
       terminationGracePeriodSeconds: 30
-      # /data is the shared PVC lane-work: the network map, the per-network
-      # BOT_TRUST/BOT_STARTUP files and the FIFO set all survive a rollout.
-      # Nothing seeds it from the ConfigMap on purpose — networks.json on the
-      # PVC is the live source of truth (NETWORKS_FILE) and hot-editable.
+      # /data is the shared PVC lane-work: the network map, per-network startup
+      # files, logs and the FIFO set survive a rollout. Trust is NOT on it:
+      # /conf (read-only ConfigMap) is the only trust source. Code is image-only.
       volumes:
         - name: conf
           configMap:

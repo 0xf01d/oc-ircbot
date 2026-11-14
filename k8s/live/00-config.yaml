@@ -5,12 +5,12 @@
 # to be identified. Trust lives here, never on the writable PVC: changing it is
 # a reviewed ConfigMap edit plus a rollout, not a FIFO verb.
 #
-# This ConfigMap is exactly what the cluster holds (kubectl get cm
-# oc-ircbot-live -o yaml), comments included: it was captured from the live
-# object, not designed here. The network map is deliberately NOT a key here —
-# it lives on the PVC at /data/networks.json (NETWORKS_FILE) because nets.py
-# re-reads it at runtime: a PVC edit adds a network without a restart, a
-# ConfigMap edit would not. k8s/live/networks.json in this repo is that file.
+# The shape was captured from the live object (kubectl get cm oc-ircbot-live
+# -o yaml); the per-network trust keys were added by the hardening change so
+# trust no longer depends on the PVC. The network map is deliberately NOT a key
+# here — it lives on the PVC at /data/networks.json (NETWORKS_FILE) because
+# nets.py re-reads it at runtime: a PVC edit adds a network without a restart,
+# a ConfigMap edit would not. k8s/live/networks.json in this repo is that file.
 #
 # Any NickServ / API secret lives in oc-ircbot-secrets, created out-of-band —
 # never in git (see 10-deployment.yaml).
