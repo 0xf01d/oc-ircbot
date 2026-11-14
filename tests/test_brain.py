@@ -716,10 +716,9 @@ def test_submit_records_the_latest_batch_trust(tmp_path):
 
 
 def test_submit_never_treats_a_synthetic_turn_as_trusted(tmp_path):
-    # A synthetic event (the model's own NEED_TOOLS follow-up) is act work, so
-    # it lands on a worker. Whatever session runs it, `trust=TRUSTED` on the
-    # synthetic event must not become a TRUSTED batch: the model cannot ask
-    # itself for permission.
+    # A synthetic event is act work, so it lands on a worker. Whatever session
+    # runs it, `trust=TRUSTED` on the synthetic event must not become a
+    # TRUSTED batch: the model cannot ask itself for permission.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     b.api.create_session.return_value = {"id": "w1"}
@@ -1208,23 +1207,19 @@ def test_learned_fallback_nick_addressed(tmp_path):
     assert sess.pending == []
 
 
-def test_need_tools_arms_an_act_turn(tmp_path, capsys):
-    # The model cannot load tools mid-turn, so it announces NEED_TOOLS and the
-    # brain shapes the FOLLOW-UP turn as `act` via a synthetic event.
+def test_need_tools_no_longer_arms_a_follow_up_turn(tmp_path, capsys):
+    # Tools are loaded on every turn: NEED_TOOLS is no longer a verb, so it
+    # is ignored as prose and never queues a synthetic act event.
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     sess = brain.Session("s1", "irc:global", "sys")
     b.sess = sess
-    ev = policy.parse_event(
-        "[12:00] MSG TRUSTED FROM=katia HOST=h TO=#test BODY=restart bird2")
     sess.pending = []
     sess.last_net = "test"
-    b.dispatch(sess, "SAY #test on it\nNEED_TOOLS restart bird2")
+    b.dispatch(sess, "NEED_TOOLS restart bird2")
     out = capsys.readouterr().out
-    assert "NEED_TOOLS" in out
-    assert len(sess.pending) == 1
-    assert sess.pending[0][1]["synthetic"] is True
-    assert b._batch_mode(sess.pending) == "act"
+    assert "NEED_TOOLS" not in out
+    assert sess.pending == []
 
 
 # --- act turns run in a worker session, never in the chat conversation --------
@@ -1249,7 +1244,7 @@ def test_chat_batch_never_creates_the_worker(tmp_path, capsys):
     assert "TURN_ROUTE chat irc:global" in capsys.readouterr().out
 
 
-def test_act_batch_routes_to_a_lazy_worker_and_acks(tmp_path, capsys):
+def test_act_batch_routes_to_a_lazy_worker_without_ack(tmp_path, capsys):
     b, _nets = _bare_brain(tmp_path)
     b.api = mock.Mock()
     b.api.create_session.return_value = {"id": "w1"}
@@ -1265,11 +1260,27 @@ def test_act_batch_routes_to_a_lazy_worker_and_acks(tmp_path, capsys):
     assert sess.busy_since is None and sess.last_count == 0
     worker = b.workers["irc|#test"]
     assert worker.sid == "w1" and worker.busy_since is not None
-    # One short ack, composed by the brain, costs no model tokens.
-    assert ["SAY #test on it"] in [c.args[0] for c in wf.call_args_list]
+    # No provisional acknowledgement: the worker speaks only when it answers.
+    assert not any("on it" in str(c) for c in wf.call_args_list)
     out = capsys.readouterr().out
     assert "TURN_MODE act" in out
     assert "TURN_ROUTE act irc:#test:work" in out
+
+
+def test_act_dispatch_never_writes_the_canned_ack(tmp_path):
+    # The invariant directly: a TRUSTED act-needing event starts worker work
+    # and must not produce a canned "SAY #test on it" on the FIFO. Match the
+    # whole payload, so a model-authored "on it, doing X" is out of scope.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    _pending(sess, "installa nginx")
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        b.submit(sess)
+    payloads = [line for c in wf.call_args_list for line in c.args[0]]
+    assert "SAY #test on it" not in payloads
 
 
 def test_act_while_worker_is_busy_queues_on_the_same_worker(tmp_path, capsys):
@@ -1391,3 +1402,38 @@ def test_due_full_batch_short_circuits(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "BATCH_MAX_WAIT", 99.0)
     sess.pending = [(now, {"body": str(i)}) for i in range(3)]
     assert b.due(sess) is True
+
+
+# --- no provisional acknowledgement, started or queued -----------------------
+def test_no_ack_for_started_or_queued_work(tmp_path, capsys):
+    # A burst of three act messages: the first starts the work, the other two
+    # queue on the busy worker. None of them produces a canned ack.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        _pending(sess, "installa nginx")
+        b.submit(sess)
+        _pending(sess, "poi mariadb")
+        b.submit(sess)
+        _pending(sess, "e redis")
+        b.submit(sess)
+    assert len(wf.call_args_list) == 0
+    assert not any("on it" in str(c) for c in wf.call_args_list)
+
+
+def test_route_with_no_target_writes_nothing(tmp_path, capsys):
+    # reply_target() falls back to "?" for an event with neither channel nor
+    # sender; the route still stays silent rather than speaking to nobody.
+    b, _nets = _bare_brain(tmp_path)
+    b.api = mock.Mock()
+    b.api.create_session.return_value = {"id": "w1"}
+    sess = brain.Session("s1", "irc:global", "sys")
+    b.sess = sess
+    ev = {"kind": "MSG", "net": "irc", "from": "", "to": "", "body": "x"}
+    with mock.patch.object(brain, "write_fifo", return_value=1) as wf:
+        with mock.patch.object(brain.Brain, "_drain"):
+            b._route_to_worker([(time.monotonic(), ev)], [ev], [], "act")
+    assert wf.call_count == 0

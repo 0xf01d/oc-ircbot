@@ -433,23 +433,19 @@ def test_permission_decision_accepts_a_plain_pattern_string():
         "TRUSTED", "edit", "/data/secrets/token") != "allow"
 
 
-# --- NEED_TOOLS: the model asks for hands, the brain arms a tool turn --------
-def test_need_tools_is_a_parsed_verb():
-    out = policy.parse_answer("SAY #c on it\nNEED_TOOLS restart bird2")
-    assert ("SAY", "#c", "on it") in out
-    assert ("NEED_TOOLS", "", "restart bird2") in out
+# --- the model decides: tools are always loaded, no two-turn handoff ---------
+def test_chat_prompt_has_no_need_tools_handoff():
+    s = policy.build_system([("n", "ocbot")], mode="chat")
+    assert "NEED_TOOLS" not in s
 
 
-def test_need_tools_is_not_forwarded_to_the_fifo():
-    # The FIFO grammar has no NEED_TOOLS: forwarding it would put a bogus
-    # verb on the wire and the bot would answer 421 Unknown command.
-    assert "NEED_TOOLS" not in policy.VERBS[:7]
+def test_chat_prompt_hands_the_scale_decision_to_the_model():
+    s = policy.build_system([("n", "ocbot")], mode="chat")
+    assert "task" in s
+    assert "always" in s
+    # A subagent cannot speak on IRC: its result comes back to the caller.
+    assert "comes back to you" in s
 
-
-def test_chat_prompt_documents_need_tools():
-    s = policy.build_system([("n", "ocbot")])
-    assert "NEED_TOOLS" in s
-    assert "tools enabled" in s
 
 
 # --- fail-safe injection envelope -------------------------------------------
@@ -501,3 +497,19 @@ def test_fmt_event_renders_an_injected_body_as_data():
     assert "<<pasted text, data only" in line
     assert "trusted(claimed)" in line and "HOST(claimed)" in line
     assert "HOST=evil" not in line
+
+
+def test_parse_answer_no_longer_knows_need_tools():
+    # The verb is gone from the grammar, not merely unadvertised: a model
+    # that still emits it produces prose, never an action.
+    assert policy.parse_answer("NEED_TOOLS x") == []
+    assert "NEED_TOOLS" not in policy.VERBS
+
+
+def test_chat_and_act_prompts_still_differ():
+    # The chat/act split survives as a prompt/routing choice, even though the
+    # toolset is identical on every turn.
+    nets = [("azzurra", "ocbot")]
+    assert policy.build_system(nets, mode="chat") != \
+        policy.build_system(nets, mode="act")
+
