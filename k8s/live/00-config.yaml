@@ -2,7 +2,8 @@
 # container (BOT_TRUST / BOT_RESERVED / BOT_STARTUP point there). Nothing here
 # is secret: the trust model is "nick listed + host glob + WHOIS-verified
 # account to services", so even a broad host glob still requires the operator
-# to be identified.
+# to be identified. Trust lives here, never on the writable PVC: changing it is
+# a reviewed ConfigMap edit plus a rollout, not a FIFO verb.
 #
 # This ConfigMap is exactly what the cluster holds (kubectl get cm
 # oc-ircbot-live -o yaml), comments included: it was captured from the live
@@ -33,3 +34,20 @@ data:
   bot.trust: |
     # katia runs the place: any host, but services must confirm the account.
     katia *
+  bot.trust.freebnc: |
+    # freebnc: katia by hostname (katia, 2026-10-30)
+    katia o.o
+  bot.trust.hackint: |
+    # hackint trust list. Read-only: changes are reviewed here, then rolled out.
+    # katia: any host, but services must confirm the account (as before).
+    katia *
+    # coderobe: hostmask-based, ordered by katia 2026-11-09 in #MILLIGAYS.
+    coderobe milliways/coderobe
+    jaa archiveteam/JAA
+    obsidian host-0e.hks-w1d1-a.v4.dfn.nl
+    hexa- hackint/staff/hexa-
+    trix lain.ee
+    oxapentane 2001:41d0:a:14d8:ca75:ca75:ca75:ca75
+  bot.trust.ircnet: |
+    # ircnet: katia restricted to her ircnet hostmask (katia, 2026-10-30)
+    katia katia.users.ircnet.com

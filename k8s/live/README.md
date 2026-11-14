@@ -12,21 +12,29 @@ The compose stack, deployed into `hermes-generated-content` as ONE pod:
 
 | path | object | contents |
 |---|---|---|
-| `/conf` | ConfigMap `oc-ircbot-live` (`00-config.yaml`) | `bot.trust`, `bot.reserved`, `bot.startup`, `bot.startup.hackint` — read-only, changes need a rollout |
-| `/data` | **PVC `lane-work`** | `networks.json`, per-network `bot.trust.<net>` / `bot.startup.<net>`, FIFOs `bot.send.<net>`, logs, `events.log`, workspace, sidecar state |
+| `/conf` | ConfigMap `oc-ircbot-live` (`00-config.yaml`) | `bot.trust` plus per-network `bot.trust.<net>`, `bot.reserved`, `bot.startup.<net>` — read-only, changes need a rollout |
+| `/data` | **PVC `lane-work`** | `networks.json`, per-network `bot.startup.<net>`, FIFOs `bot.send.<net>`, logs, `events.log`, workspace, sidecar state |
 | `/data/networks.json` | file on the PVC | the **only** network map (`NETWORKS_FILE`); `nets.py` re-reads it at runtime — which is why it cannot live in the ConfigMap |
 
-The PVC is the point: the network map, the per-network trust/startup files and
-the FIFO set must survive a rollout, and `nets.py` hot-adds networks by
-re-reading `/data/networks.json` — a ConfigMap edit would need a restart, a PVC
-edit does not. There is deliberately no second copy of that map in git's
-ConfigMap; `k8s/live/networks.json` in this repo is the reference copy, and
+The PVC is the point: the network map, per-network startup files, FIFOs and
+logs must survive a rollout, and `nets.py` hot-adds networks by re-reading
+`/data/networks.json` — a ConfigMap edit would need a restart, a PVC edit does
+not. There is deliberately no second copy of that map in git's ConfigMap;
+`k8s/live/networks.json` in this repo is the reference copy, and
 `tests/test_configs.py` asserts the two do not diverge.
 
-Per-network files also explain a classic double-bot: if two labels share one
-`BOT_TRUST` (e.g. both fall back to `/conf/bot.trust`), the mismatch shows up as
-a second bot on the wrong network. Every `BOT_*` key in `networks.json` must
-point at a `/data/...` file.
+Trust is the exception: it is read only from `/conf`, never from `/data`.
+`networks.json` may point `BOT_TRUST` at `/conf/bot.trust.<net>`; a `/data`
+trust path is a bug. This is also how the injected `szczot3k` line is removed
+from the live path: the reviewed ConfigMap does not carry it, and the old PVC
+file is no longer read. Executable code is image-only too: `BOT_HANDLERS`,
+`BOT_IRC_COMMANDS` and `BRAIN_PLUGIN` point at `/app`, so rewriting a `/data`
+copy has no effect.
+
+Per-network trust files also explain a classic double-bot: if two labels share
+one `BOT_TRUST` (e.g. both fall back to `/conf/bot.trust`), the mismatch shows
+up as a second bot on the wrong network. Every `BOT_*` key in `networks.json`
+must point at the right per-network file.
 
 ## Secrets (never in git)
 
