@@ -63,3 +63,33 @@ ENV TERM=tmux-256color \
     BRAIN_AGENT_STATUS=/data/agent.status \
     BRAIN_MODEL=opencode/deepseek-v4.1-flash-free
 CMD ["python3", "-u", "tmuxsup.py", "brain", "python3", "-u", "brain.py"]
+
+# --- brain2: the same brain on OpenCode 2.x ---------------------------------
+# 2.x is NOT on npm (`opencode-ai` latest is still 1.x): it ships as a
+# standalone binary. Pinned by sha256 so a moved or tampered asset is a build
+# failure, not a silent upgrade. The binary is self-contained, so this stage
+# does not need Node — python:3.12-slim plus the tarball is enough.
+FROM runtime-base AS brain2
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+ARG OPENCODE_VERSION=2.3.0
+ARG OPENCODE_SHA256=fc0f81522aceeabac47693d88389efa2bc517ce74c2c38fd6967819fcc6e4d3b
+RUN curl -fsSL -o /tmp/oc.tar.gz \
+      "https://github.com/sst/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
+ && echo "${OPENCODE_SHA256}  /tmp/oc.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/oc.tar.gz -C /usr/local/bin opencode \
+ && chmod +x /usr/local/bin/opencode \
+ && rm -f /tmp/oc.tar.gz \
+ && /usr/local/bin/opencode --version
+COPY brain.py plug.py policy.py networks.py memory_log.py util.py oc_compat.py opencode.json tmuxsup.py ./
+COPY tests/ ./tests/
+ENV TERM=tmux-256color \
+    BOT_EVENTS=/data/events.log \
+    BOT_FIFO=/data/bot.send \
+    BRAIN_WORKDIR=/data/workspace \
+    BRAIN_MEMORY_DIR=/data/workspace/memory \
+    BRAIN_HEARTBEAT=/data/brain.heartbeat \
+    BRAIN_AGENT_STATUS=/data/agent.status \
+    BRAIN_MODEL=aisix/auto
+CMD ["python3", "-u", "tmuxsup.py", "brain", "python3", "-u", "brain.py"]
