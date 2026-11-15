@@ -22,6 +22,7 @@ pipeline: tail -> prompt_async -> SSE -> idle -> messages -> FIFO.
 Usage: stub_opencode_serve.py [--port N]. Tests import StubServe directly.
 """
 import argparse
+import base64
 import json
 import re
 import threading
@@ -33,6 +34,7 @@ MARKER = "stub-ok"
 
 class StubState:
     def __init__(self, answer_env=None):
+        self.v2 = False
         self.lock = threading.Lock()
         self.sessions = {}          # sid -> {"id","title","messages","busy"}
         self.seq = 0
@@ -40,11 +42,12 @@ class StubState:
         self.event_cond = threading.Condition()
         self.permission_replies = []  # (requestID, body)
         self.aborted = set()
+        self.models = {}
         self.answer_env = answer_env if answer_env is not None else {}
 
     def broadcast(self, etype, props):
         ev = {"id": f"evt_{time.time_ns()}", "type": etype,
-              "properties": props}
+              ("data" if self.v2 else "properties"): props}
         with self.event_cond:
             self.events.append(ev)
             self.event_cond.notify_all()
@@ -73,16 +76,34 @@ class StubServe:
     """Run in-thread for unit tests; serve_forever() for compose smoke."""
 
     def __init__(self, host="127.0.0.1", port=0, answer=None,
-                 turn_delay=0.2, answer_env=None):
+                 turn_delay=0.2, answer_env=None, api_version="1.19.5",
+                 password="", username="opencode"):
         self.state = StubState(answer_env=answer_env)
         self.answer = answer or default_answer
         self.turn_delay = turn_delay
+        self.api_version = api_version
+        self.v2 = str(api_version).split(".")[0].isdigit() and \
+            int(str(api_version).split(".")[0]) >= 2
+        self.password = password
+        self.username = username
+        self.state.v2 = self.v2
 
         serve = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
+
+            def _authorized(self):
+                if not serve.v2 or not serve.password:
+                    return True
+                token = base64.b64encode(
+                    f"{serve.username}:{serve.password}".encode()).decode()
+                return self.headers.get("authorization") == "Basic " + token
+
+            def _unauthorized(self):
+                self._json(401, {"_tag": "UnauthorizedError",
+                                 "message": "Authentication required"})
 
             def _json(self, code, obj):
                 body = json.dumps(obj).encode()
@@ -103,8 +124,41 @@ class StubServe:
 
             def do_GET(self):
                 st = serve.state
-                if self.path == "/global/health":
+                if self.path.startswith("/api/") and not self._authorized():
+                    self._unauthorized()
+                    return
+                path = self.path.split("?")[0]
+                if path == "/global/health":
                     self._json(200, {"healthy": True, "version": "stub"})
+                elif path == "/api/info":
+                    self._json(200, {"version": serve.api_version,
+                                     "pid": 1, "hostname": "stub",
+                                     "urls": [serve.url],
+                                     "paths": {"tmp": "/tmp"},
+                                     "capabilities": {}})
+                elif path == "/api/session":
+                    with st.lock:
+                        sessions = [{"id": sid, "title": s.get("title", "")}
+                                    for sid, s in st.sessions.items()]
+                    self._json(200, {"data": sessions,
+                                     "cursor": {"previous": None,
+                                                "next": None}})
+                elif path == "/api/session/active":
+                    with st.lock:
+                        active = {sid: {"type": "running"}
+                                  for sid, s in st.sessions.items()
+                                  if s.get("busy")}
+                    self._json(200, {"data": active})
+                elif re.match(r"^/api/session/[^/]+/message$", path):
+                    sid = path.split("/")[3]
+                    with st.lock:
+                        sess = st.sessions.get(sid)
+                        msgs = list(sess["messages"]) if sess else []
+                    data = [m for m in (serve._v2_message(x) for x in msgs)
+                            if m is not None]
+                    self._json(200, {"data": data,
+                                     "cursor": {"previous": None,
+                                                "next": None}})
                 elif self.path == "/session":
                     with st.lock:
                         sessions = list(st.sessions.values())
@@ -116,6 +170,8 @@ class StubServe:
                                 if s.get("busy")}
                     self._json(200, busy)
                 elif self.path == "/event":
+                    self._sse()
+                elif self.path == "/api/event":
                     self._sse()
                 elif re.match(r"^/session/[^/]+/message$", self.path):
                     sid = self.path.split("/")[2]
@@ -129,7 +185,33 @@ class StubServe:
             def do_POST(self):
                 st = serve.state
                 body = self._read_body()
-                if self.path == "/session":
+                if self.path.startswith("/api/") and not self._authorized():
+                    self._unauthorized()
+                    return
+                path = self.path.split("?")[0]
+                if path == "/api/session":
+                    sid = st.new_sid()
+                    with st.lock:
+                        st.sessions[sid] = {"id": sid,
+                                            "title": body.get("title", ""),
+                                            "messages": [], "busy": False}
+                    st.broadcast("session.created", {"sessionID": sid})
+                    self._json(200, {"data": {"id": sid,
+                                              "title": body.get("title", "")}})
+                elif re.match(r"^/api/session/[^/]+/prompt$", path):
+                    sid = path.split("/")[3]
+                    serve._accept_prompt(sid, body.get("text", ""), v2=True)
+                    self._json(200, {"data": {"id": "msg_stub"}})
+                elif re.match(r"^/api/session/[^/]+/interrupt$", path):
+                    sid = path.split("/")[3]
+                    self._json(200, {"interrupted": serve._abort(sid)})
+                elif re.match(r"^/api/session/[^/]+/model$", path):
+                    sid = path.split("/")[3]
+                    with st.lock:
+                        st.models[sid] = body.get("model") or {}
+                    self.send_response(204)
+                    self.end_headers()
+                elif path == "/session":
                     sid = st.new_sid()
                     with st.lock:
                         st.sessions[sid] = {"id": sid,
@@ -143,38 +225,12 @@ class StubServe:
                     text = "".join(p.get("text", "")
                                    for p in body.get("parts", [])
                                    if p.get("type") == "text")
-                    with st.lock:
-                        sess = st.sessions.get(sid)
-                        if sess is None:
-                            self._json(404, {"error": "no session"})
-                            return
-                        sess["busy"] = True
-                        sess["gen"] = sess.get("gen", 0) + 1
-                        gen = sess["gen"]
-                        msg_id = f"msg_u{time.time_ns()}"
-                        sess["messages"].append(
-                            {"info": {"id": msg_id, "role": "user"},
-                             "parts": [{"type": "text", "text": text}]})
-                    st.broadcast("session.status",
-                                 {"sessionID": sid,
-                                  "status": {"type": "busy"}})
-                    threading.Thread(target=serve._run_turn,
-                                     args=(sid, text, gen),
-                                     daemon=True).start()
+                    serve._accept_prompt(sid, text, v2=False)
                     self.send_response(204)
                     self.end_headers()
                 elif re.match(r"^/session/[^/]+/abort$", self.path):
                     sid = self.path.split("/")[2]
-                    with st.lock:
-                        st.aborted.add(sid)
-                        sess = st.sessions.get(sid)
-                        if sess:
-                            sess["busy"] = False
-                            # An abort kills the CURRENT turn only — a fresh
-                            # prompt starts a new generation and runs (the
-                            # real server does the same).
-                            sess["aborted_gen"] = sess.get("gen", 0)
-                    self._json(200, True)
+                    self._json(200, serve._abort(sid))
                 elif re.match(r"^/permission/[^/]+/reply$", self.path):
                     req_id = self.path.split("/")[2]
                     with st.lock:
@@ -189,9 +245,12 @@ class StubServe:
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
                 self.end_headers()
-                self.wfile.write(b"data: "
-                                 b'{"type":"server.connected",'
-                                 b'"properties":{}}\n\n')
+                if serve.v2:
+                    hello = {"type": "server.connected", "data": {}}
+                else:
+                    hello = {"type": "server.connected", "properties": {}}
+                self.wfile.write(
+                    f"data: {json.dumps(hello)}\n\n".encode())
                 self.wfile.flush()
                 sent = 1
                 while True:
@@ -216,12 +275,78 @@ class StubServe:
         self.port = self.httpd.server_address[1]
         self.url = f"http://{host}:{self.port}"
 
-    def _run_turn(self, sid, prompt, gen):
+    def _accept_prompt(self, sid, text, v2=False):
+        st = self.state
+        with st.lock:
+            sess = st.sessions.get(sid)
+            if sess is None:
+                return
+            sess["busy"] = True
+            sess["gen"] = sess.get("gen", 0) + 1
+            gen = sess["gen"]
+            msg_id = f"msg_u{time.time_ns()}"
+            sess["messages"].append(
+                {"info": {"id": msg_id, "role": "user",
+                          "time": {"created": int(time.time() * 1000)}},
+                 "parts": [{"type": "text", "text": text}]})
+        if v2:
+            st.broadcast("session.execution.started", {"sessionID": sid})
+        else:
+            st.broadcast("session.status",
+                         {"sessionID": sid, "status": {"type": "busy"}})
+        threading.Thread(target=self._run_turn,
+                         args=(sid, text, gen, v2), daemon=True).start()
+
+    def _abort(self, sid):
+        st = self.state
+        with st.lock:
+            st.aborted.add(sid)
+            sess = st.sessions.get(sid)
+            if sess is not None:
+                sess["busy"] = False
+                sess["aborted_gen"] = sess.get("gen", 0)
+        return True
+
+    def _v2_message(self, msg):
+        info = msg.get("info") or {}
+        role = info.get("role")
+        if role == "idle":
+            return None
+        if role == "user":
+            return {"id": info.get("id"),
+                    "time": info.get("time") or {},
+                    "type": "user",
+                    "text": "".join(p.get("text", "")
+                                    for p in msg.get("parts") or [])}
+        if role == "assistant":
+            now = int(time.time() * 1000)
+            return {"id": info.get("id"),
+                    "time": info.get("time") or {"created": now,
+                                                 "completed": now},
+                    "type": "assistant",
+                    "agent": "build",
+                    "model": {"id": info.get("modelID") or "stub",
+                              "providerID": "stub"},
+                    "content": [p for p in msg.get("parts") or []
+                                if p.get("type") == "text"],
+                    "tokens": {"input": 0,
+                               "output": (info.get("tokens") or {})
+                               .get("output", 0),
+                               "reasoning": 0,
+                               "cache": {"read": 0, "write": 0}},
+                    "cost": 0}
+        return {"id": info.get("id"), "time": info.get("time") or {},
+                "type": role or "system", "text": ""}
+
+    def _run_turn(self, sid, prompt, gen, v2=False):
         time.sleep(self.turn_delay)
         st = self.state
         answer = self.answer(prompt, st)
+        now = int(time.time() * 1000)
         amsg = {"info": {"id": f"msg_a{time.time_ns()}",
-                         "role": "assistant"},
+                         "role": "assistant",
+                         "time": {"created": now, "completed": now},
+                         "tokens": {"output": len(answer.split())}},
                 "parts": [{"type": "text", "text": answer}]}
         with st.lock:
             sess = st.sessions.get(sid)
@@ -229,11 +354,15 @@ class StubServe:
                 return                  # aborted mid-turn: nothing lands
             sess["messages"].append(amsg)
             sess["busy"] = False
-        st.broadcast("session.status",
-                     {"sessionID": sid, "status": {"type": "idle"}})
-        st.broadcast("message.updated",
-                     {"sessionID": sid, "info": amsg["info"]})
-        st.broadcast("session.idle", {"sessionID": sid})
+        if v2:
+            st.broadcast("session.execution.succeeded", {"sessionID": sid})
+            st.broadcast("session.idle", {"sessionID": sid})
+        else:
+            st.broadcast("session.status",
+                         {"sessionID": sid, "status": {"type": "idle"}})
+            st.broadcast("message.updated",
+                         {"sessionID": sid, "info": amsg["info"]})
+            st.broadcast("session.idle", {"sessionID": sid})
 
     def start(self):
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()

@@ -87,3 +87,20 @@ def test_escalate_exit_on_stall_and_restart_cmd(monkeypatch):
             pytest.raises(SystemExit) as e:
         watchdog.escalate("stall")
     assert e.value.code == 1
+
+
+def test_v2_health_busy_and_abort(monkeypatch):
+    serve = StubServe(api_version="2.3.0", password="pw").start()
+    monkeypatch.setattr(watchdog, "OPENCODE_VERSION", "2.3.0")
+    monkeypatch.setattr(watchdog, "SERVER_PASSWORD", "pw")
+    try:
+        assert watchdog.serve_healthy(serve.url)
+        assert watchdog.busy_sessions(serve.url) == {}
+        sid = serve.state.new_sid()
+        serve.state.sessions[sid] = {"id": sid, "title": "t",
+                                     "messages": [], "busy": True}
+        assert watchdog.busy_sessions(serve.url) == {sid: {"type": "busy"}}
+        assert watchdog.abort_session(serve.url, sid)
+        assert sid in serve.state.aborted
+    finally:
+        serve.stop()

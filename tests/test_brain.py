@@ -27,9 +27,12 @@ from stub_opencode_serve import StubServe
 class Env:
     """One isolated brain + stub-serve world."""
 
-    def __init__(self, tmp_path, answer=None, turn_delay=0.05, fresh=True):
+    def __init__(self, tmp_path, answer=None, turn_delay=0.05, fresh=True,
+                 api_version="1.19.5", password=""):
         self.data = tmp_path / "data"
         self.work = tmp_path / "workspace"
+        self.api_version = api_version
+        self.password = password
         if fresh:
             self.data.mkdir()
             self.work.mkdir(parents=True)
@@ -37,7 +40,9 @@ class Env:
         if fresh:
             os.mkfifo(self.fifo)
         self.events = str(self.data / "events.log")
-        self.serve = StubServe(turn_delay=turn_delay, answer=answer).start()
+        self.serve = StubServe(turn_delay=turn_delay, answer=answer,
+                               api_version=self.api_version,
+                               password=self.password).start()
         self.mem = memory_log.Memory(str(self.work / "memory"))
         self.mem.ensure()
         net = networks.Net("irc", self.events, self.fifo,
@@ -56,6 +61,8 @@ class Env:
                               str(self.data / "brain.heartbeat")),
             mock.patch.object(brain, "AGENT_STATUS",
                               str(self.data / "agent.status")),
+            mock.patch.object(brain, "OPENCODE_VERSION", self.api_version),
+            mock.patch.object(brain, "SERVER_PASSWORD", self.password),
         ]
         for p in self._patches:
             p.start()
@@ -137,6 +144,8 @@ def test_full_roundtrip_answers_through_the_fifo(world):
     lines = world.fifo_lines()
     assert lines == ["SAY #test stub-ok"]
     assert world.brain.total_turns >= 2      # rehydrate + the real turn
+
+
     # The one session's pointer persists on disk for the next restart.
     store = json.load(open(str(world.work / "sessions.json")))
     assert store["session"].startswith("ses_")
@@ -148,6 +157,19 @@ def test_full_roundtrip_answers_through_the_fifo(world):
             break
         time.sleep(0.05)
     assert snap["sessions"]["irc:global"]["turns"] >= 2
+
+
+def test_v2_full_roundtrip_answers_through_the_fifo(tmp_path):
+    w = Env(tmp_path, api_version="2.3.0", password="pw")
+    w.start()
+    try:
+        w.open_fifo()
+        w.say("[12:00] MSG TRUSTED FROM=alice HOST=a@h TO=#test BODY=hi bot")
+        assert w.fifo_lines() == ["SAY #test stub-ok"]
+        assert w.brain.sess.sid.startswith("ses_stub")
+        assert w.brain.total_turns >= 2
+    finally:
+        w.stop()
 
 
 def test_muted_channel_never_creates_the_session(world):
@@ -1053,11 +1075,13 @@ def test_serve_spawn_binds_loopback_only():
     with mock.patch.object(brain.subprocess, "Popen", fake_popen), \
             mock.patch.object(brain.Serve, "_wait_healthy",
                               return_value=True), \
-            mock.patch.object(brain, "WORKDIR", "/tmp"):
+            mock.patch.object(brain, "WORKDIR", "/tmp"), \
+            mock.patch.object(brain, "OPENCODE_VERSION", "1.19.5"):
         serve = brain.Serve.spawned()
     argv = seen["argv"]
     assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
     assert "0.0.0.0" not in argv
+    assert "--log-level" not in argv
     assert serve.url.startswith("http://127.0.0.1:")
 
 

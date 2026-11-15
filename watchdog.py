@@ -19,9 +19,9 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
 from functools import partial
 
+import oc_compat
 from util import emit as _emit, env, env_bool
 
 emit = partial(_emit, "WATCHDOG")
@@ -30,6 +30,9 @@ HEARTBEAT = env("BRAIN_HEARTBEAT", "/data/brain.heartbeat")
 AGENT_STATUS = env("BRAIN_AGENT_STATUS", "/data/agent.status")
 SERVE_URL = env("BRAIN_SERVE_URL",
                 "http://127.0.0.1:" + env("BRAIN_SERVE_PORT", "46099"))
+OPENCODE_VERSION = env("BRAIN_OPENCODE_VERSION", "")
+SERVER_USERNAME = env("OPENCODE_SERVER_USERNAME", "opencode")
+SERVER_PASSWORD = env("OPENCODE_SERVER_PASSWORD", "")
 POLL = float(env("WATCHDOG_POLL", "10"))
 STALL = float(env("WATCHDOG_STALL", "30"))
 MAX_STALLS = int(env("WATCHDOG_MAX_STALLS", "3"))
@@ -53,24 +56,49 @@ def is_stalled(age, stall=STALL):
     return age is None or age > stall
 
 
+def _v2():
+    return oc_compat.is_v2(OPENCODE_VERSION)
+
+
+def _request(url, path, method="GET", body=None, timeout=3,
+             version=None):
+    return oc_compat.request(
+        url.rstrip("/") + path, method=method, body=body, timeout=timeout,
+        password=SERVER_PASSWORD, username=SERVER_USERNAME,
+        version=version if version is not None else (OPENCODE_VERSION
+                                                      or "1.19.5"))
+
+
 def serve_healthy(url=None, timeout=3):
-    """True only when /global/health answers {"healthy": true}."""
+    """True when the version-appropriate health route answers."""
     url = (url or SERVE_URL).rstrip("/")
     try:
-        with urllib.request.urlopen(url + "/global/health",
-                                    timeout=timeout) as r:
-            return json.loads(r.read()).get("healthy") is True
+        if _v2():
+            data = _request(url, "/api/info", timeout=timeout)
+            return bool(data and (data.get("version") or data.get("urls")))
+        data = _request(url, "/global/health", timeout=timeout,
+                        version="1.19.5")
+        if data and data.get("healthy") is True:
+            return True
+        if OPENCODE_VERSION:
+            return False
+        data = _request(url, "/api/info", timeout=timeout, version="2.3.0")
+        return bool(data and (data.get("version") or data.get("urls")))
     except (OSError, ValueError):
         return False
 
 
 def busy_sessions(url=None, timeout=5):
-    """{sessionID: status} for busy/retry sessions, None when unreachable."""
+    """{sessionID: status} for busy sessions, None when unreachable."""
     url = (url or SERVE_URL).rstrip("/")
     try:
-        with urllib.request.urlopen(url + "/session/status",
-                                    timeout=timeout) as r:
-            return json.loads(r.read()) or {}
+        if _v2():
+            data = _request(url, "/api/session/active", timeout=timeout)
+            data = (data or {}).get("data") or {}
+            return {sid: {"type": "busy"} for sid, st in data.items()
+                    if (st or {}).get("type") == "running"}
+        return _request(url, "/session/status", timeout=timeout,
+                        version="1.19.5") or {}
     except (OSError, ValueError):
         return None
 
@@ -85,11 +113,13 @@ def agent_snapshot(path=None):
 
 def abort_session(url, sid, timeout=10):
     try:
-        req = urllib.request.Request(
-            url.rstrip("/") + f"/session/{sid}/abort", data=b"{}",
-            method="POST", headers={"content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status == 200
+        if _v2():
+            data = _request(url, f"/api/session/{sid}/interrupt",
+                            method="POST", timeout=timeout)
+            return data is not None
+        data = _request(url, f"/session/{sid}/abort", method="POST",
+                        body={}, timeout=timeout, version="1.19.5")
+        return data is not None and data is not False
     except OSError:
         return False
 

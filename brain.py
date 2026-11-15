@@ -24,11 +24,13 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from functools import partial
 
 import memory_log
 import networks
+import oc_compat
 import plug
 import policy
 from util import emit as _emit
@@ -77,6 +79,9 @@ PLUGIN_FILE = env("BRAIN_PLUGIN", "/data/brain_plugin.py")
 plugin = plug.Plugin(PLUGIN_FILE, emit)
 
 OPENCODE_BIN = "opencode"
+OPENCODE_VERSION = env("BRAIN_OPENCODE_VERSION", "")
+SERVER_USERNAME = env("OPENCODE_SERVER_USERNAME", "opencode")
+SERVER_PASSWORD = env("OPENCODE_SERVER_PASSWORD", "")
 BATCH_MAX = int(env("BRAIN_BATCH_MAX", "25"))  # submit a batch once it grows
 # this big: a busy channel settles into a handful of fat turns instead of a
 # stream of thin ones. BATCH_WINDOW below still caps how long the oldest
@@ -155,33 +160,40 @@ def registers():
 class Serve:
     """The `opencode serve` process handle, managed or attached."""
 
-    def __init__(self, url, managed=None, port=None):
+    def __init__(self, url, managed=None, port=None, version=None):
         self.url = url.rstrip("/")
         self.managed = managed
         self.port = port
+        self.version = (version if version is not None
+                        else oc_compat.detect_version(OPENCODE_BIN,
+                                                      OPENCODE_VERSION))
+        self.v2 = oc_compat.is_v2(self.version)
+        self._auth_warned = False
 
     @classmethod
     def spawned(cls):
-        """Start `opencode serve` on loopback and wait for /global/health.
+        """Start `opencode serve` on loopback and wait for its health route.
 
-        Serve is the agent's whole control plane (sessions, prompts, aborts,
-        history) and has no auth of its own: the loopback bind IS the boundary.
-        The brain talks to 127.0.0.1 here, and so does the watchdog — compose
-        gives it `network_mode: service: brain`, k8s puts both containers in
-        one pod — so the API is never reachable beyond the host (review
-        blocker 1). There is deliberately no env knob to change this.
+        The loopback bind is the boundary; v2 additionally requires basic
+        auth on /api, so the same password the server reads is used here.
         """
         install_api_key()
         host = "127.0.0.1"
+        version = oc_compat.detect_version(OPENCODE_BIN, OPENCODE_VERSION)
+        if oc_compat.is_v2(version) and not SERVER_PASSWORD:
+            emit("AUTH_MISSING", "OPENCODE_SERVER_PASSWORD required for v2")
+            raise RuntimeError(
+                "OPENCODE_SERVER_PASSWORD is required for opencode 2.x /api")
         last_err = "unknown"
         for attempt in range(5):
             port = SERVE_PORT + attempt
             proc = subprocess.Popen(
                 [OPENCODE_BIN, "serve", "--hostname", host,
-                 "--port", str(port), "--log-level", "WARN"],
+                 "--port", str(port)],
                 cwd=WORKDIR, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
-            serve = cls(f"http://127.0.0.1:{port}", managed=proc, port=port)
+            serve = cls(f"http://127.0.0.1:{port}", managed=proc, port=port,
+                        version=version)
             if serve._wait_healthy():
                 return serve
             last_err = f"port {port} (exit {proc.poll()})"
@@ -190,7 +202,8 @@ class Serve:
 
     @classmethod
     def attached(cls):
-        return cls(SERVE_URL)
+        version = oc_compat.detect_version(OPENCODE_BIN, OPENCODE_VERSION)
+        return cls(SERVE_URL, version=version)
 
     def _wait_healthy(self, timeout=30.0):
         end = time.monotonic() + timeout
@@ -203,12 +216,22 @@ class Serve:
         return False
 
     def healthy(self):
+        if self.v2 and not SERVER_PASSWORD:
+            if not self._auth_warned:
+                self._auth_warned = True
+                emit("AUTH_MISSING",
+                     "OPENCODE_SERVER_PASSWORD required for v2 /api")
+            return False
+        path = "/api/info" if self.v2 else "/global/health"
         try:
-            with urllib.request.urlopen(self.url + "/global/health",
-                                        timeout=3) as r:
-                return json.loads(r.read()).get("healthy") is True
+            data = oc_compat.request(
+                self.url + path, timeout=3, password=SERVER_PASSWORD,
+                username=SERVER_USERNAME, version=self.version)
         except (OSError, ValueError):
             return False
+        if self.v2:
+            return bool(data and (data.get("version") or data.get("urls")))
+        return bool(data and data.get("healthy") is True)
 
     def stop(self):
         if self.managed and self.managed.poll() is None:
@@ -221,57 +244,197 @@ class Serve:
 
 # --- HTTP client ------------------------------------------------------------
 class Api:
-    """Thin sync client for the opencode server's v1 API."""
+    """Thin sync client with one surface for the v1 and v2 servers."""
 
-    def __init__(self, base):
+    def __init__(self, base, version=None):
         self.base = base.rstrip("/")
+        self.version = (version if version is not None
+                        else oc_compat.detect_version(OPENCODE_BIN,
+                                                      OPENCODE_VERSION))
+        self.v2 = oc_compat.is_v2(self.version)
+        self._models = {}
+        self._systems = {}
+        self._permission_sid = {}
 
     def _req(self, method, path, body=None, timeout=15):
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            self.base + path, data=data, method=method,
-            headers={"content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = r.read()
-        return json.loads(payload) if payload else None
+        return oc_compat.request(
+            self.base + path, method=method, body=body, timeout=timeout,
+            password=SERVER_PASSWORD, username=SERVER_USERNAME,
+            version=self.version)
+
+    @staticmethod
+    def _data(payload):
+        if isinstance(payload, dict) and "data" in payload:
+            return payload["data"]
+        return payload
+
+    @staticmethod
+    def _v2_model(m):
+        info = m.get("info") or {}
+        if "role" in info:
+            return m
+        typ = m.get("type") or ""
+        if typ == "idle":
+            return None
+        normalized = {"id": m.get("id"),
+                      "time": m.get("time") or {},
+                      "role": typ,
+                      "parts": []}
+        if typ == "assistant":
+            normalized["tokens"] = {
+                "output": (m.get("tokens") or {}).get("output", 0)}
+            normalized["modelID"] = (m.get("model") or {}).get("id")
+            normalized["parts"] = [
+                {"type": "text", "text": part.get("text", "")}
+                for part in (m.get("content") or [])
+                if part.get("type") == "text"]
+        elif typ in ("user", "synthetic", "system", "skill", "shell"):
+            normalized["parts"] = [{"type": "text",
+                                    "text": m.get("text", "")}]
+        return {"info": normalized, "parts": normalized["parts"]}
+
+    def _v2_events(self, ev):
+        etype = ev.get("type", "")
+        data = ev.get("data") or {}
+        sid = data.get("sessionID")
+        if etype == "permission.asked":
+            props = {"id": data.get("id"), "sessionID": sid,
+                     "permission": data.get("action")
+                     or data.get("permission") or "unknown",
+                     "patterns": data.get("resources")
+                     or data.get("patterns") or []}
+            self._permission_sid[props["id"]] = sid
+            return [{"type": "permission.asked", "properties": props}]
+        if etype in ("session.execution.started",):
+            return [{"type": "session.status",
+                     "properties": {"sessionID": sid,
+                                    "status": {"type": "busy"}}}]
+        if etype in ("session.execution.succeeded",
+                     "session.execution.interrupted", "session.idle"):
+            return [{"type": "session.idle",
+                     "properties": {"sessionID": sid}}]
+        if etype == "session.execution.failed":
+            return [{"type": "session.error", "properties": data},
+                    {"type": "session.idle",
+                     "properties": {"sessionID": sid}}]
+        if etype == "session.status":
+            return [{"type": "session.status", "properties": data}]
+        if etype == "session.retry.scheduled":
+            err = data.get("error") or {}
+            return [{"type": "session.status",
+                     "properties": {
+                         "sessionID": sid,
+                         "status": {"type": "retry",
+                                    "message": err.get("message", "")}}}]
+        if etype == "session.compaction.ended":
+            return [{"type": "session.compacted",
+                     "properties": {"sessionID": sid}}]
+        return []
 
     def create_session(self, title):
-        return self._req("POST", "/session", {"title": title})
+        if not self.v2:
+            return self._req("POST", "/session", {"title": title})
+        payload = self._req("POST", "/api/session", {"title": title})
+        return self._data(payload) or {}
 
     def list_sessions(self):
-        return self._req("GET", "/session") or []
+        if not self.v2:
+            return self._req("GET", "/session") or []
+        payload = self._data(
+            self._req("GET", "/api/session?limit=200"))
+        return payload or []
+
+    def _switch_model(self, sid, model):
+        if sid in self._models and self._models[sid] == model:
+            return
+        self._req("POST", f"/api/session/{sid}/model",
+                  {"model": {"providerID": model[0], "id": model[1]}})
+        self._models[sid] = model
 
     def prompt_async(self, sid, text, system=None, model=None):
-        body = {"parts": [{"type": "text", "text": text}]}
-        if system:
-            body["system"] = system
+        if not self.v2:
+            body = {"parts": [{"type": "text", "text": text}]}
+            if system:
+                body["system"] = system
+            if model:
+                body["model"] = {"providerID": model[0],
+                                 "modelID": model[1]}
+            self._req("POST", f"/session/{sid}/prompt_async", body)
+            return
         if model:
-            body["model"] = {"providerID": model[0], "modelID": model[1]}
-        self._req("POST", f"/session/{sid}/prompt_async", body)
+            self._switch_model(sid, model)
+        if system and self._systems.get(sid) != system:
+            text = f"{system}\n\n{text}"
+            self._systems[sid] = system
+        self._req("POST", f"/api/session/{sid}/prompt", {"text": text})
 
     def messages(self, sid):
-        return self._req("GET", f"/session/{sid}/message") or []
+        if not self.v2:
+            return self._req("GET", f"/session/{sid}/message") or []
+        out = []
+        cursor = None
+        for _ in range(50):
+            params = ({"cursor": cursor} if cursor
+                      else {"order": "asc", "limit": "200"})
+            url = oc_compat.url_with(
+                self.base, f"/api/session/{sid}/message", params)
+            payload = self._req("GET", url[len(self.base):])
+            data = self._data(payload) or []
+            for msg in data:
+                normalized = self._v2_model(msg)
+                if normalized is not None:
+                    out.append(normalized)
+            cursor = ((payload or {}).get("cursor") or {}).get("next")
+            if not cursor:
+                break
+        return out
 
     def abort(self, sid):
-        return self._req("POST", f"/session/{sid}/abort", {})
+        if not self.v2:
+            return self._req("POST", f"/session/{sid}/abort", {})
+        return self._req("POST", f"/api/session/{sid}/interrupt")
 
     def permission_reply(self, request_id, reply="reject", message=""):
-        return self._req("POST", f"/permission/{request_id}/reply",
-                         {"reply": reply, "message": message})
+        if not self.v2:
+            return self._req("POST", f"/permission/{request_id}/reply",
+                             {"reply": reply, "message": message})
+        sid = self._permission_sid.get(request_id)
+        if not sid:
+            raise oc_compat.AuthError(
+                f"no session for permission request {request_id}")
+        decision = "once" if reply == "allow" else "reject"
+        return self._req(
+            "POST", f"/api/session/{sid}/permission/{request_id}/reply",
+            {"decision": decision, "message": message})
 
     def events(self):
         """Yield parsed SSE events; reconnect is the caller's job."""
-        req = urllib.request.Request(self.base + "/event")
-        resp = urllib.request.urlopen(req, timeout=None)
+        path = "/api/event" if self.v2 else "/event"
+        req = urllib.request.Request(
+            self.base + path, headers=oc_compat.auth_headers(
+                SERVER_PASSWORD, SERVER_USERNAME))
+        try:
+            resp = urllib.request.urlopen(req, timeout=None)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise oc_compat.AuthError(
+                    "opencode API rejected credentials (401); check "
+                    "OPENCODE_SERVER_PASSWORD") from e
+            raise
         try:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data: "):
                     continue
                 try:
-                    yield json.loads(line[6:])
+                    ev = json.loads(line[6:])
                 except ValueError:
                     continue
+                if not self.v2:
+                    yield ev
+                    continue
+                for normalized in self._v2_events(ev):
+                    yield normalized
         finally:
             resp.close()
 
@@ -1045,10 +1208,14 @@ class Brain:
         except OSError as e:
             emit("COLLECT_ERROR", sess.title, repr(e))
             return
-        sess.last_count = len(msgs)
         with self.lock:
             started = sess.busy_since
             preempted = sess.preempted_ts is not None
+            if (started is None and not preempted
+                    and len(msgs) <= sess.last_count):
+                return
+        sess.last_count = len(msgs)
+        with self.lock:
             sess.preempted_ts = None
             sess.busy_since = None
             sess.last_trust = None

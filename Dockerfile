@@ -34,7 +34,7 @@ ENV BOT_LOG=/data/bot.log \
 CMD ["python3", "-u", "tmuxsup.py", "bot", "python3", "-u", "nets.py"]
 
 FROM runtime-base AS watchdog
-COPY watchdog.py util.py tmuxsup.py ./
+COPY watchdog.py util.py oc_compat.py tmuxsup.py ./
 ENV BRAIN_HEARTBEAT=/data/brain.heartbeat
 CMD ["python3", "-u", "tmuxsup.py", "watchdog", "python3", "-u", "watchdog.py"]
 
@@ -51,7 +51,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 # The OpenCode CLI (Node package). Pulls its own binary at install time.
 RUN npm install -g opencode-ai
-COPY brain.py plug.py policy.py networks.py memory_log.py util.py opencode.json tmuxsup.py ./
+COPY brain.py plug.py policy.py networks.py memory_log.py util.py oc_compat.py opencode.json tmuxsup.py ./
 # tests/ ships the stub serve so the image is smoke-testable offline.
 COPY tests/ ./tests/
 ENV TERM=tmux-256color \
